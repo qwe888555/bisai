@@ -112,3 +112,167 @@ class EventGroup(SoftDeleteVersionedModel):
 
     def __str__(self) -> str:  # pragma: no cover
         return f"{self.name}@{self.event_id}"
+
+# ---------------------------------------------------------------- 比赛对阵与事件
+
+MATCH_STATUSES = (
+    ("SCHEDULED", "已排期"),
+    ("LIVE", "进行中"),
+    ("FINISHED", "已结束"),
+    ("CANCELLED", "已取消"),
+)
+
+MATCH_EVENT_TYPES = (
+    ("GOAL", "进球"),
+    ("PENALTY", "判罚"),
+    ("SUBSTITUTION", "换人"),
+)
+
+PENALTY_TYPES = (
+    ("YELLOW_CARD", "黄牌"),
+    ("RED_CARD", "红牌"),
+    ("PENALTY_KICK", "点球"),
+    ("OTHER", "其他"),
+)
+
+
+class Match(SoftDeleteVersionedModel):
+    """比赛对阵与裁判分配；赛果直接写在 Match.score，不另建 Result 版本。"""
+
+    id = models.CharField(primary_key=True, max_length=64)
+    event_id = models.CharField(max_length=64, db_index=True)
+    group_id = models.CharField(max_length=64, db_index=True)
+    home_team_id = models.CharField(max_length=64)
+    away_team_id = models.CharField(max_length=64)
+    kickoff_at = models.DateTimeField()
+    venue = models.CharField(max_length=200, blank=True, default="")
+    stage = models.CharField(max_length=100, blank=True, default="")
+    status = models.CharField(
+        max_length=12, choices=MATCH_STATUSES, default="SCHEDULED"
+    )
+    referees = models.JSONField(default=list)
+    home_score = models.PositiveIntegerField(null=True, blank=True)
+    away_score = models.PositiveIntegerField(null=True, blank=True)
+    published = models.BooleanField(default=False)
+    result_published = models.BooleanField(default=False)
+    score_revision = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        db_table = "events_match"
+        indexes = [
+            models.Index(fields=["event_id"]),
+            models.Index(fields=["group_id"]),
+            models.Index(fields=["status"]),
+        ]
+
+    def __str__(self) -> str:  # pragma: no cover
+        return f"Match@{self.event_id}"
+
+
+class MatchEvent(SoftDeleteVersionedModel):
+    """比赛事件流：进球 / 判罚 / 换人；match_version 记录录入时的比赛版本快照。"""
+
+    id = models.CharField(primary_key=True, max_length=64)
+    match_id = models.CharField(max_length=64, db_index=True)
+    event_type = models.CharField(max_length=12, choices=MATCH_EVENT_TYPES)
+    minute = models.PositiveSmallIntegerField()
+    stoppage_minute = models.PositiveSmallIntegerField(null=True, blank=True)
+    team_id = models.CharField(max_length=64)
+    # GOAL 专用
+    scorer_athlete_id = models.CharField(max_length=64, blank=True, default="")
+    own_goal = models.BooleanField(default=False)
+    # PENALTY 专用
+    athlete_id = models.CharField(max_length=64, blank=True, default="")
+    penalty_type = models.CharField(
+        max_length=14, choices=PENALTY_TYPES, null=True, blank=True
+    )
+    reason = models.CharField(max_length=500, blank=True, default="")
+    # SUBSTITUTION 专用
+    out_athlete_id = models.CharField(max_length=64, blank=True, default="")
+    in_athlete_id = models.CharField(max_length=64, blank=True, default="")
+    note = models.CharField(max_length=1000, blank=True, default="")
+    match_version = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        db_table = "events_match_event"
+        indexes = [models.Index(fields=["match_id"])]
+
+    def __str__(self) -> str:  # pragma: no cover
+        return f"{self.event_type}@{self.match_id}"
+
+
+# ---------------------------------------------------------------- 门户内容与资源
+
+CONTENT_TYPES = (
+    ("NEWS", "新闻"),
+    ("POLICY", "政策"),
+    ("HIGHLIGHT", "精彩瞬间"),
+    ("BEST_LINEUP", "最佳阵容"),
+)
+
+CONTENT_STATUSES = (
+    ("DRAFT", "草稿"),
+    ("PUBLISHED", "已发布"),
+    ("OFFLINE", "已下线"),
+)
+
+
+class Content(SoftDeleteVersionedModel):
+    """新闻/政策/精彩瞬间/最佳阵容；revision 为正文修订版本，问答出处需携带。"""
+
+    id = models.CharField(primary_key=True, max_length=64)
+    content_type = models.CharField(max_length=14, choices=CONTENT_TYPES)
+    title = models.CharField(max_length=200)
+    summary = models.CharField(max_length=1000, blank=True, default="")
+    body_html = models.TextField(max_length=50000)
+    cover_file_id = models.CharField(max_length=64, blank=True, default="")
+    event_id = models.CharField(max_length=64, blank=True, default="")
+    group_id = models.CharField(max_length=64, blank=True, default="")
+    policy_document_no = models.CharField(max_length=100, blank=True, default="")
+    policy_effective_from = models.DateField(null=True, blank=True)
+    policy_effective_to = models.DateField(null=True, blank=True)
+    pinned = models.BooleanField(default=False)
+    status = models.CharField(
+        max_length=12, choices=CONTENT_STATUSES, default="DRAFT"
+    )
+    published_at = models.DateTimeField(null=True, blank=True)
+    revision = models.PositiveIntegerField(default=1)
+    body_text = models.TextField(max_length=50000, blank=True, default="")
+
+    class Meta:
+        db_table = "events_content"
+        indexes = [
+            models.Index(fields=["content_type"]),
+            models.Index(fields=["status"]),
+            models.Index(fields=["-published_at"]),
+        ]
+
+    def __str__(self) -> str:  # pragma: no cover
+        return self.title
+
+
+PORTAL_RESOURCE_TYPES = (
+    ("CAROUSEL", "轮播"),
+    ("NEWS_LINK_IMAGE", "新闻链接图"),
+    ("PARTNER", "合作方"),
+)
+
+
+class PortalResource(SoftDeleteVersionedModel):
+    """门户轮播 / 新闻链接图 / 合作方；targetContentId 与 targetUrl 至多一个。"""
+
+    id = models.CharField(primary_key=True, max_length=64)
+    resource_type = models.CharField(max_length=18, choices=PORTAL_RESOURCE_TYPES)
+    title = models.CharField(max_length=150)
+    image_file_id = models.CharField(max_length=64, blank=True, default="")
+    target_content_id = models.CharField(max_length=64, blank=True, default="")
+    target_url = models.CharField(max_length=2000, blank=True, default="")
+    sort_order = models.PositiveIntegerField(default=0)
+    enabled = models.BooleanField(default=True)
+
+    class Meta:
+        db_table = "events_portal_resource"
+        indexes = [models.Index(fields=["resource_type"]), models.Index(fields=["sort_order"])]
+
+    def __str__(self) -> str:  # pragma: no cover
+        return self.title
