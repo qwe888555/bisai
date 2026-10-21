@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# 环境变量与密钥（.env.example 需要提交）
+.env
+.env.local
+
+# 运行时数据
+backend/data/
+data/
+*.db
+*.sqlite3
+
+# IDE / 系统
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
