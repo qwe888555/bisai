@@ -107,6 +107,47 @@ def main() -> int:
     check("正确版本更新 200", resp.status_code == 200 and resp.json()["code"] == "OK",
           f"status={resp.status_code}")
 
+
+    # 7) 赛事组别：正常创建 / 403 / 409
+    group_payload = {
+        "name": "小学男子甲组",
+        "category": "PRIMARY",
+        "gender": "MALE",
+        "quota": 0,
+        "minAge": 8,
+        "maxAge": 12,
+        "maxPlayers": 11,
+        "requiredMaterialTypes": ["PLAYER_CARD", "GUARD_LETTER"],
+    }
+    resp = admin.post(
+        f"/api/v1/events/{event_id}/groups",
+        data=json.dumps(group_payload),
+        content_type="application/json",
+        **auth(admin_token),
+    )
+    gbody = resp.json()
+    check("创建组别 200/OK", resp.status_code == 200 and gbody["code"] == "OK",
+          f"status={resp.status_code} code={gbody.get('code')}")
+    group_id = gbody["data"]["id"]
+
+    # 7a) team 无权查组别列表 -> 403
+    resp = team.get(f"/api/v1/events/{event_id}/groups", **auth(team_token))
+    check("组别越权 403/FORBIDDEN",
+          resp.status_code == 403 and resp.json()["code"] == "FORBIDDEN",
+          f"status={resp.status_code}")
+
+    # 7b) PUT 组别带错 version -> 409
+    gupdate = dict(group_payload)
+    gupdate["version"] = 999
+    resp = admin.put(
+        f"/api/v1/events/{event_id}/groups/{group_id}",
+        data=json.dumps(gupdate),
+        content_type="application/json",
+        **auth(admin_token),
+    )
+    check("组别版本冲突 409/VERSION_CONFLICT",
+          resp.status_code == 409 and resp.json()["code"] == "VERSION_CONFLICT",
+          f"status={resp.status_code}")
     # 6) 未知字段 400（StrictSchema）
     bad = dict(payload)
     bad["unexpectedField"] = "x"
