@@ -18,6 +18,7 @@ from apps.common.pagination import paginate
 from apps.common.permissions import (
     ADMIN,
     ALL_ROLES,
+    MATCH_RECORDER,
     PROVINCE_REVIEWER,
     register_operation,
     require,
@@ -233,3 +234,107 @@ def available_groups(request, event_id: str):
     require("availableGroups")
     queryset = services.list_groups(event_id, {})
     return paginate(request, queryset, mapper=s.group_out)
+
+# ---------------------------------------------------------------- 比赛对阵管理（5.1）
+
+_MATCH_ROLES = (MATCH_RECORDER, ADMIN, PROVINCE_REVIEWER)
+register_operation("matchList", _MATCH_ROLES)
+register_operation("matchCreate", _MATCH_ROLES)
+register_operation("matchGet", _MATCH_ROLES)
+register_operation("matchUpdate", _MATCH_ROLES)
+register_operation("matchDelete", _MATCH_ROLES)
+register_operation("matchPublish", _MATCH_ROLES)
+register_operation("matchUnpublish", _MATCH_ROLES)
+
+
+@router.get("/matches", auth=_auth, response=EnvelopeOut, summary="分页查询比赛对阵")
+def match_list(
+    request,
+    eventId: Optional[str] = None,
+    groupId: Optional[str] = None,
+    status: Optional[str] = None,
+    teamId: Optional[str] = None,
+    teamName: Optional[str] = None,
+):
+    require("matchList")
+    queryset = services.list_matches(
+        {"eventId": eventId, "groupId": groupId, "status": status, "teamId": teamId, "teamName": teamName}
+    )
+    return paginate(request, queryset, mapper=s.match_out)
+
+
+@router.post("/matches", auth=_auth, response=EnvelopeOut, summary="创建比赛对阵")
+def match_create(request, body: s.MatchCreate):
+    require("matchCreate")
+    match = services.create_match(body.model_dump())
+    audit_state(
+        request,
+        "match.create",
+        object_type="Match",
+        object_id=match.pk,
+        summary=f"创建对阵 {match.home_team_id} vs {match.away_team_id}",
+    )
+    return ok(s.match_out(match))
+
+
+@router.get("/matches/{match_id}", auth=_auth, response=EnvelopeOut, summary="比赛对阵详情")
+def match_get(request, match_id: str):
+    require("matchGet")
+    match = services.get_match(match_id)
+    return ok(s.match_out(match))
+
+
+@router.put("/matches/{match_id}", auth=_auth, response=EnvelopeOut, summary="修改比赛对阵")
+def match_update(request, match_id: str, body: s.MatchUpdate):
+    require("matchUpdate")
+    match = services.update_match(match_id, body.model_dump())
+    audit_state(
+        request,
+        "match.update",
+        object_type="Match",
+        object_id=match.pk,
+        summary="修改比赛对阵",
+    )
+    return ok(s.match_out(match))
+
+
+@router.delete("/matches/{match_id}", auth=_auth, response=EnvelopeOut, summary="删除比赛对阵")
+def match_delete(request, match_id: str, version: Optional[int] = None):
+    require("matchDelete")
+    match = services.delete_match(match_id, _require_version(version))
+    audit_state(
+        request,
+        "match.delete",
+        object_type="Match",
+        object_id=match.pk,
+        summary="删除比赛对阵",
+    )
+    return action_result(True, match.pk, match.version)
+
+
+@router.post("/matches/{match_id}/publish", auth=_auth, response=EnvelopeOut, summary="发布对阵")
+def match_publish(request, match_id: str, body: s.MatchVersionRequest):
+    require("matchPublish")
+    match = services.publish_match(match_id, body.version)
+    audit_state(
+        request,
+        "match.publish",
+        object_type="Match",
+        object_id=match.pk,
+        summary="发布对阵",
+    )
+    return ok(s.match_out(match))
+
+
+@router.post("/matches/{match_id}/unpublish", auth=_auth, response=EnvelopeOut, summary="下线对阵")
+def match_unpublish(request, match_id: str, body: s.MatchReasonVersionRequest):
+    require("matchUnpublish")
+    match = services.unpublish_match(match_id, body.version, body.reason)
+    audit_state(
+        request,
+        "match.unpublish",
+        object_type="Match",
+        object_id=match.pk,
+        summary=f"下线对阵：{body.reason}",
+    )
+    return ok(s.match_out(match))

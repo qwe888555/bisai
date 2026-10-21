@@ -89,3 +89,66 @@ def group_out(group) -> dict:
     if group.max_age is not None:
         data["maxAge"] = int(group.max_age)
     return data
+
+# ---------------------------------------------------------------- 比赛对阵（5.1）
+
+MatchStatus = Literal["SCHEDULED", "LIVE", "FINISHED", "CANCELLED"]
+RefereeRole = Literal["REFEREE", "ASSISTANT", "FOURTH_OFFICIAL", "OTHER"]
+
+
+class RefereeAssignment(StrictSchema):
+    name: str = Field(min_length=1, max_length=100)
+    role: RefereeRole
+    level: str = Field(default="", max_length=100)
+
+
+class MatchCreate(StrictSchema):
+    eventId: str = Field(min_length=1, max_length=64)
+    groupId: str = Field(min_length=1, max_length=64)
+    homeTeamId: str = Field(min_length=1, max_length=64)
+    awayTeamId: str = Field(min_length=1, max_length=64)
+    kickoffAt: datetime
+    venue: str = Field(default="", max_length=200)
+    stage: str = Field(default="", max_length=100)
+    status: MatchStatus
+    referees: list[RefereeAssignment] = []
+
+
+class MatchUpdate(MatchCreate):
+    version: int = Field(ge=0)
+
+
+class MatchVersionRequest(StrictSchema):
+    version: int = Field(ge=0)
+
+
+class MatchReasonVersionRequest(StrictSchema):
+    version: int = Field(ge=0)
+    reason: str = Field(min_length=1, max_length=500)
+
+
+def match_out(match) -> dict:
+    data = {
+        "id": match.pk,
+        "eventId": match.event_id,
+        "groupId": match.group_id,
+        "homeTeamId": match.home_team_id,
+        "awayTeamId": match.away_team_id,
+        "kickoffAt": match.kickoff_at,
+        "venue": match.venue or "",
+        "stage": match.stage or "",
+        "status": match.status,
+        "referees": list(match.referees or []),
+        "published": bool(match.published),
+        "resultPublished": bool(match.result_published),
+        "scoreRevision": int(match.score_revision or 0),
+        "version": int(match.version or 0),
+        "createdAt": match.created_at,
+        "updatedAt": match.updated_at,
+    }
+    # 球队名称由成员4球队服务维护，本库不冗余；未取到时不输出该可选字段
+    if match.home_score is not None:
+        data["homeScore"] = int(match.home_score)
+    if match.away_score is not None:
+        data["awayScore"] = int(match.away_score)
+    return data
