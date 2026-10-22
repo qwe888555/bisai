@@ -13,7 +13,7 @@ from apps.common import idempotency
 from apps.common.authentication import JWTAuth
 from apps.common.envelope import ok
 from apps.common.middleware import audit_state
-from apps.common.pagination import paginate_list
+from apps.common.pagination import paginate
 from apps.common.permissions import (
     ADMIN,
     MATCH_RECORDER,
@@ -124,7 +124,7 @@ def identity_list(request):
             "athleteId": request.GET.get("athleteId"),
         }
     )
-    return paginate_list(request, [_identity_out(item) for item in queryset])
+    return paginate(request, queryset, mapper=_identity_out)
 
 
 @router.get(

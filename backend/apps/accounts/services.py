@@ -10,6 +10,7 @@ import secrets
 from datetime import timedelta
 from typing import Any, Optional
 
+from django.core.cache import cache
 from django.db import transaction
 from django.utils import timezone
 
@@ -368,11 +369,32 @@ def list_dictionary_items(filters: dict):
     return queryset.order_by("dict_type", "sort_order", "id")
 
 
+DICT_OPTIONS_TTL = 300  # 字典选项缓存 5 分钟；写操作立即失效
+
+
+def _dict_options_key(dict_type: str) -> str:
+    return f"dict:options:{dict_type}"
+
+
 def dictionary_options(dict_type: str):
-    return (
-        DictionaryItem.objects.filter(dict_type=dict_type, enabled=True)
-        .order_by("sort_order", "id")
+    """下拉选项：带缓存。写字典时由 _invalidate_dict_options 立即失效。"""
+    key = _dict_options_key(dict_type)
+    cached = cache.get(key)
+    if cached is not None:
+        return cached
+    items = list(
+        DictionaryItem.objects.filter(dict_type=dict_type, enabled=True).order_by(
+            "sort_order", "id"
+        )
     )
+    cache.set(key, items, DICT_OPTIONS_TTL)
+    return items
+
+
+def _invalidate_dict_options(*dict_types: str) -> None:
+    for dict_type in dict_types:
+        if dict_type:
+            cache.delete(_dict_options_key(dict_type))
 
 
 def create_dictionary_item(data: dict) -> DictionaryItem:
@@ -380,7 +402,7 @@ def create_dictionary_item(data: dict) -> DictionaryItem:
         dict_type=data["dictType"], value=data["value"]
     ).exists():
         raise ApiError(DUPLICATE_RESOURCE, "同一字典类型下 value 已存在")
-    return DictionaryItem.objects.create(
+    item = DictionaryItem.objects.create(
         id=new_dictionary_id(),
         dict_type=data["dictType"],
         value=data["value"],
@@ -388,6 +410,8 @@ def create_dictionary_item(data: dict) -> DictionaryItem:
         sort_order=int(data.get("sortOrder") or 0),
         enabled=bool(data.get("enabled", True)),
     )
+    _invalidate_dict_options(item.dict_type)
+    return item
 
 
 def get_dictionary_item(item_id: str) -> DictionaryItem:
@@ -400,6 +424,7 @@ def get_dictionary_item(item_id: str) -> DictionaryItem:
 def update_dictionary_item(item_id: str, data: dict) -> DictionaryItem:
     item = get_dictionary_item(item_id)
     check_version(item, data.get("version"))
+    old_dict_type = item.dict_type
     if (
         DictionaryItem.objects.filter(dict_type=data["dictType"], value=data["value"])
         .exclude(pk=item.pk)
@@ -413,6 +438,7 @@ def update_dictionary_item(item_id: str, data: dict) -> DictionaryItem:
     item.enabled = bool(data.get("enabled", True))
     bump(item)
     item.save()
+    _invalidate_dict_options(old_dict_type, item.dict_type)
     return item
 
 
@@ -422,6 +448,7 @@ def delete_dictionary_item(item_id: str, version: Optional[int]) -> DictionaryIt
     item.deleted_at = timezone.now()
     bump(item)
     item.save()
+    _invalidate_dict_options(item.dict_type)
     return item
 
 

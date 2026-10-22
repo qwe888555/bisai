@@ -43,6 +43,7 @@ Copy-Item .env.example .env
 python manage.py migrate
 python manage.py seed_demo      # 写入 8 个组织、8 类角色演示账号、14 条字典项
 python manage.py runserver
+python -m pytest               # 接口冒烟：登录/权限/400/401/403/404/409/幂等/文件/字典缓存
 ```
 
 - 默认 `DATABASE_URL=sqlite:///./data/football.db`，无需装 MySQL 即可启动；
@@ -89,6 +90,7 @@ def list_accounts(request):
 ## 提交前自检（DoD）
 
 - [ ] `python manage.py check` 无问题，`python manage.py runserver` 能起，`/api/v1/docs` 能看到自己的接口
+- [ ] `python -m pytest` 全绿（新增接口补一条冒烟用例）
 - [ ] 请求模型用 `StrictSchema`，未知字段被拒
 - [ ] 越权返回 403 且是契约信封（不是 500），版本冲突返回 409
 - [ ] 响应体是 `{code, message, data, requestId}`，分页 data 是 `{items, page, pageSize, total}`

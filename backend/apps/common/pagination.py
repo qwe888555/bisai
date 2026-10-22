@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from typing import Any, Iterable, Optional, Sequence
 
+from django.db.models import QuerySet
+
 from .conf import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE
 from .envelope import page
 
@@ -30,15 +32,20 @@ def _to_int(raw: Optional[str], default: int) -> int:
 def paginate(request, queryset: Any, mapper=None) -> dict:
     """对 QuerySet / 列表分页并返回契约信封。
 
+    QuerySet 走数据库切片（只取当前页）；普通列表在内存切片。
     mapper：把每条记录转成可序列化的 dict（如 Serializer 风格的 to_out），
     不传则要求元素本身已可序列化。
     """
     page_number, page_size = read_page_params(request)
-    total = queryset.count() if hasattr(queryset, "count") else len(list(queryset))
     start = (page_number - 1) * page_size
-    items = list(queryset[start : start + page_size])
-    if mapper is not None:
-        items = [mapper(item) for item in items]
+    if isinstance(queryset, QuerySet):
+        total = queryset.count()
+        rows = list(queryset[start : start + page_size])
+    else:
+        rows_all = list(queryset)
+        total = len(rows_all)
+        rows = rows_all[start : start + page_size]
+    items = [mapper(item) for item in rows] if mapper is not None else rows
     return page(items, page_number, page_size, total)
 
 
