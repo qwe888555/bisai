@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from typing import Literal, Optional
 
 from pydantic import Field
@@ -290,4 +290,125 @@ def live_link_out(link) -> dict:
         "version": int(link.version or 0),
         "createdAt": link.created_at,
         "updatedAt": link.updated_at,
+    }
+
+# ---------------------------------------------------------------- 内容引擎（7.1）与门户资源（7.2）
+
+ContentContentType = Literal["NEWS", "POLICY", "HIGHLIGHT", "BEST_LINEUP"]
+ContentStatus = Literal["DRAFT", "PUBLISHED", "OFFLINE"]
+ResourceType = Literal["CAROUSEL", "NEWS_LINK_IMAGE", "PARTNER"]
+
+
+class VersionRequest(StrictSchema):
+    version: int = Field(ge=0)
+
+
+class ReasonVersionRequest(StrictSchema):
+    version: int = Field(ge=0)
+    reason: str = Field(min_length=1, max_length=500)
+
+
+class ContentCreate(StrictSchema):
+    contentType: ContentContentType
+    title: str = Field(min_length=1, max_length=200)
+    summary: str = Field(default="", max_length=1000)
+    bodyHtml: str = Field(min_length=1, max_length=50000)
+    coverFileId: str = Field(default="", max_length=64)
+    eventId: str = Field(default="", max_length=64)
+    groupId: str = Field(default="", max_length=64)
+    policyDocumentNo: str = Field(default="", max_length=100)
+    policyEffectiveFrom: Optional[date] = None
+    policyEffectiveTo: Optional[date] = None
+    pinned: bool = False
+
+
+class ContentUpdate(ContentCreate):
+    version: int = Field(ge=0)
+
+
+class PortalResourceCreate(StrictSchema):
+    resourceType: ResourceType
+    title: str = Field(min_length=1, max_length=150)
+    imageFileId: str = Field(default="", max_length=64)
+    targetContentId: str = Field(default="", max_length=64)
+    targetUrl: str = Field(default="", max_length=2000)
+    sortOrder: int = Field(default=0, ge=0)
+    enabled: bool = True
+
+
+class PortalResourceUpdate(PortalResourceCreate):
+    version: int = Field(ge=0)
+
+
+def _date_str(value) -> Optional[str]:
+    return value.isoformat() if value else None
+
+
+def content_out(content) -> dict:
+    data = {
+        "id": content.pk,
+        "contentType": content.content_type,
+        "title": content.title,
+        "summary": content.summary or "",
+        "bodyHtml": content.body_html,
+        "coverFileId": content.cover_file_id or "",
+        "eventId": content.event_id or "",
+        "groupId": content.group_id or "",
+        "policyDocumentNo": content.policy_document_no or "",
+        "pinned": bool(content.pinned),
+        "status": content.status,
+        "revision": int(content.revision or 1),
+        "bodyText": content.body_text or "",
+        "version": int(content.version or 0),
+        "createdAt": content.created_at,
+        "updatedAt": content.updated_at,
+    }
+    data["policyEffectiveFrom"] = _date_str(content.policy_effective_from)
+    data["policyEffectiveTo"] = _date_str(content.policy_effective_to)
+    data["publishedAt"] = content.published_at
+    return data
+
+
+def public_content_out(content) -> dict:
+    """PublicContent 安全投影：不含 version/status/bodyText/pinned 等内部字段。"""
+    return {
+        "id": content.pk,
+        "contentType": content.content_type,
+        "title": content.title,
+        "summary": content.summary or "",
+        "bodyHtml": content.body_html,
+        "publicCoverUrl": "",
+        "eventId": content.event_id or "",
+        "groupId": content.group_id or "",
+        "publishedAt": content.published_at,
+        "revision": int(content.revision or 1),
+    }
+
+
+def portal_resource_out(resource) -> dict:
+    return {
+        "id": resource.pk,
+        "resourceType": resource.resource_type,
+        "title": resource.title,
+        "imageFileId": resource.image_file_id or "",
+        "targetContentId": resource.target_content_id or "",
+        "targetUrl": resource.target_url or "",
+        "sortOrder": int(resource.sort_order or 0),
+        "enabled": bool(resource.enabled),
+        "version": int(resource.version or 0),
+        "createdAt": resource.created_at,
+        "updatedAt": resource.updated_at,
+    }
+
+
+def public_resource_out(resource) -> dict:
+    """PublicResource 安全投影：不暴露 imageFileId 内部引用与 enabled。"""
+    return {
+        "id": resource.pk,
+        "resourceType": resource.resource_type,
+        "title": resource.title,
+        "imageUrl": "",
+        "targetContentId": resource.target_content_id or "",
+        "targetUrl": resource.target_url or "",
+        "sortOrder": int(resource.sort_order or 0),
     }

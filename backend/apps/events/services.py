@@ -608,3 +608,334 @@ def delete_live_link(match_id: str, link_id: str, version: int):
     bump(link)
     link.save()
     return link
+
+# ---------------------------------------------------------------- 富文本白名单清洗（7.1 防 XSS）
+
+from html.parser import HTMLParser as _HTMLParser
+from html import escape as _html_escape
+
+_SANITIZE_ALLOWED_TAGS = {
+    "p", "br", "strong", "b", "em", "i", "u", "ins", "del",
+    "ul", "ol", "li", "h1", "h2", "h3", "blockquote", "pre", "code",
+    "img", "a", "span", "div", "table", "thead", "tbody", "tr", "td", "th",
+}
+_SANITIZE_ALLOWED_ATTRS = {"a": {"href"}, "img": {"src", "alt"}}
+
+
+def _safe_sanitize_url(url: str) -> bool:
+    u = (url or "").strip().lower()
+    return (
+        u.startswith("http://")
+        or u.startswith("https://")
+        or u.startswith("/")
+        or u.startswith("#")
+        or u.startswith("mailto:")
+    )
+
+
+class _HtmlSanitizer(_HTMLParser):
+    """白名单标签/属性清洗：剥离 script/style/iframe/事件属性/javascript 协议。"""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._parts: list[str] = []
+        self._text: list[str] = []
+        self._skip = False
+
+    def handle_starttag(self, tag, attrs):
+        tag = tag.lower()
+        if tag in ("script", "style"):
+            self._skip = True
+            return
+        if tag not in _SANITIZE_ALLOWED_TAGS:
+            return
+        allowed = _SANITIZE_ALLOWED_ATTRS.get(tag, set())
+        safe: list[str] = []
+        for key, value in attrs:
+            k = key.lower()
+            if k.startswith("on") or k not in allowed:
+                continue
+            if not _safe_sanitize_url(value or ""):
+                continue
+            safe.append(f'{k}="{_html_escape(value, quote=True)}"')
+        self._parts.append(f"<{tag}" + ((" " + " ".join(safe)) if safe else "") + ">")
+
+    def handle_endtag(self, tag):
+        tag = tag.lower()
+        if tag in ("script", "style"):
+            self._skip = False
+            return
+        if tag in _SANITIZE_ALLOWED_TAGS:
+            self._parts.append(f"</{tag}>")
+
+    def handle_data(self, data):
+        if self._skip:
+            return
+        self._parts.append(data)
+        self._text.append(data)
+
+    @property
+    def cleaned_html(self) -> str:
+        return "".join(self._parts)
+
+    @property
+    def plain_text(self) -> str:
+        return " ".join("".join(self._text).split())
+
+
+def sanitize_body_html(html: str) -> tuple[str, str]:
+    """返回 (清洗后HTML, 去标签纯文本 bodyText)。"""
+    parser = _HtmlSanitizer()
+    parser.feed(html or "")
+    return parser.cleaned_html, parser.plain_text
+
+
+# ---------------------------------------------------------------- 内容引擎（7.1）
+
+def _invalidate_public_cache() -> None:
+    from django.core.cache import cache
+
+    cache.clear()
+
+
+def _content_queryset(filters: dict, published_only: bool = False):
+    from .models import Content, Event
+
+    queryset = Content.objects.all()
+    if published_only:
+        queryset = queryset.filter(status="PUBLISHED")
+    if filters.get("contentType"):
+        queryset = queryset.filter(content_type=filters["contentType"])
+    if filters.get("eventId"):
+        queryset = queryset.filter(event_id=filters["eventId"])
+    if filters.get("groupId"):
+        queryset = queryset.filter(group_id=filters["groupId"])
+    if filters.get("status") and not published_only:
+        queryset = queryset.filter(status=filters["status"])
+    if filters.get("keyword"):
+        kw = filters["keyword"]
+        queryset = queryset.filter(title__icontains=kw)
+    if filters.get("eventCategory"):
+        event_ids = Event.objects.filter(
+            event_category=filters["eventCategory"]
+        ).values_list("id", flat=True)
+        queryset = queryset.filter(event_id__in=list(event_ids) + [""])
+    return queryset
+
+
+def list_contents(filters: dict):
+    return _content_queryset(filters).order_by("-pinned", "-published_at", "-created_at")
+
+
+def get_content(content_id: str):
+    from .models import Content
+
+    content = Content.objects.filter(pk=content_id).first()
+    if content is None:
+        raise ApiError(NOT_FOUND)
+    return content
+
+
+def _apply_content_fields(content, data: dict) -> None:
+    cleaned, body_text = sanitize_body_html(data["bodyHtml"])
+    content.content_type = data["contentType"]
+    content.title = data["title"]
+    content.summary = data.get("summary", "")
+    content.body_html = cleaned
+    content.body_text = body_text
+    content.cover_file_id = data.get("coverFileId", "")
+    content.event_id = data.get("eventId", "")
+    content.group_id = data.get("groupId", "")
+    content.policy_document_no = data.get("policyDocumentNo", "")
+    content.policy_effective_from = data.get("policyEffectiveFrom")
+    content.policy_effective_to = data.get("policyEffectiveTo")
+    content.pinned = bool(data.get("pinned", False))
+
+
+def create_content(data: dict):
+    from .models import Content
+
+    cleaned, body_text = sanitize_body_html(data["bodyHtml"])
+    content = Content.objects.create(
+        id=new_id("cnt"),
+        content_type=data["contentType"],
+        title=data["title"],
+        summary=data.get("summary", ""),
+        body_html=cleaned,
+        body_text=body_text,
+        cover_file_id=data.get("coverFileId", ""),
+        event_id=data.get("eventId", ""),
+        group_id=data.get("groupId", ""),
+        policy_document_no=data.get("policyDocumentNo", ""),
+        policy_effective_from=data.get("policyEffectiveFrom"),
+        policy_effective_to=data.get("policyEffectiveTo"),
+        pinned=bool(data.get("pinned", False)),
+        status="DRAFT",
+        revision=1,
+    )
+    _invalidate_public_cache()
+    return content
+
+
+def update_content(content_id: str, data: dict):
+    content = get_content(content_id)
+    check_version(content, data.get("version"))
+    _apply_content_fields(content, data)
+    # 修改已发布内容：正文修订版本 +1，公开版本同步
+    content.revision = int(content.revision or 1) + 1
+    bump(content)
+    content.save()
+    _invalidate_public_cache()
+    return content
+
+
+def delete_content(content_id: str, version: int):
+    content = get_content(content_id)
+    check_version(content, version)
+    content.deleted_at = timezone.now()
+    bump(content)
+    content.save()
+    _invalidate_public_cache()
+    return content
+
+
+def publish_content(content_id: str, version: int):
+    content = get_content(content_id)
+    check_version(content, version)
+    content.status = "PUBLISHED"
+    content.published_at = timezone.now()
+    bump(content)
+    content.save()
+    _invalidate_public_cache()
+    return content
+
+
+def unpublish_content(content_id: str, version: int, reason: str):
+    content = get_content(content_id)
+    check_version(content, version)
+    content.status = "OFFLINE"
+    bump(content)
+    content.save()
+    _invalidate_public_cache()
+    return content
+
+
+# ---------------------------------------------------------------- 门户资源（7.2）
+
+def _validate_resource_target(resource_type: str, image_file_id: str,
+                             target_content_id: str, target_url: str, enabled: bool) -> None:
+    if target_content_id and target_url:
+        raise ApiError(
+            BUSINESS_VALIDATION_FAILED,
+            "targetContentId 与 targetUrl 至多一个",
+            [{"field": "targetUrl", "reason": "二者只能填一个"}],
+        )
+    if target_url and not (target_url.startswith("http://") or target_url.startswith("https://")):
+        raise ApiError(
+            BUSINESS_VALIDATION_FAILED,
+            "targetUrl 仅支持 http/https",
+            [{"field": "targetUrl", "reason": "必须以 http:// 或 https:// 开头"}],
+        )
+    if resource_type in ("CAROUSEL", "NEWS_LINK_IMAGE") and enabled and not image_file_id:
+        raise ApiError(
+            BUSINESS_VALIDATION_FAILED,
+            "轮播/新闻链接图启用时必须上传图片",
+            [{"field": "imageFileId", "reason": "启用状态必填"}],
+        )
+
+
+def list_portal_resources(resource_type: Optional[str], enabled: Optional[bool]):
+    from .models import PortalResource
+
+    queryset = PortalResource.objects.all()
+    if resource_type:
+        queryset = queryset.filter(resource_type=resource_type)
+    if enabled is not None:
+        queryset = queryset.filter(enabled=enabled)
+    return queryset.order_by("sort_order", "-created_at")
+
+
+def get_portal_resource(resource_id: str):
+    from .models import PortalResource
+
+    resource = PortalResource.objects.filter(pk=resource_id).first()
+    if resource is None:
+        raise ApiError(NOT_FOUND)
+    return resource
+
+
+def create_portal_resource(data: dict):
+    from .models import PortalResource
+
+    _validate_resource_target(
+        data["resourceType"], data.get("imageFileId", ""),
+        data.get("targetContentId", ""), data.get("targetUrl", ""),
+        bool(data.get("enabled", True)),
+    )
+    resource = PortalResource.objects.create(
+        id=new_id("pres"),
+        resource_type=data["resourceType"],
+        title=data["title"],
+        image_file_id=data.get("imageFileId", ""),
+        target_content_id=data.get("targetContentId", ""),
+        target_url=data.get("targetUrl", ""),
+        sort_order=data.get("sortOrder", 0),
+        enabled=bool(data.get("enabled", True)),
+    )
+    _invalidate_public_cache()
+    return resource
+
+
+def update_portal_resource(resource_id: str, data: dict):
+    resource = get_portal_resource(resource_id)
+    check_version(resource, data.get("version"))
+    _validate_resource_target(
+        data["resourceType"], data.get("imageFileId", ""),
+        data.get("targetContentId", ""), data.get("targetUrl", ""),
+        bool(data.get("enabled", True)),
+    )
+    resource.resource_type = data["resourceType"]
+    resource.title = data["title"]
+    resource.image_file_id = data.get("imageFileId", "")
+    resource.target_content_id = data.get("targetContentId", "")
+    resource.target_url = data.get("targetUrl", "")
+    resource.sort_order = data.get("sortOrder", 0)
+    resource.enabled = bool(data.get("enabled", True))
+    bump(resource)
+    resource.save()
+    _invalidate_public_cache()
+    return resource
+
+
+def delete_portal_resource(resource_id: str, version: int):
+    resource = get_portal_resource(resource_id)
+    check_version(resource, version)
+    resource.deleted_at = timezone.now()
+    bump(resource)
+    resource.save()
+    _invalidate_public_cache()
+    return resource
+
+
+# ---------------------------------------------------------------- 公开只读（7.1 / 7.2，免登录）
+
+def public_list_contents(filters: dict):
+    return _content_queryset(filters, published_only=True).order_by(
+        "-pinned", "-published_at", "-created_at"
+    )
+
+
+def public_get_content(content_id: str):
+    content = get_content(content_id)
+    if content.status != "PUBLISHED":
+        raise ApiError(NOT_FOUND)
+    return content
+
+
+def public_list_resources(resource_type: Optional[str]):
+    from .models import PortalResource
+
+    queryset = PortalResource.objects.filter(enabled=True)
+    if resource_type:
+        queryset = queryset.filter(resource_type=resource_type)
+    return queryset.order_by("sort_order", "-created_at")

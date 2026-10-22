@@ -668,3 +668,164 @@ def live_link_delete(request, match_id: str, link_id: str, version: Optional[int
         summary="删除直播链接",
     )
     return action_result(True, link.pk, link.version)
+
+# ---------------------------------------------------------------- 内容引擎（7.1，ADMIN / PROVINCE_REVIEWER）
+
+_CMS_ROLES = (ADMIN, PROVINCE_REVIEWER)
+register_operation("contentList", _CMS_ROLES)
+register_operation("contentCreate", _CMS_ROLES)
+register_operation("contentGet", _CMS_ROLES)
+register_operation("contentUpdate", _CMS_ROLES)
+register_operation("contentDelete", _CMS_ROLES)
+register_operation("contentPublish", _CMS_ROLES)
+register_operation("contentUnpublish", _CMS_ROLES)
+
+
+@router.get("/contents", auth=_auth, response=EnvelopeOut, summary="分页查询内容")
+def content_list(
+    request,
+    contentType: Optional[str] = None,
+    eventId: Optional[str] = None,
+    groupId: Optional[str] = None,
+    status: Optional[str] = None,
+    keyword: Optional[str] = None,
+    eventCategory: Optional[str] = None,
+):
+    require("contentList")
+    qs = services.list_contents({
+        "contentType": contentType, "eventId": eventId, "groupId": groupId,
+        "status": status, "keyword": keyword, "eventCategory": eventCategory,
+    })
+    return paginate(request, qs, mapper=s.content_out)
+
+
+@router.post("/contents", auth=_auth, response=EnvelopeOut, summary="创建内容")
+def content_create(request, body: s.ContentCreate):
+    require("contentCreate")
+    content = services.create_content(body.model_dump())
+    audit_state(request, "content.create", object_type="Content",
+                object_id=content.pk, summary="创建内容")
+    return ok(s.content_out(content))
+
+
+@router.get("/contents/{content_id}", auth=_auth, response=EnvelopeOut, summary="内容详情")
+def content_get(request, content_id: str):
+    require("contentGet")
+    return ok(s.content_out(services.get_content(content_id)))
+
+
+@router.put("/contents/{content_id}", auth=_auth, response=EnvelopeOut, summary="修改内容")
+def content_update(request, content_id: str, body: s.ContentUpdate):
+    require("contentUpdate")
+    content = services.update_content(content_id, body.model_dump())
+    audit_state(request, "content.update", object_type="Content",
+                object_id=content.pk, summary="修改内容，revision 递增")
+    return ok(s.content_out(content))
+
+
+@router.delete("/contents/{content_id}", auth=_auth, response=EnvelopeOut, summary="删除内容")
+def content_delete(request, content_id: str, version: Optional[int] = None):
+    require("contentDelete")
+    version = _require_version(version)
+    content = services.delete_content(content_id, version)
+    audit_state(request, "content.delete", object_type="Content",
+                object_id=content.pk, summary="删除内容")
+    return action_result(True, content.pk, content.version)
+
+
+@router.post("/contents/{content_id}/publish", auth=_auth, response=EnvelopeOut, summary="发布内容")
+def content_publish(request, content_id: str, body: s.VersionRequest):
+    require("contentPublish")
+    content = services.publish_content(content_id, body.version)
+    audit_state(request, "content.publish", object_type="Content",
+                object_id=content.pk, summary="发布内容")
+    return ok(s.content_out(content))
+
+
+@router.post("/contents/{content_id}/unpublish", auth=_auth, response=EnvelopeOut, summary="内容下线")
+def content_unpublish(request, content_id: str, body: s.ReasonVersionRequest):
+    require("contentUnpublish")
+    content = services.unpublish_content(content_id, body.version, body.reason)
+    audit_state(request, "content.unpublish", object_type="Content",
+                object_id=content.pk, summary=f"内容下线：{body.reason}")
+    return ok(s.content_out(content))
+
+
+# ---------------------------------------------------------------- 门户资源（7.2，ADMIN / PROVINCE_REVIEWER）
+
+register_operation("portalResourceList", _CMS_ROLES)
+register_operation("portalResourceCreate", _CMS_ROLES)
+register_operation("portalResourceGet", _CMS_ROLES)
+register_operation("portalResourceUpdate", _CMS_ROLES)
+register_operation("portalResourceDelete", _CMS_ROLES)
+
+
+@router.get("/portal-resources", auth=_auth, response=EnvelopeOut, summary="分页查询门户资源")
+def portal_resource_list(request, resourceType: Optional[str] = None, enabled: Optional[bool] = None):
+    require("portalResourceList")
+    qs = services.list_portal_resources(resourceType, enabled)
+    return paginate(request, qs, mapper=s.portal_resource_out)
+
+
+@router.post("/portal-resources", auth=_auth, response=EnvelopeOut, summary="创建门户资源")
+def portal_resource_create(request, body: s.PortalResourceCreate):
+    require("portalResourceCreate")
+    resource = services.create_portal_resource(body.model_dump())
+    audit_state(request, "portalResource.create", object_type="PortalResource",
+                object_id=resource.pk, summary="创建门户资源")
+    return ok(s.portal_resource_out(resource))
+
+
+@router.get("/portal-resources/{resource_id}", auth=_auth, response=EnvelopeOut, summary="门户资源详情")
+def portal_resource_get(request, resource_id: str):
+    require("portalResourceGet")
+    return ok(s.portal_resource_out(services.get_portal_resource(resource_id)))
+
+
+@router.put("/portal-resources/{resource_id}", auth=_auth, response=EnvelopeOut, summary="修改门户资源")
+def portal_resource_update(request, resource_id: str, body: s.PortalResourceUpdate):
+    require("portalResourceUpdate")
+    resource = services.update_portal_resource(resource_id, body.model_dump())
+    audit_state(request, "portalResource.update", object_type="PortalResource",
+                object_id=resource.pk, summary="修改门户资源")
+    return ok(s.portal_resource_out(resource))
+
+
+@router.delete("/portal-resources/{resource_id}", auth=_auth, response=EnvelopeOut, summary="删除门户资源")
+def portal_resource_delete(request, resource_id: str, version: Optional[int] = None):
+    require("portalResourceDelete")
+    version = _require_version(version)
+    resource = services.delete_portal_resource(resource_id, version)
+    audit_state(request, "portalResource.delete", object_type="PortalResource",
+                object_id=resource.pk, summary="删除门户资源")
+    return action_result(True, resource.pk, resource.version)
+
+
+# ---------------------------------------------------------------- 公开只读（7.1 / 7.2，免登录）
+
+@router.get("/public/contents", auth=None, response=EnvelopeOut, summary="门户已发布内容列表")
+def public_content_list(
+    request,
+    contentType: Optional[str] = None,
+    eventId: Optional[str] = None,
+    groupId: Optional[str] = None,
+    keyword: Optional[str] = None,
+    eventCategory: Optional[str] = None,
+):
+    qs = services.public_list_contents({
+        "contentType": contentType, "eventId": eventId, "groupId": groupId,
+        "keyword": keyword, "eventCategory": eventCategory,
+    })
+    return paginate(request, qs, mapper=s.public_content_out)
+
+
+@router.get("/public/contents/{content_id}", auth=None, response=EnvelopeOut, summary="门户内容详情")
+def public_content_get(request, content_id: str):
+    content = services.public_get_content(content_id)
+    return ok(s.public_content_out(content))
+
+
+@router.get("/public/resources", auth=None, response=EnvelopeOut, summary="门户轮播/链接图/合作方展示")
+def public_resource_list(request, resourceType: Optional[str] = None):
+    qs = services.public_list_resources(resourceType)
+    return paginate(request, qs, mapper=s.public_resource_out)
