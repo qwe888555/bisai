@@ -12,7 +12,7 @@ from typing import Optional
 from urllib.parse import quote
 
 from django.http import HttpResponse
-from ninja import File, Form, Router
+from ninja import File, Form, Router, Status
 from ninja.files import UploadedFile
 
 from apps.common import idempotency
@@ -330,7 +330,9 @@ def submit_enrollment(request, enrollment_id: str, body: s.VersionRequestIn):
         request, "submitEnrollment", object_id=enrollment_id, payload=body
     )
     if g.replay is not None:
-        return g.replay
+        # ninja 1.7 起弃用 (status_code, body) 元组响应，统一用 Status 包装
+        status_code, replay_body = g.replay
+        return Status(status_code, replay_body)
     data = services.submit_enrollment(actor, enrollment_id, body.version)
     envelope = ok(data)
     g.commit(envelope)
@@ -381,7 +383,9 @@ def review_enrollment(
         request, "reviewEnrollment", object_id=enrollment_id, payload=body
     )
     if g.replay is not None:
-        return g.replay
+        # ninja 1.7 起弃用 (status_code, body) 元组响应，统一用 Status 包装
+        status_code, replay_body = g.replay
+        return Status(status_code, replay_body)
     data = services.review_enrollment(actor, enrollment_id, body)
     envelope = ok(data)
     g.commit(envelope)
