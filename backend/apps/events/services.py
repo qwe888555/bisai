@@ -12,6 +12,7 @@ from django.utils import timezone
 
 from apps.common.errors import (
     BUSINESS_VALIDATION_FAILED,
+    FORBIDDEN,
     NOT_FOUND,
     STATE_CONFLICT,
     ApiError,
@@ -939,3 +940,125 @@ def public_list_resources(resource_type: Optional[str]):
     if resource_type:
         queryset = queryset.filter(resource_type=resource_type)
     return queryset.order_by("sort_order", "-created_at")
+
+# ---------------------------------------------------------------- 赛果(5.5)
+
+_ADMIN_RESULT_ROLES = {"ADMIN", "PROVINCE_REVIEWER"}
+
+
+def get_match_result(match_id: str) -> "Match":
+    return get_match(match_id)
+
+
+def write_match_result(match_id: str, data: dict, roles) -> "Match":
+    """保存/修改赛果。NORMAL 比分由有效进球事件派生，不接受手填；
+    FORFEIT/ADMIN_CORRECTION 仅 ADMIN/PROVINCE_REVIEWER，必填原因与人工比分。"""
+    match = get_match(match_id)
+    check_version(match, data.get("version"))
+    rtype = data["resultType"]
+
+    if rtype == "NORMAL":
+        _rescore(match)
+        match.result_type = "NORMAL"
+        match.manual_home_score = None
+        match.manual_away_score = None
+        match.result_reason = ""
+    else:
+        if not (set(roles or ()) & _ADMIN_RESULT_ROLES):
+            raise ApiError(FORBIDDEN, "弃权/行政更正仅限管理员或省级审核",
+                           [{"field": "resultType", "reason": "需要 ADMIN/PROVINCE_REVIEWER"}])
+        reason = (data.get("reason") or "").strip()
+        if not reason:
+            raise ApiError(BUSINESS_VALIDATION_FAILED, "弃权/行政更正必须填写原因",
+                           [{"field": "reason", "reason": "人工裁定必填 reason"}])
+        mh, ma = data.get("manualHomeScore"), data.get("manualAwayScore")
+        if mh is None or ma is None:
+            raise ApiError(BUSINESS_VALIDATION_FAILED, "弃权/行政更正必须填写双方人工比分",
+                           [{"field": "manualHomeScore", "reason": "必填"}])
+        match.result_type = rtype
+        match.manual_home_score = mh
+        match.manual_away_score = ma
+        match.home_score = mh
+        match.away_score = ma
+        match.result_reason = reason
+
+    match.score_revision = int(match.score_revision or 0) + 1
+    bump(match)
+    match.save()
+    return match
+
+
+def publish_match_result(match_id: str, version: int) -> "Match":
+    match = get_match(match_id)
+    check_version(match, version)
+    if match.status != "FINISHED":
+        raise ApiError(STATE_CONFLICT, "仅 FINISHED 且已确认赛果可发布",
+                       [{"field": "status", "reason": f"当前状态 {match.status}"}])
+    match.result_published = True
+    bump(match)
+    match.save()
+    return match
+
+
+def delete_match_result(match_id: str, version: int) -> "Match":
+    """撤下发布/人工裁定：不删底层比赛事件，回到 NORMAL 由事件重算，不自动重新发布。"""
+    match = get_match(match_id)
+    check_version(match, version)
+    match.result_published = False
+    match.result_type = "NORMAL"
+    match.manual_home_score = None
+    match.manual_away_score = None
+    match.result_reason = ""
+    _rescore(match)
+    bump(match)
+    match.save()
+    return match
+
+
+# ---------------------------------------------------------------- 进球榜(5.5，由 GOAL 事件派生)
+
+def goal_ranking(event_id: str, group_id: Optional[str], category: Optional[str],
+                 page: int, page_size: int) -> dict:
+    from .models import Match, MatchEvent, EventGroup
+
+    qs = Match.objects.filter(event_id=event_id).exclude(status="CANCELLED")
+    if group_id:
+        qs = qs.filter(group_id=group_id)
+    if category:
+        group_ids = list(EventGroup.objects.filter(category=category).values_list("id", flat=True))
+        qs = qs.filter(group_id__in=group_ids)
+    match_ids = list(qs.values_list("id", flat=True))
+
+    # 非乌龙有效进球，按球员聚合；球队取得分队 teamId。
+    agg: dict[str, dict] = {}
+    goals = MatchEvent.objects.filter(
+        match_id__in=match_ids, event_type="GOAL", own_goal=False
+    )
+    for g in goals:
+        key = g.scorer_athlete_id or g.pk
+        bucket = agg.setdefault(key, {"goals": 0, "teamId": g.team_id})
+        bucket["goals"] += 1
+
+    # 密集排名：同分同名次，按进球降序、ID 升序稳定排序
+    rows = sorted(agg.items(), key=lambda kv: (-kv[1]["goals"], kv[0]))
+    ranked: list[dict] = []
+    rank = 0
+    prev_goals = None
+    for idx, (athlete_id, info) in enumerate(rows, start=1):
+        if info["goals"] != prev_goals:
+            rank = idx
+            prev_goals = info["goals"]
+        ranked.append({
+            "rank": rank,
+            "athleteId": athlete_id,
+            # 名册/公示由成员6提供，本库无姓名来源，不伪造：先用占位，teamName 留空
+            "athleteName": athlete_id,
+            "teamId": info["teamId"],
+            "teamName": "",
+            "goals": info["goals"],
+        })
+
+    total = len(ranked)
+    start = (page - 1) * page_size
+    items = ranked[start:start + page_size]
+    return {"items": items, "page": page, "pageSize": page_size, "total": total}

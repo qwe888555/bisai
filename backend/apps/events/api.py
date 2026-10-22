@@ -829,3 +829,61 @@ def public_content_get(request, content_id: str):
 def public_resource_list(request, resourceType: Optional[str] = None):
     qs = services.public_list_resources(resourceType)
     return paginate(request, qs, mapper=s.public_resource_out)
+
+# ---------------------------------------------------------------- 赛果(5.5)：MATCH_RECORDER / ADMIN / PROVINCE_REVIEWER
+
+_RESULT_ROLES = (MATCH_RECORDER, ADMIN, PROVINCE_REVIEWER)
+register_operation("matchResultGet", _RESULT_ROLES)
+register_operation("matchResultWrite", _RESULT_ROLES)
+register_operation("matchResultPublish", _RESULT_ROLES)
+register_operation("matchResultDelete", _RESULT_ROLES)
+register_operation("goalRanking", _RESULT_ROLES)
+
+
+@router.get("/matches/{match_id}/result", auth=_auth, response=EnvelopeOut, summary="赛果信息")
+def match_result_get(request, match_id: str):
+    require("matchResultGet")
+    return ok(s.match_result_out(services.get_match_result(match_id)))
+
+
+@router.put("/matches/{match_id}/result", auth=_auth, response=EnvelopeOut, summary="保存或修改赛果")
+def match_result_write(request, match_id: str, body: s.MatchResultWrite):
+    account = require("matchResultWrite")
+    match = services.write_match_result(match_id, body.model_dump(), getattr(account, "roles", ()))
+    audit_state(request, "matchResult.write", object_type="Match",
+                object_id=match.pk, summary=f"保存赛果 {match.result_type}")
+    return ok(s.match_result_out(match))
+
+
+@router.post("/matches/{match_id}/result/publish", auth=_auth, response=EnvelopeOut, summary="发布已确认赛果")
+def match_result_publish(request, match_id: str, body: s.VersionRequest):
+    require("matchResultPublish")
+    match = services.publish_match_result(match_id, body.version)
+    audit_state(request, "matchResult.publish", object_type="Match",
+                object_id=match.pk, summary="发布赛果")
+    return ok(s.match_result_out(match))
+
+
+@router.delete("/matches/{match_id}/result", auth=_auth, response=EnvelopeOut, summary="撤下赛果")
+def match_result_delete(request, match_id: str, version: Optional[int] = None):
+    require("matchResultDelete")
+    version = _require_version(version)
+    match = services.delete_match_result(match_id, version)
+    audit_state(request, "matchResult.delete", object_type="Match",
+                object_id=match.pk, summary="撤下赛果，回到事件派生")
+    return action_result(True, match.pk, match.version)
+
+
+@router.get("/statistics/goals", auth=_auth, response=EnvelopeOut, summary="进球榜及分组统计")
+def goal_ranking(
+    request,
+    eventId: str,
+    groupId: Optional[str] = None,
+    category: Optional[str] = None,
+    page: int = 1,
+    pageSize: int = 20,
+):
+    require("goalRanking")
+    page = max(1, page)
+    pageSize = min(100, max(1, pageSize))
+    return ok(services.goal_ranking(eventId, groupId, category, page, pageSize))

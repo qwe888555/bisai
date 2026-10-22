@@ -158,6 +158,11 @@ class Match(SoftDeleteVersionedModel):
     score_revision = models.PositiveIntegerField(default=0)
     # 图文直播短轮询父资源版本：每次新增/修改/删除直播帖都 +1
     feed_revision = models.PositiveIntegerField(default=0)
+    # 5.5 赛果：NORMAL 比分由有效进球事件派生；FORFEIT/ADMIN_CORRECTION 用人工分与原因
+    result_type = models.CharField(max_length=18, default="NORMAL")
+    manual_home_score = models.PositiveIntegerField(null=True, blank=True)
+    manual_away_score = models.PositiveIntegerField(null=True, blank=True)
+    result_reason = models.CharField(max_length=1000, blank=True, default="")
 
     class Meta:
         db_table = "events_match"

@@ -412,3 +412,38 @@ def public_resource_out(resource) -> dict:
         "targetUrl": resource.target_url or "",
         "sortOrder": int(resource.sort_order or 0),
     }
+
+# ---------------------------------------------------------------- 赛果(5.5)与进球榜
+
+class MatchResultWrite(StrictSchema):
+    version: int = Field(ge=0)
+    resultType: Literal["NORMAL", "FORFEIT", "ADMIN_CORRECTION"]
+    manualHomeScore: Optional[int] = Field(None, ge=0)
+    manualAwayScore: Optional[int] = Field(None, ge=0)
+    reason: Optional[str] = Field(None, max_length=1000)
+
+
+def match_result_out(match) -> dict:
+    """MatchResult 投影；NORMAL 比分来自事件派生，人工比分落在 home/awayScore。"""
+    return {
+        "matchId": match.pk,
+        "resultType": match.result_type,
+        "homeScore": int(match.home_score or 0),
+        "awayScore": int(match.away_score or 0),
+        "reason": match.result_reason or "",
+        "published": bool(match.result_published),
+        "sourceScoreRevision": int(match.score_revision or 0),
+        "version": int(match.version or 0),
+    }
+
+
+def goal_ranking_row_out(rank: int, athlete_id: str, athlete_name: str,
+                         team_id: str, team_name: str, goals: int) -> dict:
+    return {
+        "rank": rank,
+        "athleteId": athlete_id,
+        "athleteName": athlete_name,
+        "teamId": team_id,
+        "teamName": team_name,
+        "goals": int(goals),
+    }
