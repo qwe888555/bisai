@@ -12,6 +12,7 @@ from ninja import Router
 
 from apps.common.authentication import JWTAuth
 from apps.common.envelope import action_result, ok
+from apps.common import idempotency
 from apps.common.errors import INVALID_ARGUMENT, ApiError
 from apps.common.middleware import audit_state
 from apps.common.pagination import paginate
@@ -338,3 +339,114 @@ def match_unpublish(request, match_id: str, body: s.MatchReasonVersionRequest):
         summary=f"下线对阵：{body.reason}",
     )
     return ok(s.match_out(match))
+
+# ---------------------------------------------------------------- 比赛事件流（5.2）
+
+register_operation("matchEventList", _MATCH_ROLES)
+register_operation("matchEventCreate", _MATCH_ROLES)
+register_operation("matchEventGet", _MATCH_ROLES)
+register_operation("matchEventUpdate", _MATCH_ROLES)
+register_operation("matchEventDelete", _MATCH_ROLES)
+
+
+@router.get(
+    "/matches/{match_id}/events",
+    auth=_auth,
+    response=EnvelopeOut,
+    summary="查看进球/判罚/换人事件",
+)
+def match_event_list(request, match_id: str, eventType: Optional[str] = None):
+    require("matchEventList")
+    queryset = services.list_match_events(match_id, eventType)
+    return paginate(request, queryset, mapper=s.match_event_out)
+
+
+@router.post(
+    "/matches/{match_id}/events",
+    auth=_auth,
+    response=EnvelopeOut,
+    summary="录入比赛事件",
+)
+def match_event_create(request, match_id: str, body: s.MatchEventCreate):
+    require("matchEventCreate")
+    g = idempotency.guard(
+        request, "matchEventCreate", object_id=match_id, payload=body.model_dump()
+    )
+    if g.replay is not None:
+        return g.replay
+    event = services.create_match_event(match_id, body.model_dump())
+    envelope = ok(s.match_event_out(event))
+    g.commit(envelope)
+    audit_state(
+        request,
+        "matchEvent.create",
+        object_type="MatchEvent",
+        object_id=event.pk,
+        summary=f"录入{event.event_type}事件",
+    )
+    return envelope
+
+
+@router.get(
+    "/matches/{match_id}/events/{event_id}",
+    auth=_auth,
+    response=EnvelopeOut,
+    summary="比赛事件详情",
+)
+def match_event_get(request, match_id: str, event_id: str):
+    require("matchEventGet")
+    event = services.get_match_event(match_id, event_id)
+    return ok(s.match_event_out(event))
+
+
+@router.put(
+    "/matches/{match_id}/events/{event_id}",
+    auth=_auth,
+    response=EnvelopeOut,
+    summary="修改进球/判罚事件",
+)
+def match_event_update(request, match_id: str, event_id: str, body: s.MatchEventUpdate):
+    require("matchEventUpdate")
+    event = services.update_match_event(
+        match_id, event_id, body.version, body.event.model_dump()
+    )
+    audit_state(
+        request,
+        "matchEvent.update",
+        object_type="MatchEvent",
+        object_id=event.pk,
+        summary="修改比赛事件，比分同步重算",
+    )
+    return ok(s.match_event_out(event))
+
+
+@router.delete(
+    "/matches/{match_id}/events/{event_id}",
+    auth=_auth,
+    response=EnvelopeOut,
+    summary="撤销比赛事件",
+)
+def match_event_delete(
+    request,
+    match_id: str,
+    event_id: str,
+    version: Optional[int] = None,
+    matchVersion: Optional[int] = None,
+):
+    require("matchEventDelete")
+    version = _require_version(version)
+    if matchVersion is None:
+        raise ApiError(
+            INVALID_ARGUMENT,
+            "缺少 matchVersion",
+            [{"field": "matchVersion", "reason": "撤销必须同时提交比赛版本"}],
+        )
+    event = services.delete_match_event(match_id, event_id, version, matchVersion)
+    audit_state(
+        request,
+        "matchEvent.delete",
+        object_type="MatchEvent",
+        object_id=event.pk,
+        summary="撤销比赛事件，比分同步重算",
+    )
+    return action_result(True, event.pk, event.version)

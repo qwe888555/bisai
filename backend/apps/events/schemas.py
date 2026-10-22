@@ -152,3 +152,66 @@ def match_out(match) -> dict:
     if match.away_score is not None:
         data["awayScore"] = int(match.away_score)
     return data
+
+# ---------------------------------------------------------------- 比赛事件（5.2）
+
+MatchEventType = Literal["GOAL", "PENALTY", "SUBSTITUTION"]
+PenaltyType = Literal["YELLOW_CARD", "RED_CARD", "PENALTY_KICK", "OTHER"]
+
+
+class MatchEventCreate(StrictSchema):
+    """按 eventType 分支：GOAL 需 scorerAthleteId；PENALTY 需 penaltyType+reason；
+    SUBSTITUTION 需 outAthleteId+inAthleteId。分支必填由服务层校验，三分支不混合。"""
+
+    eventType: MatchEventType
+    minute: int = Field(ge=0, le=150)
+    stoppageMinute: Optional[int] = Field(default=None, ge=0, le=30)
+    teamId: str = Field(min_length=1, max_length=64)
+    matchVersion: int = Field(ge=0)
+    note: str = Field(default="", max_length=1000)
+    # GOAL 专用
+    scorerAthleteId: Optional[str] = Field(default=None, min_length=1, max_length=64)
+    ownGoal: bool = False
+    # PENALTY 专用
+    athleteId: Optional[str] = Field(default=None, min_length=1, max_length=64)
+    penaltyType: Optional[PenaltyType] = None
+    reason: Optional[str] = Field(default=None, min_length=1, max_length=500)
+    # SUBSTITUTION 专用
+    outAthleteId: Optional[str] = Field(default=None, min_length=1, max_length=64)
+    inAthleteId: Optional[str] = Field(default=None, min_length=1, max_length=64)
+
+
+class MatchEventUpdate(StrictSchema):
+    version: int = Field(ge=0)
+    event: MatchEventCreate
+
+
+def match_event_out(event) -> dict:
+    data = {
+        "id": event.pk,
+        "matchId": event.match_id,
+        "eventType": event.event_type,
+        "minute": int(event.minute),
+        "teamId": event.team_id,
+        "ownGoal": bool(event.own_goal),
+        "note": event.note or "",
+        "matchVersion": int(event.match_version or 0),
+        "version": int(event.version or 0),
+        "createdAt": event.created_at,
+        "updatedAt": event.updated_at,
+    }
+    if event.stoppage_minute is not None:
+        data["stoppageMinute"] = int(event.stoppage_minute)
+    if event.scorer_athlete_id:
+        data["scorerAthleteId"] = event.scorer_athlete_id
+    if event.athlete_id:
+        data["athleteId"] = event.athlete_id
+    if event.penalty_type:
+        data["penaltyType"] = event.penalty_type
+    if event.reason:
+        data["reason"] = event.reason
+    if event.out_athlete_id:
+        data["outAthleteId"] = event.out_athlete_id
+    if event.in_athlete_id:
+        data["inAthleteId"] = event.in_athlete_id
+    return data

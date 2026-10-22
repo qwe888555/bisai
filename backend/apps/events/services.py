@@ -306,3 +306,145 @@ def unpublish_match(match_id: str, version: int, reason: str) -> "Match":
     # 下线理由写入审计，不落冗余字段
     match._unpublish_reason = reason
     return match
+
+# ---------------------------------------------------------------- 比赛事件流（5.2）
+
+def _rescore(match) -> None:
+    """由未撤销 GOAL 事件重算比分；不接受手填比分。teamId 即得分队。"""
+    from .models import MatchEvent
+
+    goals = MatchEvent.objects.filter(match_id=match.pk, event_type="GOAL")
+    match.home_score = sum(1 for g in goals if g.team_id == match.home_team_id)
+    match.away_score = sum(1 for g in goals if g.team_id == match.away_team_id)
+
+
+def _validate_event_team(match, team_id: str) -> None:
+    if team_id not in (match.home_team_id, match.away_team_id):
+        raise ApiError(
+            BUSINESS_VALIDATION_FAILED,
+            "teamId 不属于本场双方",
+            [{"field": "teamId", "reason": "只能填写主队或客队 ID"}],
+        )
+
+
+def _validate_event_payload(data: dict) -> None:
+    etype = data["eventType"]
+    if etype == "GOAL" and not data.get("scorerAthleteId"):
+        raise ApiError(BUSINESS_VALIDATION_FAILED, "进球必须填写 scorerAthleteId",
+                       [{"field": "scorerAthleteId", "reason": "GOAL 必填"}])
+    elif etype == "PENALTY":
+        if not data.get("penaltyType"):
+            raise ApiError(BUSINESS_VALIDATION_FAILED, "判罚必须填写 penaltyType",
+                           [{"field": "penaltyType", "reason": "PENALTY 必填"}])
+        if not (data.get("reason") or "").strip():
+            raise ApiError(BUSINESS_VALIDATION_FAILED, "判罚必须填写 reason",
+                           [{"field": "reason", "reason": "PENALTY 必填"}])
+    elif etype == "SUBSTITUTION":
+        if not data.get("outAthleteId") or not data.get("inAthleteId"):
+            raise ApiError(BUSINESS_VALIDATION_FAILED, "换人必须填写 outAthleteId 与 inAthleteId",
+                           [{"field": "event", "reason": "SUBSTITUTION 双方球员必填"}])
+
+
+def list_match_events(match_id: str, event_type: Optional[str]):
+    from .models import MatchEvent
+
+    get_match(match_id)
+    queryset = MatchEvent.objects.filter(match_id=match_id)
+    if event_type:
+        queryset = queryset.filter(event_type=event_type)
+    # 时间序列：按分钟、补时、录入顺序
+    return queryset.order_by("minute", "stoppage_minute", "created_at", "id")
+
+
+def get_match_event(match_id: str, event_id: str):
+    from .models import MatchEvent
+
+    event = MatchEvent.objects.filter(pk=event_id, match_id=match_id).first()
+    if event is None:
+        raise ApiError(NOT_FOUND)
+    return event
+
+
+def create_match_event(match_id: str, data: dict):
+    from django.db import transaction
+
+    from .models import MatchEvent
+
+    match = get_match(match_id)
+    check_version(match, data.get("matchVersion"))
+    _validate_event_team(match, data["teamId"])
+    _validate_event_payload(data)
+    with transaction.atomic():
+        snapshot_version = int(match.version or 0)
+        event = MatchEvent.objects.create(
+            id=new_id("mev"),
+            match_id=match.pk,
+            event_type=data["eventType"],
+            minute=data["minute"],
+            stoppage_minute=data.get("stoppageMinute"),
+            team_id=data["teamId"],
+            scorer_athlete_id=data.get("scorerAthleteId") or "",
+            own_goal=bool(data.get("ownGoal", False)),
+            athlete_id=data.get("athleteId") or "",
+            penalty_type=data.get("penaltyType"),
+            reason=data.get("reason") or "",
+            out_athlete_id=data.get("outAthleteId") or "",
+            in_athlete_id=data.get("inAthleteId") or "",
+            note=data.get("note", ""),
+            match_version=snapshot_version,
+        )
+        _rescore(match)
+        bump(match)
+        match.score_revision = int(match.score_revision or 0) + 1
+        match.save()
+    return event
+
+
+def update_match_event(match_id: str, event_id: str, version: int, data: dict):
+    from django.db import transaction
+
+    event = get_match_event(match_id, event_id)
+    check_version(event, version)
+    match = get_match(match_id)
+    check_version(match, data.get("matchVersion"))
+    _validate_event_team(match, data["teamId"])
+    _validate_event_payload(data)
+    with transaction.atomic():
+        event.event_type = data["eventType"]
+        event.minute = data["minute"]
+        event.stoppage_minute = data.get("stoppageMinute")
+        event.team_id = data["teamId"]
+        event.scorer_athlete_id = data.get("scorerAthleteId") or ""
+        event.own_goal = bool(data.get("ownGoal", False))
+        event.athlete_id = data.get("athleteId") or ""
+        event.penalty_type = data.get("penaltyType")
+        event.reason = data.get("reason") or ""
+        event.out_athlete_id = data.get("outAthleteId") or ""
+        event.in_athlete_id = data.get("inAthleteId") or ""
+        event.note = data.get("note", "")
+        event.match_version = int(match.version or 0)
+        bump(event)
+        event.save()
+        _rescore(match)
+        bump(match)
+        match.score_revision = int(match.score_revision or 0) + 1
+        match.save()
+    return event
+
+
+def delete_match_event(match_id: str, event_id: str, version: int, match_version: int):
+    from django.db import transaction
+
+    event = get_match_event(match_id, event_id)
+    check_version(event, version)
+    match = get_match(match_id)
+    check_version(match, match_version)
+    with transaction.atomic():
+        event.deleted_at = timezone.now()
+        bump(event)
+        event.save()
+        _rescore(match)
+        bump(match)
+        match.score_revision = int(match.score_revision or 0) + 1
+        match.save()
+    return event
