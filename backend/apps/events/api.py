@@ -450,3 +450,221 @@ def match_event_delete(
         summary="撤销比赛事件，比分同步重算",
     )
     return action_result(True, event.pk, event.version)
+
+# ---------------------------------------------------------------- 赛事文件（5.3）
+
+register_operation("matchDocumentCreate", _MATCH_ROLES)
+register_operation("matchDocumentList", _MATCH_ROLES)
+
+
+@router.post(
+    "/matches/{match_id}/documents",
+    auth=_auth,
+    response=EnvelopeOut,
+    summary="关联签到/签字记录/裁判报告",
+)
+def match_document_create(request, match_id: str, body: s.MatchDocumentCreate):
+    require("matchDocumentCreate")
+    doc = services.create_match_document(match_id, body.model_dump())
+    audit_state(
+        request,
+        "matchDocument.create",
+        object_type="MatchDocument",
+        object_id=doc.pk,
+        summary=f"挂载{doc.document_type}文件",
+    )
+    return ok(s.match_document_out(doc))
+
+
+@router.get(
+    "/matches/{match_id}/documents",
+    auth=_auth,
+    response=EnvelopeOut,
+    summary="比赛文件列表",
+)
+def match_document_list(request, match_id: str, documentType: Optional[str] = None):
+    require("matchDocumentList")
+    queryset = services.list_match_documents(match_id, documentType)
+    return paginate(request, queryset, mapper=s.match_document_out)
+
+
+# ---------------------------------------------------------------- 图文直播条目（5.4）
+
+register_operation("livePostList", _MATCH_ROLES)
+register_operation("livePostCreate", _MATCH_ROLES)
+register_operation("livePostGet", _MATCH_ROLES)
+register_operation("livePostUpdate", _MATCH_ROLES)
+register_operation("livePostDelete", _MATCH_ROLES)
+
+
+@router.get(
+    "/matches/{match_id}/live-posts",
+    auth=_auth,
+    response=EnvelopeOut,
+    summary="分页查询图文直播条目",
+)
+def live_post_list(request, match_id: str):
+    require("livePostList")
+    queryset = services.list_live_posts(match_id)
+    return paginate(request, queryset, mapper=s.live_post_out)
+
+
+@router.post(
+    "/matches/{match_id}/live-posts",
+    auth=_auth,
+    response=EnvelopeOut,
+    summary="创建图文直播条目",
+)
+def live_post_create(request, match_id: str, body: s.LivePostCreate):
+    require("livePostCreate")
+    post = services.create_live_post(match_id, body.model_dump())
+    audit_state(
+        request,
+        "livePost.create",
+        object_type="LivePost",
+        object_id=post.pk,
+        summary="新增图文直播条目",
+    )
+    return ok(s.live_post_out(post))
+
+
+@router.get(
+    "/matches/{match_id}/live-posts/{post_id}",
+    auth=_auth,
+    response=EnvelopeOut,
+    summary="图文直播条目详情",
+)
+def live_post_get(request, match_id: str, post_id: str):
+    require("livePostGet")
+    post = services.get_live_post(match_id, post_id)
+    return ok(s.live_post_out(post))
+
+
+@router.put(
+    "/matches/{match_id}/live-posts/{post_id}",
+    auth=_auth,
+    response=EnvelopeOut,
+    summary="修改图文直播条目",
+)
+def live_post_update(request, match_id: str, post_id: str, body: s.LivePostUpdate):
+    require("livePostUpdate")
+    post = services.update_live_post(match_id, post_id, body.model_dump())
+    audit_state(
+        request,
+        "livePost.update",
+        object_type="LivePost",
+        object_id=post.pk,
+        summary="修改图文直播条目",
+    )
+    return ok(s.live_post_out(post))
+
+
+@router.delete(
+    "/matches/{match_id}/live-posts/{post_id}",
+    auth=_auth,
+    response=EnvelopeOut,
+    summary="删除图文直播条目",
+)
+def live_post_delete(request, match_id: str, post_id: str, version: Optional[int] = None):
+    require("livePostDelete")
+    version = _require_version(version)
+    post = services.delete_live_post(match_id, post_id, version)
+    audit_state(
+        request,
+        "livePost.delete",
+        object_type="LivePost",
+        object_id=post.pk,
+        summary="删除图文直播条目",
+    )
+    return action_result(True, post.pk, post.version)
+
+
+# ---------------------------------------------------------------- 直播链接（5.4）
+
+register_operation("liveLinkList", _MATCH_ROLES)
+register_operation("liveLinkCreate", _MATCH_ROLES)
+register_operation("liveLinkGet", _MATCH_ROLES)
+register_operation("liveLinkUpdate", _MATCH_ROLES)
+register_operation("liveLinkDelete", _MATCH_ROLES)
+
+
+@router.get(
+    "/matches/{match_id}/live-links",
+    auth=_auth,
+    response=EnvelopeOut,
+    summary="分页查询直播链接",
+)
+def live_link_list(request, match_id: str):
+    require("liveLinkList")
+    queryset = services.list_live_links(match_id)
+    return paginate(request, queryset, mapper=s.live_link_out)
+
+
+@router.post(
+    "/matches/{match_id}/live-links",
+    auth=_auth,
+    response=EnvelopeOut,
+    summary="创建直播链接",
+)
+def live_link_create(request, match_id: str, body: s.LiveLinkCreate):
+    require("liveLinkCreate")
+    link = services.create_live_link(match_id, body.model_dump())
+    audit_state(
+        request,
+        "liveLink.create",
+        object_type="LiveLink",
+        object_id=link.pk,
+        summary="新增直播链接",
+    )
+    return ok(s.live_link_out(link))
+
+
+@router.get(
+    "/matches/{match_id}/live-links/{link_id}",
+    auth=_auth,
+    response=EnvelopeOut,
+    summary="直播链接详情",
+)
+def live_link_get(request, match_id: str, link_id: str):
+    require("liveLinkGet")
+    link = services.get_live_link(match_id, link_id)
+    return ok(s.live_link_out(link))
+
+
+@router.put(
+    "/matches/{match_id}/live-links/{link_id}",
+    auth=_auth,
+    response=EnvelopeOut,
+    summary="修改直播链接",
+)
+def live_link_update(request, match_id: str, link_id: str, body: s.LiveLinkUpdate):
+    require("liveLinkUpdate")
+    link = services.update_live_link(match_id, link_id, body.model_dump())
+    audit_state(
+        request,
+        "liveLink.update",
+        object_type="LiveLink",
+        object_id=link.pk,
+        summary="修改直播链接",
+    )
+    return ok(s.live_link_out(link))
+
+
+@router.delete(
+    "/matches/{match_id}/live-links/{link_id}",
+    auth=_auth,
+    response=EnvelopeOut,
+    summary="删除直播链接",
+)
+def live_link_delete(request, match_id: str, link_id: str, version: Optional[int] = None):
+    require("liveLinkDelete")
+    version = _require_version(version)
+    link = services.delete_live_link(match_id, link_id, version)
+    audit_state(
+        request,
+        "liveLink.delete",
+        object_type="LiveLink",
+        object_id=link.pk,
+        summary="删除直播链接",
+    )
+    return action_result(True, link.pk, link.version)

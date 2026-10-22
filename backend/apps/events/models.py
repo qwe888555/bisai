@@ -156,6 +156,8 @@ class Match(SoftDeleteVersionedModel):
     published = models.BooleanField(default=False)
     result_published = models.BooleanField(default=False)
     score_revision = models.PositiveIntegerField(default=0)
+    # 图文直播短轮询父资源版本：每次新增/修改/删除直播帖都 +1
+    feed_revision = models.PositiveIntegerField(default=0)
 
     class Meta:
         db_table = "events_match"
@@ -273,6 +275,69 @@ class PortalResource(SoftDeleteVersionedModel):
     class Meta:
         db_table = "events_portal_resource"
         indexes = [models.Index(fields=["resource_type"]), models.Index(fields=["sort_order"])]
+
+    def __str__(self) -> str:  # pragma: no cover
+        return self.title
+
+# ---------------------------------------------------------------- 赛事文件与图文直播（5.3 / 5.4）
+
+DOCUMENT_TYPES = (
+    ("SIGN_IN", "签到表"),
+    ("SIGNED_RECORD", "记录集签字确认表"),
+    ("REFEREE_REPORT", "裁判员报告书"),
+)
+
+
+class MatchDocument(SoftDeleteVersionedModel):
+    """比赛归档文件：签到 / 签字记录 / 裁判报告；fileId 指向成员2文件服务。"""
+
+    id = models.CharField(primary_key=True, max_length=64)
+    match_id = models.CharField(max_length=64, db_index=True)
+    document_type = models.CharField(max_length=16, choices=DOCUMENT_TYPES)
+    file_id = models.CharField(max_length=64)
+
+    class Meta:
+        db_table = "events_match_document"
+        indexes = [
+            models.Index(fields=["match_id"]),
+            models.Index(fields=["document_type"]),
+        ]
+
+    def __str__(self) -> str:  # pragma: no cover
+        return f"{self.document_type}@{self.match_id}"
+
+
+class LivePost(SoftDeleteVersionedModel):
+    """图文直播条目；cursor 为写入时父资源 feedRevision 快照，供短轮询增量。"""
+
+    id = models.CharField(primary_key=True, max_length=64)
+    match_id = models.CharField(max_length=64, db_index=True)
+    text = models.CharField(max_length=3000)
+    image_file_ids = models.JSONField(default=list)
+    minute = models.PositiveSmallIntegerField(null=True, blank=True)
+    cursor = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        db_table = "events_live_post"
+        ordering = ["-created_at", "-id"]
+        indexes = [models.Index(fields=["match_id"]), models.Index(fields=["cursor"])]
+
+    def __str__(self) -> str:  # pragma: no cover
+        return f"LivePost@{self.match_id}"
+
+
+class LiveLink(SoftDeleteVersionedModel):
+    """外部直播链接（视频流/直播平台），enabled 控制是否展示。"""
+
+    id = models.CharField(primary_key=True, max_length=64)
+    match_id = models.CharField(max_length=64, db_index=True)
+    title = models.CharField(max_length=150)
+    url = models.CharField(max_length=2000)
+    enabled = models.BooleanField(default=True)
+
+    class Meta:
+        db_table = "events_live_link"
+        indexes = [models.Index(fields=["match_id"])]
 
     def __str__(self) -> str:  # pragma: no cover
         return self.title

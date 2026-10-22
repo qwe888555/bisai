@@ -448,3 +448,163 @@ def delete_match_event(match_id: str, event_id: str, version: int, match_version
         match.score_revision = int(match.score_revision or 0) + 1
         match.save()
     return event
+
+# ---------------------------------------------------------------- 赛事文件（5.3）
+
+def list_match_documents(match_id: str, document_type: Optional[str]):
+    from .models import MatchDocument
+
+    get_match(match_id)
+    queryset = MatchDocument.objects.filter(match_id=match_id)
+    if document_type:
+        queryset = queryset.filter(document_type=document_type)
+    return queryset.order_by("-created_at", "-id")
+
+
+def create_match_document(match_id: str, data: dict):
+    from .models import MatchDocument
+
+    get_match(match_id)
+    doc = MatchDocument.objects.create(
+        id=new_id("mdoc"),
+        match_id=match_id,
+        document_type=data["documentType"],
+        file_id=data["fileId"],
+    )
+    return doc
+
+
+# ---------------------------------------------------------------- 图文直播条目（5.4）
+
+def _bump_feed(match) -> int:
+    match.feed_revision = int(match.feed_revision or 0) + 1
+    match.save(update_fields=["feed_revision", "updated_at"])
+    return match.feed_revision
+
+
+def list_live_posts(match_id: str):
+    from .models import LivePost
+
+    get_match(match_id)
+    return LivePost.objects.filter(match_id=match_id).order_by("-created_at", "-id")
+
+
+def get_live_post(match_id: str, post_id: str):
+    from .models import LivePost
+
+    post = LivePost.objects.filter(pk=post_id, match_id=match_id).first()
+    if post is None:
+        raise ApiError(NOT_FOUND)
+    return post
+
+
+def create_live_post(match_id: str, data: dict):
+    from django.db import transaction
+
+    from .models import LivePost
+
+    match = get_match(match_id)
+    with transaction.atomic():
+        revision = _bump_feed(match)
+        post = LivePost.objects.create(
+            id=new_id("lpost"),
+            match_id=match_id,
+            text=data["text"],
+            image_file_ids=list(data.get("imageFileIds") or []),
+            minute=data.get("minute"),
+            cursor=revision,
+        )
+    return post
+
+
+def update_live_post(match_id: str, post_id: str, data: dict):
+    from django.db import transaction
+
+    post = get_live_post(match_id, post_id)
+    check_version(post, data.get("version"))
+    match = get_match(match_id)
+    with transaction.atomic():
+        post.text = data["text"]
+        post.image_file_ids = list(data.get("imageFileIds") or [])
+        post.minute = data.get("minute")
+        post.cursor = _bump_feed(match)
+        bump(post)
+        post.save()
+    return post
+
+
+def delete_live_post(match_id: str, post_id: str, version: int):
+    from django.db import transaction
+
+    post = get_live_post(match_id, post_id)
+    check_version(post, version)
+    match = get_match(match_id)
+    with transaction.atomic():
+        post.deleted_at = timezone.now()
+        bump(post)
+        post.save()
+        _bump_feed(match)
+    return post
+
+
+# ---------------------------------------------------------------- 直播链接（5.4）
+
+def _validate_live_url(url: str) -> None:
+    if not (url.startswith("http://") or url.startswith("https://")):
+        raise ApiError(
+            BUSINESS_VALIDATION_FAILED,
+            "直播链接仅支持 http/https",
+            [{"field": "url", "reason": "必须以 http:// 或 https:// 开头"}],
+        )
+
+
+def list_live_links(match_id: str):
+    from .models import LiveLink
+
+    get_match(match_id)
+    return LiveLink.objects.filter(match_id=match_id).order_by("-created_at", "-id")
+
+
+def get_live_link(match_id: str, link_id: str):
+    from .models import LiveLink
+
+    link = LiveLink.objects.filter(pk=link_id, match_id=match_id).first()
+    if link is None:
+        raise ApiError(NOT_FOUND)
+    return link
+
+
+def create_live_link(match_id: str, data: dict):
+    from .models import LiveLink
+
+    get_match(match_id)
+    _validate_live_url(data["url"])
+    link = LiveLink.objects.create(
+        id=new_id("llink"),
+        match_id=match_id,
+        title=data["title"],
+        url=data["url"],
+        enabled=bool(data.get("enabled", True)),
+    )
+    return link
+
+
+def update_live_link(match_id: str, link_id: str, data: dict):
+    link = get_live_link(match_id, link_id)
+    check_version(link, data.get("version"))
+    _validate_live_url(data["url"])
+    link.title = data["title"]
+    link.url = data["url"]
+    link.enabled = bool(data.get("enabled", True))
+    bump(link)
+    link.save()
+    return link
+
+
+def delete_live_link(match_id: str, link_id: str, version: int):
+    link = get_live_link(match_id, link_id)
+    check_version(link, version)
+    link.deleted_at = timezone.now()
+    bump(link)
+    link.save()
+    return link

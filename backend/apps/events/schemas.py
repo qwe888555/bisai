@@ -215,3 +215,79 @@ def match_event_out(event) -> dict:
     if event.in_athlete_id:
         data["inAthleteId"] = event.in_athlete_id
     return data
+
+# ---------------------------------------------------------------- 赛事文件 / 图文直播 / 直播链接（5.3 / 5.4）
+
+DocumentType = Literal["SIGN_IN", "SIGNED_RECORD", "REFEREE_REPORT"]
+
+
+class MatchDocumentCreate(StrictSchema):
+    documentType: DocumentType
+    fileId: str = Field(min_length=1, max_length=64)
+
+
+class LivePostCreate(StrictSchema):
+    text: str = Field(min_length=1, max_length=3000)
+    imageFileIds: list[str] = Field(default_factory=list, max_length=9)
+    minute: Optional[int] = Field(default=None, ge=0, le=150)
+
+
+class LivePostUpdate(StrictSchema):
+    text: str = Field(min_length=1, max_length=3000)
+    imageFileIds: list[str] = Field(default_factory=list, max_length=9)
+    minute: Optional[int] = Field(default=None, ge=0, le=150)
+    version: int = Field(ge=0)
+
+
+class LiveLinkCreate(StrictSchema):
+    title: str = Field(min_length=1, max_length=150)
+    url: str = Field(min_length=1, max_length=2000)
+    enabled: bool = True
+
+
+class LiveLinkUpdate(StrictSchema):
+    title: str = Field(min_length=1, max_length=150)
+    url: str = Field(min_length=1, max_length=2000)
+    enabled: bool = True
+    version: int = Field(ge=0)
+
+
+def match_document_out(doc) -> dict:
+    return {
+        "id": doc.pk,
+        "matchId": doc.match_id,
+        "documentType": doc.document_type,
+        "fileId": doc.file_id,
+        "version": int(doc.version or 0),
+        "createdAt": doc.created_at,
+        "updatedAt": doc.updated_at,
+    }
+
+
+def live_post_out(post) -> dict:
+    data = {
+        "id": post.pk,
+        "matchId": post.match_id,
+        "text": post.text,
+        "imageFileIds": list(post.image_file_ids or []),
+        "cursor": int(post.cursor or 0),
+        "version": int(post.version or 0),
+        "createdAt": post.created_at,
+        "updatedAt": post.updated_at,
+    }
+    if post.minute is not None:
+        data["minute"] = int(post.minute)
+    return data
+
+
+def live_link_out(link) -> dict:
+    return {
+        "id": link.pk,
+        "matchId": link.match_id,
+        "title": link.title,
+        "url": link.url,
+        "enabled": bool(link.enabled),
+        "version": int(link.version or 0),
+        "createdAt": link.created_at,
+        "updatedAt": link.updated_at,
+    }
