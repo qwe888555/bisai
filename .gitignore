@@ -17,6 +17,8 @@ backend/data/
 data/
 *.db
 *.sqlite3
+backups/
+backend/deploy/certs/
 
 # IDE / 系统
 .idea/

@@ -51,6 +51,19 @@ python -m pytest               # 接口冒烟：登录/权限/400/401/403/404/40
 - 演示账号：`admin` / `province` / `city` / `university` / `team` / `coach` / `athlete` / `recorder`，初始密码统一 `Foot@2026`；
 - 切正式环境：`DATABASE_URL` 改 MySQL、`STORAGE_BACKEND` 改 `minio`、填 `REDIS_URL`，或直接 `docker compose up -d`。
 
+## 部署与运维
+
+```bash
+docker compose up -d                                   # MySQL + Redis + MinIO + web + nginx
+bash deploy/backup.sh                                  # 备份库/文件/MinIO 到 backups/<时间戳>
+bash deploy/restore.sh backups/<时间戳>                 # 从备份恢复
+python scripts/smoke_concurrency.py --path "/accounts" --total 100 --concurrency 50 --login "admin:Foot@2026"
+```
+
+- 生产 HTTPS：把 compose 里 nginx 的挂载换成 `deploy/nginx-https.conf`，证书放 `deploy/certs/`（不进仓库）；
+- 并发冒烟默认打 `/api/v1` 前缀，报名提交这类写接口加 `--idempotency` 让每次请求带不同幂等键；
+- 备份产物包含 `db.sql.gz`、`files.tar.gz`、`minio.tar.gz`，回滚先恢复再用 `docker compose restart web` 验证 `/api/v1/health`。
+
 ## 一个接口长什么样（照这个写）
 
 ```python
