@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 
 from django.core.management import call_command
@@ -15,6 +16,11 @@ PASSWORD = "Foot@2026"
 
 # 只校验文件头的最小 PNG，够服务端嗅探使用
 PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
+
+# 真正的 1x1 PNG，用于验证 Pillow 缩略图
+REAL_PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+)
 
 
 def body(response) -> dict:
@@ -178,6 +184,29 @@ class ApiSmokeTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response["Cache-Control"], "private, no-store")
         self.assertTrue(b"".join(response.streaming_content).startswith(b"\x89PNG"))
+
+    def test_image_thumbnail_generated_and_served(self):
+        from django.core.files.uploadedfile import SimpleUploadedFile
+
+        token = self.login()
+        response = self.client.post(
+            f"{BASE}/files",
+            data={
+                "ownerType": "MATCH",
+                "ownerId": "match_demo_thumb",
+                "category": "CAPTURE_PHOTO",
+                "file": SimpleUploadedFile("photo.png", REAL_PNG, "image/png"),
+            },
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+        self.assertEqual(response.status_code, 200, response.content)
+        data = body(response)["data"]
+        self.assertEqual(data["thumbnailUrl"], f"/files/{data['id']}/thumbnail")
+
+        thumb = self.get(f"/files/{data['id']}/thumbnail", token)
+        self.assertEqual(thumb.status_code, 200)
+        self.assertEqual(thumb["Content-Type"], "image/jpeg")
+        self.assertEqual(thumb["Cache-Control"], "private, no-store")
 
     def test_bad_extension_is_415(self):
         from django.core.files.uploadedfile import SimpleUploadedFile
