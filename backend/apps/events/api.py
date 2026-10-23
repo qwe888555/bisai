@@ -887,3 +887,55 @@ def goal_ranking(
     page = max(1, page)
     pageSize = min(100, max(1, pageSize))
     return ok(services.goal_ranking(eventId, groupId, category, page, pageSize))
+
+# ---------------------------------------------------------------- 门户公开读(T5-07，免登录)
+
+@router.get("/public/matches", auth=None, response=EnvelopeOut, summary="门户对阵及赛果列表")
+def public_match_list(
+    request,
+    eventId: str,
+    groupId: Optional[str] = None,
+    status: Optional[str] = None,
+    resultPublished: Optional[bool] = None,
+):
+    qs = services.public_list_matches({
+        "eventId": eventId, "groupId": groupId, "status": status,
+        "resultPublished": resultPublished,
+    })
+    return paginate(request, qs, mapper=s.public_match_out)
+
+
+@router.get("/public/matches/{match_id}", auth=None, response=EnvelopeOut, summary="已发布比赛对阵详情")
+def public_match_get(request, match_id: str):
+    return ok(s.public_match_out(services.public_get_match(match_id)))
+
+
+@router.get("/public/matches/{match_id}/live-feed", auth=None, response=EnvelopeOut, summary="短轮询图文直播")
+def public_live_feed(request, match_id: str, afterRevision: int = 0):
+    feed = services.public_live_feed(match_id, afterRevision)
+    return ok({
+        "feedRevision": feed["feedRevision"],
+        "items": [s.public_live_post_out(p) for p in feed["items"]],
+        "deletedIds": feed["deletedIds"],
+        "resetRequired": feed["resetRequired"],
+    })
+
+
+@router.get("/public/matches/{match_id}/live-links", auth=None, response=EnvelopeOut, summary="门户直播外链")
+def public_live_links(request, match_id: str):
+    qs = services.public_list_live_links(match_id)
+    return paginate(request, qs, mapper=s.public_live_link_out)
+
+
+@router.get("/public/statistics/goals", auth=None, response=EnvelopeOut, summary="门户进球榜/三组统计")
+def public_goal_ranking(
+    request,
+    eventId: str,
+    groupId: Optional[str] = None,
+    category: Optional[str] = None,
+    page: int = 1,
+    pageSize: int = 20,
+):
+    page = max(1, page)
+    pageSize = min(100, max(1, pageSize))
+    return ok(services.goal_ranking(eventId, groupId, category, page, pageSize, published_only=True))

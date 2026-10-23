@@ -1018,10 +1018,12 @@ def delete_match_result(match_id: str, version: int) -> "Match":
 # ---------------------------------------------------------------- 进球榜(5.5，由 GOAL 事件派生)
 
 def goal_ranking(event_id: str, group_id: Optional[str], category: Optional[str],
-                 page: int, page_size: int) -> dict:
+                 page: int, page_size: int, published_only: bool = False) -> dict:
     from .models import Match, MatchEvent, EventGroup
 
     qs = Match.objects.filter(event_id=event_id).exclude(status="CANCELLED")
+    if published_only:
+        qs = qs.filter(published=True)
     if group_id:
         qs = qs.filter(group_id=group_id)
     if category:
@@ -1062,3 +1064,49 @@ def goal_ranking(event_id: str, group_id: Optional[str], category: Optional[str]
     start = (page - 1) * page_size
     items = ranked[start:start + page_size]
     return {"items": items, "page": page, "pageSize": page_size, "total": total}
+
+# ---------------------------------------------------------------- 门户公开读(T5-07，免登录)
+
+def public_list_matches(filters: dict):
+    from .models import Match
+
+    qs = Match.objects.filter(published=True)
+    if filters.get("eventId"):
+        qs = qs.filter(event_id=filters["eventId"])
+    if filters.get("groupId"):
+        qs = qs.filter(group_id=filters["groupId"])
+    if filters.get("status"):
+        qs = qs.filter(status=filters["status"])
+    if filters.get("resultPublished") is not None:
+        qs = qs.filter(result_published=filters["resultPublished"])
+    return qs.order_by("kickoff_at", "-score_revision")
+
+
+def public_get_match(match_id: str):
+    from .models import Match
+
+    match = Match.objects.filter(pk=match_id, published=True).first()
+    if match is None:
+        raise ApiError(NOT_FOUND)
+    return match
+
+
+def public_live_feed(match_id: str, after_revision: int) -> dict:
+    """短轮询：仅已发布比赛；返回 cursor>afterRevision 的有效帖增量与最新 feedRevision。"""
+    from .models import LivePost
+
+    match = public_get_match(match_id)
+    posts = LivePost.objects.filter(match_id=match_id, cursor__gt=after_revision).order_by("cursor", "id")
+    return {
+        "feedRevision": int(match.feed_revision or 0),
+        "items": list(posts),
+        "deletedIds": [],
+        "resetRequired": after_revision < 0,
+    }
+
+
+def public_list_live_links(match_id: str):
+    from .models import LiveLink
+
+    public_get_match(match_id)
+    return LiveLink.objects.filter(match_id=match_id, enabled=True).order_by("-created_at", "-id")

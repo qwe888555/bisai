@@ -447,3 +447,37 @@ def goal_ranking_row_out(rank: int, athlete_id: str, athlete_name: str,
         "teamName": team_name,
         "goals": int(goals),
     }
+
+# ---------------------------------------------------------------- 门户公开只读(T5-07)
+
+def public_match_out(match) -> dict:
+    """PublicMatch 安全投影：仅已发布对阵；队名暂用队ID占位(名册由成员6提供)。"""
+    return {
+        "id": match.pk,
+        "eventId": match.event_id,
+        "groupId": match.group_id,
+        "homeTeamName": match.home_team_id,
+        "awayTeamName": match.away_team_id,
+        "kickoffAt": match.kickoff_at,
+        "venue": match.venue or "",
+        "status": match.status,
+        "homeScore": int(match.home_score or 0),
+        "awayScore": int(match.away_score or 0),
+        "scoreRevision": int(match.score_revision or 0),
+    }
+
+
+def public_live_post_out(post) -> dict:
+    """PublicLivePost 投影；imageUrls 待成员2文件服务解析真实公网URL。"""
+    return {
+        "id": post.pk,
+        "text": post.text,
+        "imageUrls": [],
+        "minute": post.minute,
+        "updatedAt": post.updated_at,
+    }
+
+
+def public_live_link_out(link) -> dict:
+    """公开直播外链：只含标题与URL，不暴露内部ID/version。"""
+    return {"title": link.title, "url": link.url}
