@@ -15,8 +15,11 @@ from io import StringIO
 from tempfile import NamedTemporaryFile
 
 from django.core.management import call_command
+from django.core.management.base import CommandError
+from django.db import connection
 from django.test import TestCase
 
+from apps.infra.management.commands.init_base_data import DICT_TYPES
 from apps.materials.models import MaterialType
 from apps.persons.models import DictItem, DictType, Region, School
 
@@ -185,3 +188,228 @@ class InitBaseDataTests(TestCase):
         self.assertIn("新增=0", out2)
         self.assertIn("跳过=1", out2)
         self.assertEqual(MaterialType.objects.count(), 1)
+
+
+class VerifyTests(TestCase):
+    """--verify 只读验收：退出码、分级定位、--phase 组合、只读零写入。
+
+    运行方式与 InitBaseDataTests 相同（内存 SQLite，不触碰 MySQL）。
+    """
+
+    MODELS = {"region": Region, "school": School, "dict_type": DictType,
+              "dict_item": DictItem, "material": MaterialType}
+
+    def call_verify(self, *args, **kwargs) -> tuple[str, int]:
+        """执行 --verify，返回 (输出, 退出码)。sys.exit(1) 转为退出码 1。"""
+        out = StringIO()
+        try:
+            call_command("init_base_data", *args, **kwargs, stdout=out)
+            code = 0
+        except SystemExit as exc:  # noqa: B904 测试内捕获为主命令退出码
+            code = exc.code or 1
+        return out.getvalue(), code
+
+    def snapshot(self) -> dict:
+        """全表内容快照（逐字段值），用于断言 verify 零写入。"""
+        return {name: list(model.objects.order_by("pk").values()) for name, model in self.MODELS.items()}
+
+    @staticmethod
+    def make_region(code: str, level: int, parent=None, is_active: bool = True) -> Region:
+        return Region.objects.create(code=code, name=f"区划{code}", level=level,
+                                     parent=parent, sort_order=0, is_active=is_active)
+
+    @staticmethod
+    def make_school(name: str, region: Region, stype: str = "PRIMARY", code: str | None = None) -> School:
+        return School.objects.create(name=name, region=region, school_type=stype, code=code)
+
+    # ------------------------------------------------------------ 正常与空库
+
+    def test_verify_empty_db_info_exit_zero(self):
+        out, code = self.call_verify(verify=True)
+        self.assertEqual(out.count("[INFO ]"), 5)  # 5 张基础表全部空表提示
+        self.assertNotIn("[ERROR", out)
+        self.assertNotIn("[WARN", out)
+        self.assertEqual(code, 0)
+
+    def test_verify_healthy_data_exit_zero(self):
+        prov = self.make_region("540000", 1)
+        city = self.make_region("540100", 2, parent=prov)
+        self.make_region("540121", 3, parent=city)
+        self.make_school("林周县中学", Region.objects.get(code="540121"))
+        for item in DICT_TYPES:  # 5 骨架齐全
+            DictType.objects.create(code=item["code"], name=item["name"])
+        DictItem.objects.create(type=DictType.objects.get(code="position"), value="GK", label="守门员")
+        MaterialType.objects.create(code="photo", name="个人照片", applies_to="PERSON")
+        out, code = self.call_verify(verify=True)  # 5 表均非空且合法 -> 无任何发现项
+        self.assertNotIn("[ERROR", out)
+        self.assertNotIn("[WARN", out)
+        self.assertIn("(全部检查通过, 无发现项)", out)
+        self.assertEqual(code, 0)
+
+    # ------------------------------------------------------------ 硬错误定位
+
+    def test_verify_orphan_city_error_exit_one(self):
+        self.make_region("540100", 2)  # 市级无父级
+        out, code = self.call_verify(verify=True)
+        self.assertIn("[ERROR] base_region: code=540100 level=2 非省级缺少父级", out)
+        self.assertEqual(code, 1)
+
+    def test_verify_province_with_parent_error(self):
+        prov = self.make_region("540000", 1)
+        other = self.make_region("510000", 1)
+        Region.objects.filter(pk=prov.pk).update(parent=other)  # 绕过校验直改：省级挂父
+        out, code = self.call_verify(verify=True)
+        self.assertIn("[ERROR] base_region: code=540000 level=1 省级不得有父级(现父=510000)", out)
+        self.assertEqual(code, 1)
+
+    def test_verify_parent_level_mismatch_error(self):
+        prov = self.make_region("540000", 1)
+        county = self.make_region("540121", 3)
+        Region.objects.filter(pk=county.pk).update(parent=prov)  # 县挂省：跳级
+        out, code = self.call_verify(verify=True)
+        self.assertIn("level=3 父级 level=1 不满足 level-1", out)
+        self.assertEqual(code, 1)
+
+    def test_verify_school_bad_type_error(self):
+        prov = self.make_region("540000", 1)
+        School.objects.create(name="坏学校", region=prov, school_type="VOC", code=None)
+        out, code = self.call_verify(verify=True)
+        self.assertIn("[ERROR] base_school: pk=", out)
+        self.assertIn("school_type='VOC' 非法", out)
+        self.assertEqual(code, 1)
+
+    def test_verify_material_bad_applies_error(self):
+        MaterialType.objects.create(code="bad", name="坏类型", applies_to="BOTH")
+        out, code = self.call_verify(verify=True)
+        self.assertIn("[ERROR] material_type: code=bad applies_to='BOTH' 非法", out)
+        self.assertEqual(code, 1)
+
+    def test_verify_region_bad_level_error(self):
+        self.make_region("999999", 3)
+        Region.objects.filter(code="999999").update(level=0)  # 绕过 choices 直改
+        out, code = self.call_verify(verify=True)
+        self.assertIn("[ERROR] base_region: code=999999 level=0 非法(允许: 1/2/3)", out)
+        self.assertEqual(code, 1)
+
+    # ------------------------------------------------------------ 引用完整性（仅绕过 ORM 直改可达）
+    # 机制说明：Django 5.1+ 的 SQLite 强制 FK，悬空行无法在约束生效时合法存在；
+    # 借助 constraint_checks_disabled 在测试连接内临时切换 pragma，verify 于悬空窗口内执行，
+    # 退出前把引用改回有效值——约束与数据在恢复时均完整，不改任何 DDL/真实库约束。
+
+    def test_verify_region_dangling_parent_ref_error(self):
+        prov = self.make_region("540000", 1)
+        city = self.make_region("540100", 2, parent=prov)
+        with connection.constraint_checks_disabled():  # Django 内部 try/finally 保证 pragma 必然恢复
+            Region.objects.filter(pk=city.pk).update(parent_id=99999)
+            try:
+                out, code = self.call_verify(verify=True)  # 悬空窗口内执行验收
+            finally:
+                Region.objects.filter(pk=city.pk).update(parent_id=prov.pk)  # 异常时也恢复，避免污染
+        self.assertIn("[ERROR] base_region: code=540100 引用的父区划 id=99999 不存在", out)
+        self.assertEqual(code, 1)
+        self.assertEqual(Region.objects.get(pk=city.pk).parent_id, prov.pk)  # 数据已还原
+
+    def test_verify_school_dangling_region_ref_error(self):
+        region = self.make_region("540000", 1)
+        school = self.make_school("悬空学校", region, code="SCH9")
+        with connection.constraint_checks_disabled():  # Django 内部 try/finally 保证 pragma 必然恢复
+            School.objects.filter(pk=school.pk).update(region_id=99999)
+            try:
+                out, code = self.call_verify(verify=True)  # 悬空窗口内执行验收
+            finally:
+                School.objects.filter(pk=school.pk).update(region_id=region.pk)  # 异常时也恢复，避免污染
+        self.assertIn("[ERROR] base_school: code=SCH9 引用的区划 id=99999 不存在", out)
+        self.assertEqual(code, 1)
+        self.assertEqual(School.objects.get(pk=school.pk).region_id, region.pk)  # 数据已还原
+
+    def test_verify_dict_item_dangling_type_ref_error(self):
+        dtype = DictType.objects.create(code="position", name="场上位置")
+        item = DictItem.objects.create(type=dtype, value="GK", label="守门员")
+        with connection.constraint_checks_disabled():
+            DictItem.objects.filter(pk=item.pk).update(type_id=99999)
+            try:
+                out, code = self.call_verify(verify=True)
+            finally:
+                DictItem.objects.filter(pk=item.pk).update(type_id=dtype.pk)  # 异常时也恢复
+        self.assertIn(f"[ERROR] base_dict_item: pk={item.pk} value=GK 引用的字典类型 id=99999 不存在", out)
+        self.assertEqual(code, 1)
+        self.assertEqual(DictItem.objects.get(pk=item.pk).type_id, dtype.pk)  # 数据已还原
+
+    # ------------------------------------------------------------ 警告与 strict
+
+    def test_verify_school_empty_code_warn_not_error(self):
+        prov = self.make_region("540000", 1)
+        School.objects.create(name="无码学校", region=prov, school_type="PRIMARY", code="")
+        out, code = self.call_verify(verify=True)
+        self.assertIn("[WARN ] base_school: pk=", out)
+        self.assertIn("空串占唯一键, 应为 NULL", out)
+        self.assertNotIn("[ERROR", out)
+        self.assertEqual(code, 0)  # 非 strict 时 WARN 不影响退出码
+
+    def test_verify_missing_skeleton_warn_only(self):
+        DictType.objects.create(code="team_category", name="球队组别")  # 只建 1/5
+        out, code = self.call_verify(verify=True)
+        self.assertEqual(out.count("骨架缺失"), 4)
+        self.assertEqual(code, 0)
+
+    def test_verify_dict_item_unknown_type_warn(self):
+        dtype = DictType.objects.create(code="custom_ext", name="扩展类型")  # 骨架外类型
+        DictItem.objects.create(type=dtype, value="X1", label="扩展项")
+        out, code = self.call_verify(verify=True)
+        self.assertIn("[WARN ] base_dict_item: type=custom_ext value=X1 挂在骨架外类型", out)
+        self.assertEqual(code, 0)
+
+    def test_verify_inactive_parent_warn(self):
+        prov = self.make_region("540000", 1, is_active=False)
+        self.make_region("540100", 2, parent=prov)  # 父停用：合法但提示
+        out, code = self.call_verify(verify=True)
+        self.assertIn("父级 540000 已停用", out)
+        self.assertNotIn("[ERROR", out)
+        self.assertEqual(code, 0)
+
+    def test_verify_strict_warns_exit_nonzero(self):
+        DictType.objects.create(code="team_category", name="球队组别")  # 4 个骨架缺失 -> WARN
+        out, code = self.call_verify(verify=True, strict=True)
+        self.assertEqual(out.count("骨架缺失"), 4)
+        self.assertEqual(code, 1)  # strict 下 WARN 也非零
+
+    def test_verify_region_partial_import_no_gap_warn(self):
+        prov = self.make_region("540000", 1)
+        self.make_region("540100", 2, parent=prov)  # 合法部分导入：只到市级不算缺口
+        out, code = self.call_verify(verify=True)
+        self.assertNotIn("层级覆盖缺口", out)
+        self.assertEqual(code, 0)
+
+    def test_verify_region_coverage_gap_warn_on_bypass(self):
+        prov = self.make_region("540000", 1)
+        city = self.make_region("540100", 2, parent=prov)
+        self.make_region("540121", 3, parent=city)
+        Region.objects.filter(pk=city.pk).update(level=3)  # 绕过校验直改：父链断裂
+        out, code = self.call_verify(verify=True)
+        self.assertIn("层级覆盖缺口", out)  # 缺口 WARN（正常导入流程不可触发，仅直改数据出现）
+        self.assertEqual(code, 1)  # 同时命中 level-1 硬错
+
+    # ------------------------------------------------------------ 范围与安全
+
+    def test_verify_phase_limits_scope(self):
+        prov = self.make_region("540000", 1)
+        School.objects.create(name="坏学校", region=prov, school_type="BAD", code=None)  # 学校硬错
+        self.make_region("540100", 2)  # 区划硬错
+        out, code = self.call_verify(verify=True, phase="regions")  # 只查区划
+        self.assertIn("code=540100 level=2 非省级缺少父级", out)
+        self.assertNotIn("school_type='BAD'", out)  # 学校检查不在范围内
+        self.assertEqual(code, 1)
+
+    def test_verify_writes_nothing(self):
+        prov = self.make_region("540000", 1)
+        self.make_region("540100", 2, parent=prov)
+        self.make_school("测试学校", prov)
+        MaterialType.objects.create(code="bad", name="坏类型", applies_to="BOTH")
+        before = self.snapshot()
+        self.call_verify(verify=True)
+        self.call_verify(verify=True, strict=True)
+        self.assertEqual(self.snapshot(), before)  # 逐字段内容一致（非仅行数）
+
+    def test_verify_mutually_exclusive_with_execute(self):
+        with self.assertRaises(CommandError):
+            call_command("init_base_data", verify=True, execute=True, stdout=StringIO())

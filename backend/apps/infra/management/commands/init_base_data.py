@@ -14,9 +14,13 @@
     python manage.py init_base_data --phase material_types --material-csv 路径.csv --execute
         # 导入材料类型（列: code,name,applies_to,is_required,need_audit,allow_multiple,
         #                 allowed_ext,max_size_mb,sort_order,is_active,remark）
+    python manage.py init_base_data [--phase <名>] --verify [--strict]
+        # 只读验收：按冻结约束+已确认规则体检基础数据，绝不写入；
+        # --phase 限定检查范围；退出码 0=通过 1=存在ERROR(--strict 时含WARN)
 
 约定：
 1. 不带 --execute 一律只读预览，任何阶段（含提供了 CSV 时）都不写数据；
+1a. --verify 为只读验收：与 --execute 互斥；全程仅查询，不做任何修复；
 2. 幂等：按业务唯一键 get_or_create，已存在的一律跳过，不覆盖人工修改；
 3. 不编造数据：regions/schools/dict_items/material_types 无 CSV 或无确认清单时明确跳过并记录；
 4. 外键依赖：区划按 level 升序处理（父级先于子级）；学校依赖已导入的区划；字典项依赖字典类型；
@@ -27,6 +31,7 @@ from __future__ import annotations
 
 import csv
 import json
+import sys
 from pathlib import Path
 
 from django.core.management.base import BaseCommand, CommandError
@@ -47,6 +52,9 @@ DICT_TYPES: tuple[dict, ...] = (
 
 # 学校类型编码：DDL base_school.school_type 列注释枚举（编码已确认，字典项 label 待成员5确认）。
 SCHOOL_TYPE_CODES = ("PRIMARY", "JUNIOR", "SENIOR", "NINE_YEAR", "COMPLETE", "MIDDLE_VOC")
+
+# 5 骨架字典类型 code 集合（验收用：字典项挂到骨架外类型仅提示人工确认，不判硬错）。
+SKELETON_CODES = frozenset(item["code"] for item in DICT_TYPES)
 
 TRUE_SET = {"1", "true", "yes", "on", "是", "y"}
 
@@ -82,6 +90,10 @@ class Command(BaseCommand):
         parser.add_argument("--schools-csv")
         parser.add_argument("--dict-items-csv")
         parser.add_argument("--material-csv")
+        parser.add_argument("--verify", action="store_true",
+                            help="只读验收：检查基础数据一致性，不写入不修复")
+        parser.add_argument("--strict", action="store_true",
+                            help="验收严格模式：存在 WARN 也返回非零退出码")
 
     # ---------------------------------------------------------------- 预览
 
@@ -95,7 +107,8 @@ class Command(BaseCommand):
             with connection.cursor() as c:
                 c.execute("SELECT sqlite_version()")
                 ver = f"SQLite {c.fetchone()[0]}"
-        self.stdout.write(f"目标库: {db} ({ver})  模式: {'【写入】' if self.execute else '只读预览'}")
+        mode = "【写入】" if self.execute else ("只读验收" if self.verify else "只读预览")
+        self.stdout.write(f"目标库: {db} ({ver})  模式: {mode}")
 
     def _print_counts(self) -> None:
         stats = []
@@ -270,15 +283,121 @@ class Command(BaseCommand):
 
         return self._process_rows(rows, row_fn)
 
+    # ---------------------------------------------------------------- 只读验收
+
+    def _run_verify(self, phase: str) -> None:
+        """只读体检：仅查询（select_related/values_list/exists），无任何 save/create/update/delete；
+        硬错=违反冻结约束或已确认服务层规则；WARN=可疑但合法/依赖未确认清单；INFO=空表提示。"""
+        findings: list[tuple[str, str]] = []
+        scopes = (["dict_types", "regions", "schools", "dict_items", "material_types"]
+                  if phase == "all" else [phase])
+
+        if "dict_types" in scopes:
+            if DictType.objects.count() == 0:
+                findings.append(("INFO", "base_dict_type: 空表, 未初始化"))
+            else:
+                for item in DICT_TYPES:  # 骨架缺失仅 WARN：名称/清单尚未最终确认，不判硬错
+                    if not DictType.objects.filter(code=item["code"]).exists():
+                        findings.append(("WARN", f"base_dict_type: 骨架缺失 {item['code']}"
+                                                 f" (阶段 dict_types 未执行或被人工清理)"))
+
+        if "regions" in scopes:  # 严格层级规则已在 base-data 接口确认 → 违反即硬错
+            if Region.objects.count() == 0:
+                findings.append(("INFO", "base_region: 空表, 未初始化"))
+            # 与学校/字典段一致：不能用 select_related——其 JOIN 会把悬空父级引用行从结果集丢弃
+            parent_by_pk = {r.pk: r for r in Region.objects.all()}
+            for r in Region.objects.order_by("code"):
+                loc = f"code={r.code}"
+                if r.level not in (1, 2, 3):  # 与模型 choices/导入校验/服务层同源；仅绕过写入可达
+                    findings.append(("ERROR", f"base_region: {loc} level={r.level} 非法(允许: 1/2/3)"))
+                    continue  # level 无效时后续父子规则无从判断
+                parent = parent_by_pk.get(r.parent_id) if r.parent_id is not None else None
+                if parent is None and r.parent_id is not None:  # 仅防绕过 ORM 的直改
+                    findings.append(("ERROR", f"base_region: {loc} 引用的父区划 id={r.parent_id} 不存在"))
+                    continue  # 父级无效时后续父子规则无从判断
+                if r.level == 1 and parent is not None:
+                    findings.append(("ERROR", f"base_region: {loc} level=1 省级不得有父级(现父={parent.code})"))
+                if r.level > 1 and parent is None:
+                    findings.append(("ERROR", f"base_region: {loc} level={r.level} 非省级缺少父级"))
+                if parent is not None:
+                    if parent.level != r.level - 1:
+                        findings.append(("ERROR", f"base_region: {loc} level={r.level}"
+                                                  f" 父级 level={parent.level} 不满足 level-1"))
+                    if not parent.is_active:  # 停用不级联，子区划仍合法 → 仅提示
+                        findings.append(("WARN", f"base_region: {loc} 父级 {parent.code} 已停用(请人工确认)"))
+            levels = set(Region.objects.values_list("level", flat=True))
+            if 3 in levels and 2 not in levels:
+                findings.append(("WARN", "base_region: 存在 level=3 但缺失 level=2 (层级覆盖缺口, 允许部分导入)"))
+            if 2 in levels and 1 not in levels:
+                findings.append(("WARN", "base_region: 存在 level=2 但缺失 level=1 (层级覆盖缺口, 允许部分导入)"))
+
+        if "schools" in scopes:
+            if School.objects.count() == 0:
+                findings.append(("INFO", "base_school: 空表, 未初始化"))
+            # 注意：不能用 select_related——其 JOIN 会把悬空引用行从结果集丢弃，导致防御检查失效
+            regions_by_pk = {r.pk: r for r in Region.objects.all()}
+            for s in School.objects.order_by("pk"):
+                loc = f"code={s.code}" if s.code else f"pk={s.pk}"
+                if s.school_type not in SCHOOL_TYPE_CODES:  # DDL 列注释枚举（冻结值）
+                    findings.append(("ERROR", f"base_school: {loc} school_type={s.school_type!r}"
+                                              f" 非法(允许: {','.join(SCHOOL_TYPE_CODES)})"))
+                if s.code == "":  # 空串占唯一键、阻塞后续导入合法行 → 可疑但不违规
+                    findings.append(("WARN", f"base_school: {loc}(空串占唯一键, 应为 NULL) name={s.name}"))
+                if s.region_id is not None and s.region_id not in regions_by_pk:  # 仅防绕过 ORM 的直改
+                    findings.append(("ERROR", f"base_school: {loc} 引用的区划 id={s.region_id} 不存在"))
+
+        if "dict_items" in scopes:
+            if DictItem.objects.count() == 0:
+                findings.append(("INFO", "base_dict_item: 空表, 未初始化"))
+            types_by_pk = {t.pk: t for t in DictType.objects.all()}  # 同上：预加载防 JOIN 丢行
+            for d in DictItem.objects.order_by("pk"):
+                dtype = types_by_pk.get(d.type_id) if d.type_id is not None else None
+                if d.type_id is not None and dtype is None:  # 仅防绕过 ORM 的直改
+                    findings.append(("ERROR", f"base_dict_item: pk={d.pk} value={d.value}"
+                                              f" 引用的字典类型 id={d.type_id} 不存在"))
+                elif dtype is not None and dtype.code not in SKELETON_CODES:
+                    # 正式字典清单未确认，骨架外类型合法 → 人工确认级
+                    findings.append(("WARN", f"base_dict_item: type={dtype.code} value={d.value}"
+                                             f" 挂在骨架外类型(正式清单未确认, 请人工确认)"))
+
+        if "material_types" in scopes:
+            if MaterialType.objects.count() == 0:
+                findings.append(("INFO", "material_type: 空表, 未初始化"))
+            for m in MaterialType.objects.order_by("pk"):
+                if m.applies_to not in ("PERSON", "TEAM"):  # 与导入校验同源
+                    findings.append(("ERROR", f"material_type: code={m.code}"
+                                              f" applies_to={m.applies_to!r} 非法(允许: PERSON/TEAM)"))
+
+        errors = [f for lv, f in findings if lv == "ERROR"]
+        warns = [f for lv, f in findings if lv == "WARN"]
+        infos = [f for lv, f in findings if lv == "INFO"]
+        self.stdout.write("\n== 只读验收报告 (--verify) ==")
+        for lv, msg in findings:
+            self.stdout.write(f"  [{lv:<5}] {msg}")
+        if not findings:
+            self.stdout.write("  (全部检查通过, 无发现项)")
+        self.stdout.write(f"  合计: 错误={len(errors)} 警告={len(warns)} 提示={len(infos)}")
+        self.stdout.write("[提示] --verify 为只读验收, 未写入/未修复任何数据。")
+        if errors or (self.strict and warns):
+            sys.exit(1)
+
     # ---------------------------------------------------------------- 入口
 
     def handle(self, *args, **options):
         self.execute = options["execute"]
+        self.verify = options["verify"]
+        self.strict = options["strict"]
         self.csv_paths = {k: options[f"{k}_csv"] for k in ("regions", "schools", "dict_items", "material")}
+        if self.verify and self.execute:
+            raise CommandError("--verify 与 --execute 互斥：验收模式绝不写入")
         self._print_target()
         self._print_counts()
 
         phase = options["phase"]
+        if self.verify:  # 只读验收分支：仅查询，与初始化写入路径完全隔离
+            self._run_verify(phase)
+            return
+
         runners = {"dict_types": self._run_dict_types, "regions": self._run_regions,
                    "schools": self._run_schools, "dict_items": self._run_dict_items,
                    "material_types": self._run_material_types}
