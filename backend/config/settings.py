@@ -80,6 +80,10 @@ INSTALLED_APPS = [
     "apps.verification",
     "apps.policyqa",
     "apps.events",
+    "apps.persons",
+    "apps.teams",
+    "apps.materials",
+    "apps.infra",
 ]
 
 # 中间件顺序不可随意调整：requestId 必须最外层，审计/限流在其内。
