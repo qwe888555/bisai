@@ -58,7 +58,7 @@ def post_xlsx(client, url: str, headers: dict, data: bytes, mode: str):
 
 
 def test_roster_template_headers(client, auth):
-    headers = auth("team")
+    headers = auth("university")
     response = client.get(f"{BASE}/imports/templates/roster.xlsx", **headers)
     assert response.status_code == 200
     workbook = load_workbook(io.BytesIO(response.content))
@@ -67,7 +67,7 @@ def test_roster_template_headers(client, auth):
 
 
 def test_import_players_validate_then_apply(client, auth):
-    headers = auth("team")
+    headers = auth("university")
     enrollment_id = create_draft(client, headers)["id"]
     valid_id = make_id("11010520100101001")
     rows = [
@@ -116,7 +116,7 @@ def test_import_players_validate_then_apply(client, auth):
 
 
 def test_photo_zip_matching_and_unmatched(client, auth):
-    headers = auth("team")
+    headers = auth("university")
     enrollment_id = create_draft(client, headers)["id"]
     matched_id = make_id("11010520100101003")
     athlete_id = person_client.resolve_person("", matched_id)["id"]
@@ -160,25 +160,25 @@ def test_photo_zip_matching_and_unmatched(client, auth):
 
 
 def test_documents_bundle_and_excel_are_masked(client, auth):
-    team_headers = auth("team")
+    school_headers = auth("university")
     city_headers = auth("city")
     province_headers = auth("province")
-    enrollment_id = complete_draft(client, team_headers)
+    enrollment_id = complete_draft(client, school_headers)
     approved = approve_flow(
-        client, team_headers, city_headers, province_headers, enrollment_id, "doc"
+        client, school_headers, city_headers, province_headers, enrollment_id, "doc"
     )
     assert approved["status"] == "APPROVED"
 
     pdf = client.get(
         f"{BASE}/enrollments/{enrollment_id}/documents/registration.pdf",
-        **team_headers,
+        **school_headers,
     )
     assert pdf.status_code == 200
     assert pdf.content[:4] == b"%PDF"
     assert len(PdfReader(io.BytesIO(pdf.content)).pages) == 1
 
     docx = client.get(
-        f"{BASE}/enrollments/{enrollment_id}/documents/players.docx", **team_headers
+        f"{BASE}/enrollments/{enrollment_id}/documents/players.docx", **school_headers
     )
     assert docx.status_code == 200
     assert docx.content[:2] == b"PK"
@@ -216,14 +216,14 @@ def test_documents_bundle_and_excel_are_masked(client, auth):
 
 
 def test_statistics_excludes_draft_and_dedups(client, auth):
-    team_headers = auth("team")
-    other_headers = auth("team2")
+    school_headers = auth("university")
+    other_headers = auth("university2")
     city_headers = auth("city")
     province_headers = auth("province")
 
-    approved_id = complete_draft(client, team_headers)
+    approved_id = complete_draft(client, school_headers)
     approve_flow(
-        client, team_headers, city_headers, province_headers, approved_id, "stat"
+        client, school_headers, city_headers, province_headers, approved_id, "stat"
     )
     # 另一队的草稿不应计入
     complete_draft(

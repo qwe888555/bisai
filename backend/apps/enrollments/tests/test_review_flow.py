@@ -16,14 +16,14 @@ from apps.enrollments.tests.factories import (
 
 
 def test_submit_blocked_by_precheck_missing_material(client, auth):
-    team_headers = auth("team")
-    enrollment_id = complete_draft(client, team_headers, materials=False)
-    version = get_detail(client, team_headers, enrollment_id)["version"]
+    school_headers = auth("university")
+    enrollment_id = complete_draft(client, school_headers, materials=False)
+    version = get_detail(client, school_headers, enrollment_id)["version"]
 
     precheck = post_json(
         client,
         f"{BASE}/enrollments/{enrollment_id}/precheck",
-        team_headers,
+        school_headers,
         {"version": version},
     )
     assert precheck.status_code == 200
@@ -32,19 +32,19 @@ def test_submit_blocked_by_precheck_missing_material(client, auth):
     codes = {issue["code"] for issue in result["issues"]}
     assert "MISSING_MATERIAL" in codes
 
-    response = submit(client, team_headers, enrollment_id, "missing-material-key")
+    response = submit(client, school_headers, enrollment_id, "missing-material-key")
     assert response.status_code == 422
     assert response.json()["code"] == "BUSINESS_VALIDATION_FAILED"
 
 
 def test_city_then_province_approve_and_snapshot_frozen(client, auth):
-    team_headers = auth("team")
+    school_headers = auth("university")
     city_headers = auth("city")
     province_headers = auth("province")
-    enrollment_id = complete_draft(client, team_headers)
+    enrollment_id = complete_draft(client, school_headers)
 
     approved = approve_flow(
-        client, team_headers, city_headers, province_headers, enrollment_id, "flow"
+        client, school_headers, city_headers, province_headers, enrollment_id, "flow"
     )
     assert approved["status"] == "APPROVED"
     assert approved["editable"] is False
@@ -52,13 +52,13 @@ def test_city_then_province_approve_and_snapshot_frozen(client, auth):
     snapshot_id = approved["snapshotId"]
     assert snapshot_id
 
-    history = client.get(f"{BASE}/enrollments/{enrollment_id}/reviews", **team_headers)
+    history = client.get(f"{BASE}/enrollments/{enrollment_id}/reviews", **school_headers)
     assert history.status_code == 200
     actions = [item["action"] for item in history.json()["data"]["items"]]
     assert actions == ["APPROVE", "APPROVE", "SUBMIT"]
 
     snapshot = client.get(
-        f"{BASE}/enrollments/{enrollment_id}/snapshots/{snapshot_id}", **team_headers
+        f"{BASE}/enrollments/{enrollment_id}/snapshots/{snapshot_id}", **school_headers
     )
     assert snapshot.status_code == 200
     payload = snapshot.json()["data"]
@@ -67,7 +67,7 @@ def test_city_then_province_approve_and_snapshot_frozen(client, auth):
     assert payload["enrollment"]["status"] == "PENDING_CITY_REVIEW"
 
     # 已通过后不可编辑、不可重复提交
-    version = get_detail(client, team_headers, enrollment_id)["version"]
+    version = get_detail(client, school_headers, enrollment_id)["version"]
     update = client.put(
         f"{BASE}/enrollments/{enrollment_id}",
         data=json.dumps(
@@ -82,20 +82,20 @@ def test_city_then_province_approve_and_snapshot_frozen(client, auth):
             }
         ),
         content_type="application/json",
-        **team_headers,
+        **school_headers,
     )
     assert update.status_code == 409
-    resubmit = submit(client, team_headers, enrollment_id, "resubmit-after-approve")
+    resubmit = submit(client, school_headers, enrollment_id, "resubmit-after-approve")
     assert resubmit.status_code == 409
     assert resubmit.json()["code"] == "STATE_CONFLICT"
 
 
 def test_city_cannot_review_province_stage(client, auth):
-    team_headers = auth("team")
+    school_headers = auth("university")
     city_headers = auth("city")
-    enrollment_id = complete_draft(client, team_headers)
+    enrollment_id = complete_draft(client, school_headers)
 
-    assert submit(client, team_headers, enrollment_id, "stage-submit").status_code == 200
+    assert submit(client, school_headers, enrollment_id, "stage-submit").status_code == 200
     first = review(client, city_headers, enrollment_id, "APPROVE", "stage-city")
     assert first.status_code == 200
     assert first.json()["data"]["status"] == "PENDING_PROVINCE_REVIEW"
@@ -113,17 +113,17 @@ def test_city_cannot_review_province_stage(client, auth):
 
 
 def test_withdraw_pending_and_cannot_withdraw_approved(client, auth):
-    team_headers = auth("team")
+    school_headers = auth("university")
     city_headers = auth("city")
     province_headers = auth("province")
-    enrollment_id = complete_draft(client, team_headers)
-    assert submit(client, team_headers, enrollment_id, "withdraw-submit").status_code == 200
+    enrollment_id = complete_draft(client, school_headers)
+    assert submit(client, school_headers, enrollment_id, "withdraw-submit").status_code == 200
 
-    version = get_detail(client, team_headers, enrollment_id)["version"]
+    version = get_detail(client, school_headers, enrollment_id)["version"]
     withdrawn = post_json(
         client,
         f"{BASE}/enrollments/{enrollment_id}/withdraw",
-        team_headers,
+        school_headers,
         {"version": version, "reason": "材料需要补充"},
     )
     assert withdrawn.status_code == 200
@@ -133,7 +133,7 @@ def test_withdraw_pending_and_cannot_withdraw_approved(client, auth):
     again = post_json(
         client,
         f"{BASE}/enrollments/{enrollment_id}/withdraw",
-        team_headers,
+        school_headers,
         {
             "version": withdrawn.json()["data"]["version"],
             "reason": "再次撤回",
@@ -143,16 +143,16 @@ def test_withdraw_pending_and_cannot_withdraw_approved(client, auth):
 
     # 重新提交后走完整审批，已通过不可撤回
     second = complete_draft(
-        client, team_headers, team_id="org_team_01", group_id="group_u12", players=5
+        client, school_headers, team_id="org_team_01", group_id="group_u12", players=5
     )
     approve_flow(
-        client, team_headers, city_headers, province_headers, second, "approved"
+        client, school_headers, city_headers, province_headers, second, "approved"
     )
-    approved_version = get_detail(client, team_headers, second)["version"]
+    approved_version = get_detail(client, school_headers, second)["version"]
     response = post_json(
         client,
         f"{BASE}/enrollments/{second}/withdraw",
-        team_headers,
+        school_headers,
         {"version": approved_version, "reason": "已通过后撤回"},
     )
     assert response.status_code == 409
@@ -160,15 +160,15 @@ def test_withdraw_pending_and_cannot_withdraw_approved(client, auth):
 
 
 def test_submit_idempotency_replay_and_conflict(client, auth):
-    team_headers = auth("team")
-    enrollment_id = complete_draft(client, team_headers)
-    version = get_detail(client, team_headers, enrollment_id)["version"]
+    school_headers = auth("university")
+    enrollment_id = complete_draft(client, school_headers)
+    version = get_detail(client, school_headers, enrollment_id)["version"]
     payload = {"version": version}
 
     first = post_json(
         client,
         f"{BASE}/enrollments/{enrollment_id}/submit",
-        team_headers,
+        school_headers,
         payload,
         HTTP_IDEMPOTENCY_KEY="same-key-0001",
     )
@@ -176,7 +176,7 @@ def test_submit_idempotency_replay_and_conflict(client, auth):
     replay = post_json(
         client,
         f"{BASE}/enrollments/{enrollment_id}/submit",
-        team_headers,
+        school_headers,
         payload,
         HTTP_IDEMPOTENCY_KEY="same-key-0001",
     )
@@ -186,7 +186,7 @@ def test_submit_idempotency_replay_and_conflict(client, auth):
     conflict = post_json(
         client,
         f"{BASE}/enrollments/{enrollment_id}/submit",
-        team_headers,
+        school_headers,
         {"version": version + 1},
         HTTP_IDEMPOTENCY_KEY="same-key-0001",
     )
@@ -195,15 +195,15 @@ def test_submit_idempotency_replay_and_conflict(client, auth):
 
 
 def test_precheck_reports_outside_window(client, auth, monkeypatch):
-    team_headers = auth("team")
-    enrollment_id = complete_draft(client, team_headers)
-    version = get_detail(client, team_headers, enrollment_id)["version"]
+    school_headers = auth("university")
+    enrollment_id = complete_draft(client, school_headers)
+    version = get_detail(client, school_headers, enrollment_id)["version"]
 
     monkeypatch.setenv("ENROLLMENT_MOCK_WINDOW_OPEN", "2099-01-01T00:00:00+08:00")
     response = post_json(
         client,
         f"{BASE}/enrollments/{enrollment_id}/precheck",
-        team_headers,
+        school_headers,
         {"version": version},
     )
     assert response.status_code == 200

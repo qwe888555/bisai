@@ -301,6 +301,7 @@ def create_enrollment(actor, payload) -> dict:
 
 def update_enrollment(actor, enrollment_id: str, payload) -> dict:
     enrollment = scope.get_enrollment(actor, enrollment_id)
+    scope.ensure_enrollment_creator(actor, enrollment)
     _ensure_editable(enrollment)
     check_version(enrollment, payload.version)
 
@@ -336,6 +337,7 @@ def update_enrollment(actor, enrollment_id: str, payload) -> dict:
 
 def delete_enrollment(actor, enrollment_id: str, version: int) -> tuple[str, int]:
     enrollment = scope.get_enrollment(actor, enrollment_id)
+    scope.ensure_enrollment_creator(actor, enrollment)
     _ensure_editable(enrollment)
     check_version(enrollment, version)
     if (
@@ -521,6 +523,7 @@ def _submitted_status(subject_type: str) -> str:
 @transaction.atomic
 def submit_enrollment(actor, enrollment_id: str, version: int) -> dict:
     enrollment = _locked_enrollment(actor, enrollment_id)
+    scope.ensure_enrollment_creator(actor, enrollment)
     check_version(enrollment, version)
     if enrollment.status not in EDITABLE_STATUSES:
         raise ApiError(
@@ -577,11 +580,7 @@ def withdraw_enrollment(actor, enrollment_id: str, version: int, reason: str) ->
             "仅待审核报名可撤回，已通过不可撤回",
             [{"field": "status", "reason": enrollment.status}],
         )
-    roles = scope.role_set(actor)
-    proxy_roles = roles & {"CITY", "PROVINCE_REVIEWER", "ADMIN"}
-    if actor.pk != enrollment.created_by and not proxy_roles:
-        raise ApiError(FORBIDDEN, "仅创建方或有代报权限的主体可撤回")
-
+    scope.ensure_enrollment_creator(actor, enrollment)
     from_status = enrollment.status
     stage = "CITY" if from_status == STATUS_PENDING_CITY else "PROVINCE"
     snapshot = _latest_snapshot(enrollment)

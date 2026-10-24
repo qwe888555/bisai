@@ -39,25 +39,27 @@ from .models import ENROLLMENT_STATUSES, SUBJECT_TYPES
 router = Router(tags=["enrollments"])
 _auth = JWTAuth()
 
-# 角色元组：R5 全业务角色；R3 审核/统计
+# 角色元组：R5 全业务角色（只读/名单/材料维护）；R1 仅学校端（报名单写操作）；
+# R3 审核/统计（ADMIN 依口径可代审，但不代建代提）。
 R5 = (TEAM, UNIVERSITY, CITY, PROVINCE_REVIEWER, ADMIN)
+R1 = (UNIVERSITY,)
 R3 = (CITY, PROVINCE_REVIEWER, ADMIN)
 
 # 权限点登记（导入期完成，漏登记 require() 会直接报错）
 register_operation("formConfig", R5)
 register_operation("enrollmentList", R5)
-register_operation("enrollmentCreate", R5)
+register_operation("enrollmentCreate", R1)
 register_operation("enrollmentGet", R5)
-register_operation("enrollmentUpdate", R5)
-register_operation("enrollmentDelete", R5)
+register_operation("enrollmentUpdate", R1)
+register_operation("enrollmentDelete", R1)
 register_operation("rosterList", R5)
 register_operation("rosterCreate", R5)
 register_operation("rosterGet", R5)
 register_operation("rosterUpdate", R5)
 register_operation("rosterDelete", R5)
 register_operation("precheck", R5)
-register_operation("submitEnrollment", R5)
-register_operation("withdrawEnrollment", R5)
+register_operation("submitEnrollment", R1)
+register_operation("withdrawEnrollment", R1)
 register_operation("reviewEnrollment", R3)
 register_operation("reviewHistory", R5)
 register_operation("snapshotGet", R5)

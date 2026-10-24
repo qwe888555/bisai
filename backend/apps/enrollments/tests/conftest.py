@@ -23,6 +23,8 @@ ORGANIZATIONS = (
 )
 
 ACCOUNTS = (
+    ("acc_university", "university", ["UNIVERSITY"], "org_school_01"),
+    ("acc_university2", "university2", ["UNIVERSITY"], "org_school_02"),
     ("acc_team", "team", ["TEAM"], "org_team_01"),
     ("acc_team2", "team2", ["TEAM"], "org_team_02"),
     ("acc_city", "city", ["CITY"], "org_city_01"),

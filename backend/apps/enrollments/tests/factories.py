@@ -151,13 +151,13 @@ def review(client, headers: dict, enrollment_id: str, decision: str, key: str, r
 
 def approve_flow(
     client,
-    team_headers: dict,
+    school_headers: dict,
     city_headers: dict,
     province_headers: dict,
     enrollment_id: str,
     key_prefix: str,
 ) -> dict:
-    response = submit(client, team_headers, enrollment_id, f"{key_prefix}-submit")
+    response = submit(client, school_headers, enrollment_id, f"{key_prefix}-submit")
     assert response.status_code == 200, response.json()
     response = review(client, city_headers, enrollment_id, "APPROVE", f"{key_prefix}-city")
     assert response.status_code == 200, response.json()

@@ -15,11 +15,7 @@ from django.db.models import Q
 
 from apps.common.errors import DATA_SCOPE_DENIED, FORBIDDEN, NOT_FOUND, ApiError
 from apps.common.permissions import (
-    ADMIN,
-    CITY,
     ORG_SCOPE_ROLES,
-    PROVINCE_REVIEWER,
-    TEAM,
     UNIVERSITY,
 )
 from apps.common.scopes import org_scope_ids
@@ -87,21 +83,40 @@ def get_enrollment(account, enrollment_id: str) -> Enrollment:
 
 
 def subject_type_allowed(account, subject_type: str) -> None:
-    """subjectType 必须匹配账号实际报送权限（不能自报 CITY 越级）。"""
+    """学校端（UNIVERSITY）是唯一报送主体：新建/编辑/提交/撤回只能由它做。
+
+    TEAM 只读看进度+维护名单材料；CITY 不代填报；省级只终审；
+    ADMIN 依口径不代替学校新建或提交报名。
+    """
     roles = role_set(account)
-    if subject_type == "SCHOOL_TEAM" and TEAM in roles:
-        return
-    if subject_type == "UNIVERSITY" and UNIVERSITY in roles:
-        return
-    if subject_type == "CITY" and CITY in roles:
-        return
-    if roles & {ADMIN, PROVINCE_REVIEWER}:
-        return
-    raise ApiError(
-        FORBIDDEN,
-        "当前账号无权以该主体类型报送",
-        [{"field": "subjectType", "reason": "与账号报送权限不匹配"}],
-    )
+    if UNIVERSITY not in roles:
+        raise ApiError(
+            FORBIDDEN,
+            "仅学校端可报送报名",
+            [{"field": "subjectType", "reason": "当前角色无报送权限"}],
+        )
+    if subject_type not in {"SCHOOL_TEAM", "UNIVERSITY"}:
+        raise ApiError(
+            FORBIDDEN,
+            "报送主体类型非法",
+            [{"field": "subjectType", "reason": "仅支持中小学球队/高校"}],
+        )
+
+
+def ensure_enrollment_creator(account, enrollment: Enrollment) -> None:
+    """报名单的编辑/提交/撤回：仅创建该报名的学校端账号本人可操作。"""
+    if UNIVERSITY not in role_set(account):
+        raise ApiError(
+            FORBIDDEN,
+            "仅学校端可操作该报名单",
+            [{"field": "enrollmentId", "reason": "当前角色无报送权限"}],
+        )
+    if account.pk != enrollment.created_by:
+        raise ApiError(
+            FORBIDDEN,
+            "仅创建该报名的学校账号可操作",
+            [{"field": "enrollmentId", "reason": "非报名的创建者"}],
+        )
 
 
 def ensure_team_in_scope(account, team: dict) -> None:
