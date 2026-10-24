@@ -247,3 +247,172 @@ class ApiSmokeTests(TestCase):
 
         second = self.get("/dictionaries/GENDER/options", token)
         self.assertEqual(body(second)["data"]["total"], original_total + 1)
+
+    # ---------------------------------------------------------------- 组织树
+    def create_org(self, token: str, payload: dict) -> dict:
+        response = self.post("/organizations", payload, token)
+        self.assertEqual(response.status_code, 200, response.content)
+        return body(response)["data"]
+
+    def org_by_code(self, code: str):
+        from apps.accounts.models import Organization
+
+        return Organization.all_objects.get(code=code)
+
+    def test_team_cannot_hang_under_province(self):
+        token = self.login()
+        response = self.post(
+            "/organizations",
+            {
+                "name": "越级球队",
+                "orgType": "TEAM",
+                "code": "BIZ_TEAM_BAD_1",
+                "parentId": "org_prov",
+            },
+            token,
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(body(response)["code"], "INVALID_ARGUMENT")
+        self.assertIn("parentId", [item["field"] for item in body(response)["data"]])
+
+    def test_soft_deleted_code_is_revived(self):
+        token = self.login()
+        created = self.create_org(
+            token,
+            {"name": "待撤市州", "orgType": "CITY", "code": "BIZ_CITY_REVIVE", "parentId": "org_prov"},
+        )
+        deleted = self.client.delete(
+            f"{BASE}/organizations/{created['id']}?version={created['version']}",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+        self.assertEqual(deleted.status_code, 200, deleted.content)
+
+        revived = self.create_org(
+            token,
+            {"name": "恢复市州", "orgType": "CITY", "code": "BIZ_CITY_REVIVE", "parentId": "org_prov"},
+        )
+        self.assertEqual(revived["id"], created["id"])
+        self.assertEqual(self.org_by_code("BIZ_CITY_REVIVE").deleted_at, None)
+
+    def test_organization_cycle_and_disable_are_rejected(self):
+        token = self.login()
+        city = self.create_org(
+            token,
+            {"name": "某市", "orgType": "CITY", "code": "BIZ_CITY_CYCLE", "parentId": "org_prov"},
+        )
+        school = self.create_org(
+            token,
+            {"name": "某校", "orgType": "SCHOOL", "code": "BIZ_SCHOOL_CYCLE", "parentId": city["id"]},
+        )
+
+        cycle = self.client.put(
+            f"{BASE}/organizations/{city['id']}",
+            data=json.dumps(
+                {
+                    "name": "某市",
+                    "orgType": "CITY",
+                    "code": "BIZ_CITY_CYCLE",
+                    "parentId": school["id"],
+                    "version": city["version"],
+                }
+            ),
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+        self.assertEqual(cycle.status_code, 400, cycle.content)
+        self.assertEqual(body(cycle)["code"], "INVALID_ARGUMENT")
+
+        disable = self.client.put(
+            f"{BASE}/organizations/{city['id']}",
+            data=json.dumps(
+                {
+                    "name": "某市",
+                    "orgType": "CITY",
+                    "code": "BIZ_CITY_CYCLE",
+                    "parentId": "org_prov",
+                    "enabled": False,
+                    "version": city["version"],
+                }
+            ),
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+        self.assertEqual(disable.status_code, 409, disable.content)
+        self.assertEqual(body(disable)["code"], "STATE_CONFLICT")
+
+    def test_code_is_immutable_on_update(self):
+        token = self.login()
+        city = self.create_org(
+            token,
+            {"name": "不可改码市", "orgType": "CITY", "code": "BIZ_CITY_IMMUT", "parentId": "org_prov"},
+        )
+        response = self.client.put(
+            f"{BASE}/organizations/{city['id']}",
+            data=json.dumps(
+                {
+                    "name": "不可改码市",
+                    "orgType": "CITY",
+                    "code": "BIZ_CITY_RENAMED",
+                    "parentId": "org_prov",
+                    "version": city["version"],
+                }
+            ),
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(body(response)["code"], "INVALID_ARGUMENT")
+
+    def test_ensure_business_org_syncs_and_revives(self):
+        from django.db import transaction
+
+        from apps.accounts.models import Organization
+        from apps.accounts.services import ensure_business_org
+
+        with transaction.atomic():
+            org = ensure_business_org("UNIVERSITY", "BIZ_UNI_ENSURE", "同步高校", "org_prov")
+        self.assertEqual(org.org_type, "UNIVERSITY")
+        self.assertEqual(org.parent_id, "org_prov")
+
+        with transaction.atomic():
+            again = ensure_business_org("UNIVERSITY", "BIZ_UNI_ENSURE", "同步高校", "org_prov")
+        self.assertEqual(again.pk, org.pk)
+
+        Organization.objects.filter(pk=org.pk).update(deleted_at="2026-01-01T00:00:00Z")
+        with transaction.atomic():
+            revived = ensure_business_org("UNIVERSITY", "BIZ_UNI_ENSURE", "同步高校", "org_prov")
+        self.assertEqual(revived.pk, org.pk)
+        self.assertIsNone(revived.deleted_at)
+
+    def test_global_admin_without_org_sees_everything(self):
+        from apps.accounts.models import Account
+        from apps.accounts.services import scoped_accounts
+        from apps.common.ids import new_account_id
+
+        admin = Account.objects.create(
+            id=new_account_id(),
+            username="global_admin_case",
+            display_name="全局管理员",
+            roles=["ADMIN"],
+            organization=None,
+            password="x",
+        )
+        self.assertEqual(scoped_accounts(admin).count(), Account.objects.count())
+
+    def test_init_admin_command(self):
+        from django.core.management import CommandError
+
+        from apps.accounts.models import Account
+
+        call_command("init_admin", username="root_admin", password="Init@123456", verbosity=0)
+        account = Account.objects.get(username="root_admin")
+        self.assertTrue(account.must_change_password)
+        self.assertIsNone(account.organization_id)
+
+        token = self.login("root_admin", "Init@123456")
+        me = self.get("/me", token)
+        self.assertEqual(me.status_code, 200)
+
+        with self.assertRaises(CommandError):
+            call_command("init_admin", username="root_admin", password="Init@123456", verbosity=0)
+
