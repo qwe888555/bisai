@@ -11,7 +11,7 @@ from ninja import Router
 from apps.common.authentication import JWTAuth
 from apps.common.envelope import action_result, ok
 from apps.common.errors import NOT_FOUND, ApiError
-from apps.common.pagination import paginate_list
+from apps.common.pagination import paginate
 from apps.common.permissions import ALL_ROLES, register_operation, require
 from apps.common.schemas import EnvelopeOut
 from apps.common.versioning import bump
@@ -67,7 +67,7 @@ def message_list(request):
     if read not in (None, ""):
         queryset = queryset.filter(read=str(read).lower() in {"1", "true", "yes"})
     queryset = queryset.order_by("-created_at", "id")
-    return paginate_list(request, [_message_out(item) for item in queryset])
+    return paginate(request, queryset, mapper=_message_out)
 
 
 @router.get(
