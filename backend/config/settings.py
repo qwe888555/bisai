@@ -79,6 +79,10 @@ INSTALLED_APPS = [
     "apps.attachments",
     "apps.verification",
     "apps.policyqa",
+    "apps.persons",
+    "apps.teams",
+    "apps.materials",
+    "apps.infra",
     "apps.enrollments",
 ]
 

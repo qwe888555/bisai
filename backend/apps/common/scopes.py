@@ -12,7 +12,6 @@ from .errors import DATA_SCOPE_DENIED, FORBIDDEN, ApiError
 from .permissions import (
     ADMIN,
     HIGH_PRIVILEGE_ROLES,
-    ORG_SCOPE_ROLES,
     ROLE_NAMES,
 )
 
@@ -31,6 +30,14 @@ ROLE_LEVEL: dict[str, int] = {
 
 def is_admin(account) -> bool:
     return ADMIN in (getattr(account, "roles", ()) or ())
+
+
+def is_global_admin(account) -> bool:
+    """无所属组织的 ADMIN 视为全局管理员：读写都覆盖全库。
+
+    挂组织的 ADMIN 仍按组织子树限定，避免"读空写通"的半坏状态。
+    """
+    return is_admin(account) and not account_org_id(account)
 
 
 def role_level(roles: Optional[Iterable[str]]) -> int:
@@ -64,19 +71,17 @@ def _subtree_ids(org_id: str) -> list[str]:
 
 
 def org_scope_ids(account) -> list[str]:
-    """当前账号可见的组织范围。"""
+    """当前账号可见的组织范围；全局管理员由调用方单独放行（返回空表示无范围）。"""
     org_id = account_org_id(account)
     if not org_id:
         return []
-    if set(getattr(account, "roles", ()) or ()) & ORG_SCOPE_ROLES:
-        return _subtree_ids(org_id)
-    return _subtree_ids(org_id)  # 非树角色也只看自身组织（子树通常为空）
+    return _subtree_ids(org_id)
 
 
 def ensure_org_in_scope(account, org_id: Optional[str]) -> None:
+    if is_global_admin(account):
+        return
     if not org_id:
-        if is_admin(account):
-            return
         raise ApiError(DATA_SCOPE_DENIED, "缺少所属组织，无法确定数据范围")
     if org_id not in set(org_scope_ids(account)):
         raise ApiError(DATA_SCOPE_DENIED, "目标组织不在当前账号数据范围内")

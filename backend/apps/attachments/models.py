@@ -49,6 +49,8 @@ class FileRecord(models.Model):
     private = models.BooleanField(default=True)
     storage_key = models.CharField(max_length=255)
     storage_backend = models.CharField(max_length=20, default="local")
+    # 图片类文件生成的缩略图存储键（非图片或生成失败时为空）
+    thumbnail_key = models.CharField(max_length=255, blank=True, default="")
     uploaded_by = models.CharField(max_length=64, db_index=True)
     version = models.PositiveIntegerField(default=0)
     created_at = models.DateTimeField(auto_now_add=True)

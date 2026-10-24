@@ -13,7 +13,7 @@ from ninja.files import UploadedFile
 
 from apps.common.authentication import JWTAuth
 from apps.common.envelope import action_result, ok
-from apps.common.errors import INVALID_ARGUMENT, ApiError
+from apps.common.errors import INVALID_ARGUMENT, NOT_FOUND, ApiError
 from apps.common.middleware import audit_state
 from apps.common.permissions import ALL_ROLES, register_operation, require
 from apps.common.schemas import EnvelopeOut, StrictSchema
@@ -64,6 +64,8 @@ def _file_out(record: FileRecord) -> dict:
         data["category"] = record.category
     if record.content_type:
         data["contentType"] = record.content_type
+    if record.thumbnail_key:
+        data["thumbnailUrl"] = f"/files/{record.pk}/thumbnail"
     return data
 
 
@@ -162,4 +164,23 @@ def file_download(request, file_id: str):
         f"attachment; filename*=UTF-8''{quote(record.original_name)}"
     )
     response["Content-Length"] = str(record.size_bytes)
+    return response
+
+
+@router.get(
+    "/files/{file_id}/thumbnail",
+    auth=_auth,
+    response=None,
+    summary="图片缩略图（授权读取）",
+)
+def file_thumbnail(request, file_id: str):
+    actor = require("fileDownload")
+    from .storage import get_storage
+
+    record = services.get_record(actor, file_id)
+    if not record.thumbnail_key:
+        raise ApiError(NOT_FOUND, "该文件没有缩略图")
+    stream = get_storage().open(record.thumbnail_key)
+    response = FileResponse(stream, content_type="image/jpeg")
+    response["Cache-Control"] = "private, no-store"
     return response

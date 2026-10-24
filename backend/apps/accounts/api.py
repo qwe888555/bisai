@@ -15,7 +15,7 @@ from apps.common.authentication import JWTAuth
 from apps.common.envelope import action_result, ok
 from apps.common.errors import INVALID_ARGUMENT, ApiError
 from apps.common.middleware import audit_state
-from apps.common.pagination import paginate_list
+from apps.common.pagination import paginate
 from apps.common.permissions import (
     ADMIN,
     ALL_ROLES,
@@ -184,7 +184,7 @@ def account_list(
             "enabled": _bool_param(enabled),
         },
     )
-    return paginate_list(request, [s.account_out(account) for account in queryset])
+    return paginate(request, queryset, mapper=s.account_out)
 
 
 @router.post("/accounts", auth=_auth, response=EnvelopeOut, summary="创建账号")
@@ -275,7 +275,7 @@ def organization_list(
     queryset = services.list_organizations(
         actor, {"parentId": parentId, "orgType": orgType}
     )
-    return paginate_list(request, [s.organization_out(o) for o in queryset])
+    return paginate(request, queryset, mapper=s.organization_out)
 
 
 @router.post("/organizations", auth=_auth, response=EnvelopeOut, summary="创建组织")
@@ -354,7 +354,7 @@ def organization_delete(request, organization_id: str, version: Optional[int] = 
 def dictionary_list(request, dictType: Optional[str] = None):
     actor = require("dictionaryList")
     queryset = services.list_dictionary_items({"dictType": dictType})
-    return paginate_list(request, [s.dictionary_item_out(i) for i in queryset])
+    return paginate(request, queryset, mapper=s.dictionary_item_out)
 
 
 @router.post("/dictionary-items", auth=_auth, response=EnvelopeOut, summary="创建字典项")
@@ -431,8 +431,8 @@ def dictionary_delete(request, dictionary_id: str, version: Optional[int] = None
 )
 def dictionary_options(request, dict_type: str):
     actor = require("dictionaryOptions")
-    queryset = services.dictionary_options(dict_type)
-    return paginate_list(request, [s.dictionary_item_out(i) for i in queryset])
+    items = services.dictionary_options(dict_type)
+    return paginate(request, items, mapper=s.dictionary_item_out)
 
 
 # ---------------------------------------------------------------- 审计日志
@@ -461,4 +461,4 @@ def audit_list(
         actor,
         {"logType": logType, "objectId": objectId, **parsed},
     )
-    return paginate_list(request, [s.audit_log_out(log) for log in queryset])
+    return paginate(request, queryset, mapper=s.audit_log_out)
