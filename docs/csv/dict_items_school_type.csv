@@ -1,0 +1,7 @@
+type_code,value,label,sort_order,is_active,ext_json
+school_type,PRIMARY,小学,10,1,
+school_type,JUNIOR,初中,20,1,
+school_type,SENIOR,高中,30,1,
+school_type,NINE_YEAR,九年一贯制学校,40,1,
+school_type,COMPLETE,完全中学,50,1,
+school_type,MIDDLE_VOC,中等职业学校,60,1,

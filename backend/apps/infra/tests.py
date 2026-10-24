@@ -50,12 +50,12 @@ class InitBaseDataTests(TestCase):
 
     def test_execute_dict_types_idempotent(self):
         self.call_cmd(phase="dict_types", execute=True)
-        self.assertEqual(DictType.objects.count(), 5)
+        self.assertEqual(DictType.objects.count(), len(DICT_TYPES))
         self.assertTrue(DictType.objects.filter(code="team_category", name="球队组别").exists())
         out = self.call_cmd(phase="dict_types", execute=True)  # 重跑：全部跳过
         self.assertIn("新增=0", out)
-        self.assertIn("跳过=5", out)
-        self.assertEqual(DictType.objects.count(), 5)
+        self.assertIn(f"跳过={len(DICT_TYPES)}", out)
+        self.assertEqual(DictType.objects.count(), len(DICT_TYPES))
 
     def test_missing_csv_skips_explicitly(self):
         for phase in ("regions", "schools", "dict_items", "material_types"):
@@ -153,7 +153,7 @@ class InitBaseDataTests(TestCase):
         csv = make_csv(
             [
                 ["position", "GK", "守门员", "1", "1", ""],
-                ["position", "GK", "守门员", "1", "1", ""],       # (type,value) 已存在 -> 跳过
+                ["position", "GK", "守门员-重导行", "1", "1", ""],  # (type,value) 已存在 -> 跳过（label 须不同，文件内同 type 同 label 会被预检拦截）
                 ["nope", "X", "未知类型", "", "1", ""],            # type_code 不存在 -> 失败
                 ["position", "DF", "后卫", "2", "1", "{bad"],      # ext_json 非法 -> 失败
                 ["position", "MF", "中场", "3", "1", '{"group":"U12"}'],  # 合法 JSON
@@ -188,6 +188,24 @@ class InitBaseDataTests(TestCase):
         self.assertIn("新增=0", out2)
         self.assertIn("跳过=1", out2)
         self.assertEqual(MaterialType.objects.count(), 1)
+
+
+    # ------------------------------------------------------------ 参数与数据边界
+
+    def test_phase_invalid_choice_rejected(self):
+        # --phase 有 argparse choices 校验；CLI 字符串形式才会走 parser 校验
+        out = StringIO()
+        with self.assertRaises(CommandError):
+            call_command("init_base_data", "--phase=bogus", stdout=out)
+
+    def test_regions_csv_header_only_succeeds(self):
+        path = make_csv([], ["code", "name", "level", "parent_code", "sort_order", "is_active"])
+        try:
+            out = self.call_cmd(phase="regions", execute=True, regions_csv=path)
+        finally:
+            os.unlink(path)
+        self.assertIn("新增=0", out)
+        self.assertEqual(Region.objects.count(), 0)
 
 
 class VerifyTests(TestCase):
@@ -236,7 +254,7 @@ class VerifyTests(TestCase):
         city = self.make_region("540100", 2, parent=prov)
         self.make_region("540121", 3, parent=city)
         self.make_school("林周县中学", Region.objects.get(code="540121"))
-        for item in DICT_TYPES:  # 5 骨架齐全
+        for item in DICT_TYPES:  # 骨架齐全
             DictType.objects.create(code=item["code"], name=item["name"])
         DictItem.objects.create(type=DictType.objects.get(code="position"), value="GK", label="守门员")
         MaterialType.objects.create(code="photo", name="个人照片", applies_to="PERSON")
@@ -347,9 +365,9 @@ class VerifyTests(TestCase):
         self.assertEqual(code, 0)  # 非 strict 时 WARN 不影响退出码
 
     def test_verify_missing_skeleton_warn_only(self):
-        DictType.objects.create(code="team_category", name="球队组别")  # 只建 1/5
+        DictType.objects.create(code="team_category", name="球队组别")  # 只建 1/6
         out, code = self.call_verify(verify=True)
-        self.assertEqual(out.count("骨架缺失"), 4)
+        self.assertEqual(out.count("骨架缺失"), len(DICT_TYPES) - 1)
         self.assertEqual(code, 0)
 
     def test_verify_dict_item_unknown_type_warn(self):
@@ -368,9 +386,9 @@ class VerifyTests(TestCase):
         self.assertEqual(code, 0)
 
     def test_verify_strict_warns_exit_nonzero(self):
-        DictType.objects.create(code="team_category", name="球队组别")  # 4 个骨架缺失 -> WARN
+        DictType.objects.create(code="team_category", name="球队组别")  # 其余骨架缺失 -> WARN
         out, code = self.call_verify(verify=True, strict=True)
-        self.assertEqual(out.count("骨架缺失"), 4)
+        self.assertEqual(out.count("骨架缺失"), len(DICT_TYPES) - 1)
         self.assertEqual(code, 1)  # strict 下 WARN 也非零
 
     def test_verify_region_partial_import_no_gap_warn(self):
@@ -413,3 +431,102 @@ class VerifyTests(TestCase):
     def test_verify_mutually_exclusive_with_execute(self):
         with self.assertRaises(CommandError):
             call_command("init_base_data", verify=True, execute=True, stdout=StringIO())
+
+
+class DictItemsValidationTests(TestCase):
+    """字典项导入校验补强（2026-10-24）：value 编码格式 + 同 type 下 label 冲突拦截。
+
+    覆盖既有校验器的两个缺口：
+    - value 必须匹配 ^[A-Za-z0-9][A-Za-z0-9_-]{0,49}$（稳定编码，列宽 VARCHAR(50)）；
+    - 同一 type_code 下 label 重复 → 整体 CommandError 拦截（写库前，零写入）。
+    """
+
+    ITEMS_HEADER = ["type_code", "value", "label", "sort_order", "is_active", "ext_json"]
+
+    def call_cmd(self, *args) -> str:
+        out = StringIO()
+        call_command("init_base_data", *args, stdout=out)
+        return out.getvalue()
+
+    def test_value_format_invalid_recorded_as_failed(self):
+        DictType.objects.create(code="position", name="场上位置")
+        path = make_csv(
+            [["position", "GK DF", "守门员", "1", "1", ""]],
+            self.ITEMS_HEADER,
+        )
+        out = self.call_cmd("--phase", "dict_items", "--dict-items-csv", path)
+        self.assertIn("编码格式非法", out)
+        self.assertIn("失败=1", out)
+        self.assertEqual(DictItem.objects.count(), 0)
+
+    def test_value_over_50_chars_rejected(self):
+        DictType.objects.create(code="position", name="场上位置")
+        path = make_csv(
+            [["position", "A" * 51, "超长", "1", "1", ""]],
+            self.ITEMS_HEADER,
+        )
+        out = self.call_cmd("--phase", "dict_items", "--dict-items-csv", path)
+        self.assertIn("编码格式非法", out)
+        self.assertEqual(DictItem.objects.count(), 0)
+
+    def test_label_duplicate_rejected_before_write(self):
+        DictType.objects.create(code="position", name="场上位置")
+        path = make_csv(
+            [
+                ["position", "GK", "守门员", "1", "1", ""],
+                ["position", "GK2", "守门员", "2", "1", ""],
+            ],
+            self.ITEMS_HEADER,
+        )
+        out = StringIO()
+        with self.assertRaises(CommandError):
+            call_command(
+                "init_base_data", "--phase", "dict_items",
+                "--dict-items-csv", path, stdout=out,
+            )
+        self.assertEqual(DictItem.objects.count(), 0)  # 预检在写库前，零写入
+
+    def test_valid_values_still_imported(self):
+        """既有合法值域（含下划线/连字符）不受新格式校验影响。"""
+        DictType.objects.create(code="school_type", name="学校类型")
+        path = make_csv(
+            [["school_type", "MIDDLE_VOC", "中职学校", "1", "1", ""]],
+            self.ITEMS_HEADER,
+        )
+        out = self.call_cmd("--phase", "dict_items", "--dict-items-csv", path, "--execute")
+        self.assertIn("新增=1", out)
+        self.assertEqual(DictItem.objects.count(), 1)
+
+    def test_dict_items_rerun_idempotent(self):
+        """同 CSV 跨命令重跑：第二次全部跳过，数据不变（幂等）。"""
+        DictType.objects.create(code="position", name="场上位置")
+        path = make_csv(
+            [
+                ["position", "GK", "守门员", "10", "1", ""],
+                ["position", "DF", "后卫", "20", "1", ""],
+            ],
+            self.ITEMS_HEADER,
+        )
+        first = self.call_cmd("--phase", "dict_items", "--dict-items-csv", path, "--execute")
+        self.assertIn("新增=2", first)
+        second = self.call_cmd("--phase", "dict_items", "--dict-items-csv", path, "--execute")
+        self.assertIn("跳过=2", second)
+        self.assertEqual(DictItem.objects.count(), 2)
+        # label 未被第二次导入改写（get_or_create 不更新 defaults）
+        self.assertEqual(DictItem.objects.get(value="GK").label, "守门员")
+
+    def test_dict_items_blank_value_failed_row_isolated(self):
+        """空 value/label 行记失败，同批其他合法行正常导入（行级隔离）。"""
+        DictType.objects.create(code="position", name="场上位置")
+        path = make_csv(
+            [
+                ["position", "", "空value", "1", "1", ""],
+                ["position", "GK", "", "2", "1", ""],
+                ["position", "DF", "后卫", "20", "1", ""],
+            ],
+            self.ITEMS_HEADER,
+        )
+        out = self.call_cmd("--phase", "dict_items", "--dict-items-csv", path, "--execute")
+        self.assertIn("失败=2", out)
+        self.assertIn("新增=1", out)
+        self.assertEqual(DictItem.objects.count(), 1)  # 仅 DF 导入

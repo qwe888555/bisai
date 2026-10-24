@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -40,12 +41,21 @@ from django.db import connection, transaction
 from apps.materials.models import MaterialType
 from apps.persons.models import DictItem, DictType, Region, School
 
-# 字典类型骨架：code 为冻结 DDL（V1.4-r1）与《成员4后端总体设计 V1.0》确认的 5 类引用；
+# 字典项 value 稳定编码格式：字母/数字开头，仅含字母数字下划线连字符，≤50（列宽上限）。
+# 现有全部既有值域（GK/DF/MF/FW、HEAD/ASSISTANT/...、PRIMARY/MIDDLE_VOC 等）均满足。
+_VALUE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,49}$")
+
+# 字典类型骨架：code 为冻结 DDL（V1.4-r1）与《成员4后端总体设计 V1.0》确认的 5 类引用，
+# 加 coach_category（2026-10-24 用户规划候选：HEAD/ASSISTANT/GOALKEEPER/FITNESS/MANAGER/OTHER，
+# 字典项清单待最终确认后走 --dict-items-csv 导入，模板见 docs/初始化数据模板与缺失数据清单.md；
+# 注意：TeamCoach.duty 冻结枚举仅 3 值（CoachDuty），coach_category 的消费端承载方案待批准，
+# 本骨架仅建字典类型行（数据非 DDL），不改变任何冻结结构）。
 # name 为建议名称，预览中醒目标注，可在执行前人工确认/修改（DDL 对 name 无硬性规定）。
 DICT_TYPES: tuple[dict, ...] = (
     {"code": "team_category", "name": "球队组别"},
     {"code": "position", "name": "场上位置"},
     {"code": "coach_level", "name": "教练等级"},
+    {"code": "coach_category", "name": "教练岗位"},
     {"code": "guardian_relation", "name": "监护人关系"},
     {"code": "school_type", "name": "学校类型"},
 )
@@ -134,7 +144,10 @@ class Command(BaseCommand):
 
     def _run_dict_types(self) -> dict:
         self.stdout.write("\n== 阶段1: base_dict_type 字典类型骨架 ==")
-        self.stdout.write("  唯一键: code (uk_dict_type_code) | 来源: 冻结DDL+总体设计V1.0 确认的5类引用")
+        self.stdout.write(
+            f"  唯一键: code (uk_dict_type_code) | 来源: 冻结DDL+总体设计V1.0 确认的5类引用"
+            f"+coach_category(2026-10-24 规划候选) 共{len(DICT_TYPES)}类"
+        )
         report = {"created": 0, "skipped": 0, "failed": []}
         for item in DICT_TYPES:
             exists = DictType.objects.filter(code=item["code"]).exists()
@@ -225,6 +238,19 @@ class Command(BaseCommand):
         rows = _read_csv(self.csv_paths["dict_items"])
         self.stdout.write(f"  唯一键: (type,value) | 行数: {len(rows)} | 前置: 字典类型须已存在")
 
+        # 跨行预检：同一 type_code 下 label 重复 = 下拉出现同名两行，属数据质量问题，
+        # 导入前按 CSV 行号整体拦截（value 唯一由 (type,value) 键保证，label 无唯一约束）。
+        seen_labels: dict[tuple[str, str], int] = {}
+        for line_no, row in enumerate(rows, start=2):  # 行号含表头偏移
+            key = (row.get("type_code", ""), row.get("label", ""))
+            if key[1] and key in seen_labels:
+                raise CommandError(
+                    f"dict_items 第 {seen_labels[key]} 行与第 {line_no} 行 label 重复"
+                    f"（type_code={key[0]!r}, label={key[1]!r}），请修正后再导入"
+                )
+            if key[1]:
+                seen_labels[key] = line_no
+
         def row_fn(row: dict) -> str:
             dtype = DictType.objects.filter(code=row.get("type_code", "")).first()
             if dtype is None:
@@ -232,6 +258,11 @@ class Command(BaseCommand):
             value, label = row.get("value", ""), row.get("label", "")
             if not value or not label:
                 raise ValueError("value/label 必填")
+            if not _VALUE_RE.match(value):
+                raise ValueError(
+                    f"value 编码格式非法: {value!r}（仅限字母/数字/下划线/连字符，"
+                    f"以字母或数字开头，≤50 字符，与列 VARCHAR(50) 一致）"
+                )
             ext_raw = row.get("ext_json", "") or None
             ext = None
             if ext_raw:
