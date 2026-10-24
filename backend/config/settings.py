@@ -64,6 +64,13 @@ def env_list(key: str, default: str = "") -> list[str]:
 SECRET_KEY = env("DJANGO_SECRET_KEY", "dev-only-change-me-please-32bytes-min")
 DEBUG = env_bool("DJANGO_DEBUG", True)
 ALLOWED_HOSTS = env_list("ALLOWED_HOSTS", "*")
+
+# 运行环境档位：dev（默认，零校验零影响）/ test / prod（触发生产安全启动校验，见 apps/common/production.py）。
+# 未知值显式报错拒绝启动，不静默回退 dev（报错不回显输入内容）。
+DJANGO_ENV = env("DJANGO_ENV", "dev").strip().lower()
+from apps.common.production import assert_valid_env as _assert_valid_env  # noqa: E402
+
+_assert_valid_env(DJANGO_ENV)
 ROOT_URLCONF = "config.urls"
 WSGI_APPLICATION = "config.wsgi.application"
 ASGI_APPLICATION = "config.asgi.application"
