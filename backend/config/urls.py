@@ -11,6 +11,7 @@ from apps.attachments.api import router as attachments_router
 from apps.common.api import api_not_found
 from apps.common.api import router as common_router
 from apps.common.ninja_api import api
+from apps.enrollments.api import router as enrollments_router
 from apps.notices.api import router as notices_router
 from apps.policyqa.api import router as policyqa_router
 from apps.verification.api import router as verification_router
@@ -22,6 +23,7 @@ api.add_router("", notices_router, tags=["notices"])
 api.add_router("", attachments_router, tags=["files"])
 api.add_router("", verification_router, tags=["identity"])
 api.add_router("", policyqa_router, tags=["policy"])
+api.add_router("", enrollments_router, tags=["enrollments"])
 
 urlpatterns = [
     path("api/v1/", api.urls),

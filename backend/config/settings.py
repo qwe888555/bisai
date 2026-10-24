@@ -83,6 +83,7 @@ INSTALLED_APPS = [
     "apps.teams",
     "apps.materials",
     "apps.infra",
+    "apps.enrollments",
 ]
 
 # 中间件顺序不可随意调整：requestId 必须最外层，审计/限流在其内。
