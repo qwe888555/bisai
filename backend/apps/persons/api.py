@@ -15,12 +15,26 @@ from typing import Optional
 from ninja import Query, Router
 
 from apps.common.authentication import JWTAuth
-from apps.common.envelope import action_result, ok
+from apps.common.conf import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE
+from apps.common.envelope import action_result, ok, page
+from apps.common.errors import (
+    INVALID_ARGUMENT,
+    NOT_FOUND,
+    PROFILE_BINDING_REQUIRED,
+    ApiError,
+    field_errors,
+)
 from apps.common.middleware import audit_state
 from apps.common.pagination import paginate, paginate_list
 from apps.common.permissions import (
     ADMIN,
     ALL_ROLES,
+    ATHLETE,
+    CITY,
+    COACH,
+    PROVINCE_REVIEWER,
+    TEAM,
+    UNIVERSITY,
     register_operation,
     require,
 )
@@ -378,3 +392,267 @@ def dict_item_disable(request, dict_item_id: str):
         summary=f"停用字典项 {item.type.code}:{item.value}",
     )
     return action_result(True, item.pk)
+
+
+# ---------------------------------------------------------------- 人员主档（/people）
+# 契约对齐 zuqiu 前端 personApi（src/api/index.ts L118-125）；写链（create/update/
+# remove）依赖 B1/B4 等待确认项，未实施。
+
+# 前端实际调用方角色：PeopleManageView(ADMIN) / EnrollmentDetailView(UNIVERSITY) /
+# TeamCoachesView、TeamMembersView(TEAM)；CITY / PROVINCE_REVIEWER 按文档审核
+# 场景预留。ATHLETE/COACH/MATCH_RECORDER 前端无调用且范围规则未定义，不登记。
+# 非管理员的数据范围过滤集中在 services.apply_person_scope（方案A′ 待确认）。
+_PERSON_QUERY_ROLES = (ADMIN, UNIVERSITY, CITY, PROVINCE_REVIEWER, TEAM)
+
+register_operation("personList", _PERSON_QUERY_ROLES)
+register_operation("personSearch", _PERSON_QUERY_ROLES)
+register_operation("personGet", _PERSON_QUERY_ROLES)
+
+
+@router.get("/people", auth=_auth, response=EnvelopeOut, summary="人员档案列表")
+def people_list(
+    request,
+    keyword: Optional[str] = None,
+    kind: Optional[str] = None,
+    reviewStatus: Optional[str] = None,
+):
+    account = require("personList")
+    queryset = services.list_people(
+        {"keyword": keyword, "kind": kind, "reviewStatus": reviewStatus}, account
+    )
+    return paginate(request, queryset, mapper=s.person_out)
+
+
+@router.post(
+    "/people/search", auth=_auth, response=EnvelopeOut, summary="人员档案检索"
+)
+def people_search(request, body: s.PersonSearchBody):
+    account = require("personSearch")
+    items = services.search_people(body.keyword, account)
+    # 检索正文不入审计（文档：精确检索服务端不记正文），仅记操作发生
+    audit_state(
+        request,
+        "person.search",
+        object_type="Person",
+        summary="人员档案检索",
+    )
+    # 前端 personApi.search 类型为 Person[]（数组非分页），直接返回列表
+    return ok([s.person_out(item) for item in items])
+
+
+@router.get(
+    "/people/{person_id}", auth=_auth, response=EnvelopeOut, summary="人员档案详情"
+)
+def people_get(request, person_id: str):
+    account = require("personGet")
+    return ok(s.person_out(services.get_person(person_id, account)))
+
+
+# 写操作仅 ADMIN（PeopleManageView 为管理端页面；学校端可否创建人员待确认④）
+register_operation("personCreate", (ADMIN,))
+register_operation("personUpdate", (ADMIN,))
+register_operation("personDelete", (ADMIN,))
+
+
+@router.post("/people", auth=_auth, response=EnvelopeOut, summary="创建人员档案")
+def people_create(request, body: s.PersonCreate):
+    account = require("personCreate")
+    person = services.create_person(body.model_dump(), account)
+    audit_state(
+        request,
+        "person.create",
+        object_type="Person",
+        object_id=str(person.pk),
+        summary=f"创建人员 {person.full_name}({person.person_no})",
+    )
+    return ok(s.person_out(person))
+
+
+@router.put(
+    "/people/{person_id}", auth=_auth, response=EnvelopeOut, summary="更新人员档案"
+)
+def people_update(request, person_id: str, body: s.PersonUpdate):
+    account = require("personUpdate")
+    person = services.update_person(person_id, body.model_dump(), account)
+    audit_state(
+        request,
+        "person.update",
+        object_type="Person",
+        object_id=str(person.pk),
+        summary=f"更新人员 {person.full_name}",
+    )
+    return ok(s.person_out(person))
+
+
+@router.delete(
+    "/people/{person_id}", auth=_auth, response=EnvelopeOut, summary="删除人员档案"
+)
+def people_delete(request, person_id: str, version: Optional[int] = Query(None, ge=0)):
+    account = require("personDelete")
+    if version is None:
+        raise ApiError(
+            INVALID_ARGUMENT,
+            "缺少 version",
+            field_errors([("version", "该操作必须提交乐观锁版本")]),
+        )
+    services.delete_person(person_id, version, account)
+    audit_state(
+        request,
+        "person.delete",
+        object_type="Person",
+        object_id=person_id,
+        summary="删除人员档案（软删）",
+    )
+    return action_result(True, person_id)
+
+
+# ---------------------------------------------------------------- 本人档案（/me/profile）
+# 前端 MyProfileView 经 profileApi 调用（zuqiu src/api/index.ts L65-66）；
+# 权限点命名与权威接口文档 §6.5 对齐（myProfileGet/myProfileUpdate）。
+# GET：自读对象=服务端账号 person_id 绑定档案，无客户端传入 id，无数据范围歧义。
+# PUT（2026-10-24 用户裁定）：version 必填乐观锁（缺失/非法=400 统一校验错误，
+# 不匹配=409 VERSION_CONFLICT）；字段集=MyProfileUpdate（前端实际提交集），
+# 身份/归属/联系方式/证件不在本人可改集；schoolName/education/coachCategory
+# 接受不持久化（D2 在案，遗留问题清单在档）。
+register_operation("myProfileGet", (ATHLETE, COACH))
+register_operation("myProfileUpdate", (ATHLETE, COACH))
+
+
+def _own_person_id(account) -> str:
+    """当前账号绑定档案 ID（服务端签发，空=未绑定）。"""
+    return (getattr(account, "person_id", "") or "").strip()
+
+
+@router.get("/me/profile", auth=_auth, response=EnvelopeOut, summary="查看本人档案")
+def my_profile(request):
+    account = require("myProfileGet")
+    person_id = _own_person_id(account)
+    if not person_id:
+        raise ApiError(NOT_FOUND, "当前账号未绑定人员档案")
+    return ok(s.person_out(services.get_own_person(person_id)))
+
+
+@router.put("/me/profile", auth=_auth, response=EnvelopeOut, summary="更新本人档案")
+def my_profile_update(request, body: s.MyProfileUpdate):
+    account = require("myProfileUpdate")
+    person_id = _own_person_id(account)
+    if not person_id:
+        raise ApiError(NOT_FOUND, "当前账号未绑定人员档案")
+    person = services.update_own_person(person_id, body.model_dump())
+    audit_state(
+        request,
+        "person.self_update",
+        object_type="Person",
+        object_id=str(person.pk),
+        summary=f"本人更新档案 {person.full_name}",
+    )
+    return ok(s.person_out(person))
+
+
+# GET /me/profile-match（契约清单 B2）：前端实际为 GET（权威文档原写 POST，
+# 按"前端实码优先"原则实现 GET 并同步文档）；权限点沿用文档命名 profileMatch。
+# 仅服务端绑定关系判定，无请求参数；响应三态见 services.get_profile_match。
+register_operation("profileMatch", (ATHLETE, COACH))
+
+
+@router.get(
+    "/me/profile-match", auth=_auth, response=EnvelopeOut, summary="本人主档匹配状态"
+)
+def my_profile_match(request):
+    account = require("profileMatch")
+    # dict 直出（EnvelopeOut.data=Any）：NO_MATCH/REVIEW_REQUIRED 时无
+    # personId/maskedIdNumber 键，与前端 mock 契约形状一致（非 null 占位）
+    return ok(services.get_profile_match(account))
+
+
+# POST /me/profile-confirmation（契约清单 B3）：确认=DRAFT→PENDING 提交复核
+# （create_person 初值 DRAFT + 前端成功文案"等待管理员复核"；mock 置 APPROVED
+# 与文案矛盾不作依据）。version 必填乐观锁（文档 ProfileConfirmation）；
+# 绑定失效（未绑定/软删）→ 403 PROFILE_BINDING_REQUIRED（文档定稿口径，
+# 错误码已在 common/errors 预留）——与 myProfileGet 的 404 口径不同。
+register_operation("profileConfirm", (ATHLETE, COACH))
+
+
+@router.post(
+    "/me/profile-confirmation",
+    auth=_auth,
+    response=EnvelopeOut,
+    summary="确认本人档案信息",
+)
+def my_profile_confirm(request, body: s.ProfileConfirmation):
+    account = require("profileConfirm")
+    person_id = _own_person_id(account)
+    if not person_id:
+        raise ApiError(PROFILE_BINDING_REQUIRED)
+    person = services.confirm_own_person(person_id, body.version)
+    audit_state(
+        request,
+        "person.self_confirm",
+        object_type="Person",
+        object_id=str(person.pk),
+        summary=f"本人确认档案 {person.full_name}",
+    )
+    return ok(s.person_out(person))
+
+
+# GET /me/teams（契约清单 B4）：前端 meApi.teams() 无参数、Team[] 直出
+# （zuqiu src/api/index.ts:69；权威文档原写分页 TeamPage+active 参数，按前端
+# 实码实现数组）。范围=本人 CURRENT 球员/教练正式关系（EXITED 历史与 mock
+# "自报归属 VERIFIED 合并"均不采用，见 services.list_own_teams）；
+# UNIVERSITY 全校分支依赖 D1 组织映射（A′ 未批）暂缓，权限点仅 ATHLETE/COACH。
+# 未绑定档案 → 404（对齐 myProfileGet 口径）；读接口不留审计（同前两个 GET）。
+register_operation("myTeams", (ATHLETE, COACH))
+
+
+@router.get("/me/teams", auth=_auth, response=EnvelopeOut, summary="本人所属球队")
+def my_teams(request):
+    account = require("myTeams")
+    person_id = _own_person_id(account)
+    if not person_id:
+        raise ApiError(NOT_FOUND, "当前账号未绑定人员档案")
+    # dict 直出（EnvelopeOut.data=Any），字段口径见 services._team_brief_out
+    return ok(services.list_own_teams(person_id))
+
+
+# §6.8 档案聚合（批次 D-1）：文档角色 ADMIN/PROVINCE_REVIEWER（接口文档
+# L1740/L1762）；数据范围复用 apply_person_scope（非 ADMIN → 403
+# DATA_SCOPE_DENIED，D5 同口径，PROVINCE_REVIEWER 权限点通过但范围拒绝）。
+# 读接口不留审计（同 GET /people）；检索正文不入审计（同 POST /people/search）。
+register_operation("dossierSearch", (ADMIN, PROVINCE_REVIEWER))
+register_operation("dossierGet", (ADMIN, PROVINCE_REVIEWER))
+
+
+@router.post(
+    "/selection-dossiers/search",
+    auth=_auth,
+    response=EnvelopeOut,
+    summary="遴选档案受控检索",
+)
+def dossier_search(request, body: s.DossierSearchBody):
+    account = require("dossierSearch")
+    payload = body.model_dump()
+    queryset = services.dossier_search_queryset(payload, account)
+    # page/pageSize 在请求体（§7 DossierSearch 模型），与 paginate 的 query
+    # string 参数源不同：切片/上限/信封语义沿用 pagination 同款（默认 20、
+    # 上限 100、page 从 1 起）。
+    total = queryset.count()
+    page_number = payload.get("page") or 1
+    page_size = min(max(payload.get("pageSize") or DEFAULT_PAGE_SIZE, 1), MAX_PAGE_SIZE)
+    start = (page_number - 1) * page_size
+    items = [
+        services.dossier_out(row, account)
+        for row in queryset[start : start + page_size]
+    ]
+    # page() 已含完整信封（ok 包装），不再二次包装
+    return page(items, page_number, page_size, total)
+
+
+@router.get(
+    "/selection-dossiers/{athlete_id}",
+    auth=_auth,
+    response=EnvelopeOut,
+    summary="球员遴选档案聚合详情",
+)
+def dossier_get(request, athlete_id: str, eventId: Optional[str] = None):
+    account = require("dossierGet")
+    return ok(services.dossier_get(athlete_id, eventId, account))

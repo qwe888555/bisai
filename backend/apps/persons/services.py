@@ -8,25 +8,43 @@
   （因此父对象停用后其子对象不可再编辑，需先恢复父对象）；
 - created_by / updated_by 为底座用户ID（BIGINT），当前 Account 主键为非数字
   字符串（acc_xxx），本阶段不写入（保持 NULL），操作人由 AuditLog 留痕；
-- 表无 version 乐观锁列，更新为最后写入胜出，审计留痕兜底。
+- 表无 version 乐观锁列（冻结），版本号由 updated_at(UTC微秒) 派生（schemas.person_version），
+  PUT/DELETE 统一 409 校验；写链禁止 queryset.update() 修改业务字段（绕过 auto_now）。
 """
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Optional
 
-from django.db.models import Q, QuerySet
+from django.db import transaction
+from django.db.models import Count, Exists, OuterRef, Q, QuerySet, Subquery
+from django.utils import timezone
 
+from apps.common import crypto, enums
 from apps.common.enums import RegionLevel
 from apps.common.errors import (
+    DATA_SCOPE_DENIED,
     DUPLICATE_RESOURCE,
     INVALID_ARGUMENT,
     NOT_FOUND,
+    PROFILE_BINDING_REQUIRED,
     STATE_CONFLICT,
+    VERSION_CONFLICT,
     ApiError,
     field_errors,
 )
-from apps.persons.models import DictItem, DictType, Region, School
+from apps.persons.models import (
+    AthleteProfile,
+    CoachProfile,
+    DictItem,
+    DictType,
+    Person,
+    PersonChangeLog,
+    Region,
+    School,
+)
+from apps.teams.models import Team, TeamCoach, TeamMember
 
 # 学校类型编码：DDL base_school.school_type 列注释枚举，与 init_base_data 命令
 # 保持一致（编码已确认，字典项 label 待成员5确认）。字典数据就绪后可切换为
@@ -384,3 +402,813 @@ def dict_type_options(type_code: str) -> QuerySet:
         .select_related("type")
         .order_by("sort_order", "value", "id")
     )
+
+
+# ---------------------------------------------------------------- 人员主档查询
+# （/people 读链，契约对齐 zuqiu 前端 personApi；写链依赖待确认项未实施）
+
+def people_queryset() -> QuerySet:
+    """人员主档基础查询：排除软删；学校、扩展档案、现役球队名一次取齐。
+
+    team_name 取现役（CURRENT）球队名（team_member 单向流转，历史关系不计）。
+    """
+    current_team_name = TeamMember.objects.filter(
+        person=OuterRef("pk"), status=enums.RelationStatus.CURRENT
+    ).values("team__name")[:1]
+    return (
+        Person.objects.filter(is_deleted=False)
+        .select_related("school")
+        .annotate(
+            student_no_val=Subquery(
+                AthleteProfile.objects.filter(person=OuterRef("pk")).values("student_no")[:1]
+            ),
+            team_name_val=current_team_name,
+            # kinds 合成（方案C）与 kind 过滤的存在性事实源（免 N+1）
+            athlete_profile_exists=Exists(
+                AthleteProfile.objects.filter(person=OuterRef("pk"))
+            ),
+            coach_profile_exists=Exists(CoachProfile.objects.filter(person=OuterRef("pk"))),
+        )
+    )
+
+
+def apply_person_scope(queryset: QuerySet, account) -> QuerySet:
+    """人员数据范围过滤（集中一处；方案A′ 落地后仅改本函数）。
+
+    前端 mock 的目标口径（src/mock/adapter.ts scopePersons）：ADMIN 全量 /
+    CITY 本市 / UNIVERSITY 本校 / TEAM 本队成员 / 其余仅本人。其中"本市/本校/
+    本队/本人"均依赖 org→school→team 映射（方案A′，待确认）与
+    Account.person_id / team_ids 的落库约定（未定）——除 ADMIN 外一律拒绝，
+    不得在映射未定时放行全量造成越权（安全约束不被前端调用覆盖）。
+    """
+    from apps.common.permissions import ADMIN
+
+    if ADMIN in (getattr(account, "roles", ()) or ()):
+        return queryset
+    raise ApiError(
+        DATA_SCOPE_DENIED,
+        "人员数据范围待组织映射方案确认后开放，当前仅管理员可查询",
+    )
+
+
+def _check_enum(value: Optional[str], allowed: tuple, field: str) -> None:
+    if value is not None and value not in allowed:
+        raise ApiError(
+            INVALID_ARGUMENT,
+            f"{field} 非法（允许：{','.join(allowed)}）",
+            field_errors([(field, "不在允许值域内")]),
+        )
+
+
+def list_people(filters: dict, account) -> QuerySet:
+    """GET /people：keyword 匹配姓名；kind→扩展档案行存在性（方案C 合成口径）；
+    reviewStatus→audit_status。
+
+    前端实际传参（admin/PeopleManageView.vue L49-55）：page/pageSize/keyword/
+    kind/reviewStatus。kind=ATHLETE/COACH 与 kinds 合成同源（档案行存在性），
+    双类别人员在两种过滤下均命中。mock 的 maskedIdNumber 包含匹配与 teamId
+    过滤为演示逻辑，不照搬（maskedIdNumber 是敏感掩码，不得作为检索键；
+    teamId 依赖成员关系查询，待球队读服务就绪后一并补充）。
+    """
+    kind = filters.get("kind")
+    _check_enum(kind, tuple(enums.PersonCategory.values), "kind")
+    review_status = filters.get("reviewStatus")
+    _check_enum(review_status, tuple(enums.AuditStatus.values), "reviewStatus")
+    queryset = apply_person_scope(people_queryset(), account)
+    keyword = (filters.get("keyword") or "").strip()
+    if keyword:
+        queryset = queryset.filter(full_name__icontains=keyword)
+    if kind == "ATHLETE":
+        queryset = queryset.filter(athlete_profile_exists=True)
+    elif kind == "COACH":
+        queryset = queryset.filter(coach_profile_exists=True)
+    if review_status:
+        queryset = queryset.filter(audit_status=review_status)
+    return queryset.order_by("-id")
+
+
+def search_people(keyword: str, account) -> list:
+    """POST /people/search：{keyword} 按姓名包含匹配，返回数组（非分页）。
+
+    mock 的 slice(0, 20) 截断沿用作无分页检索的保护上限（C 类沿用项，
+    如需调整待确认）。mock 按 maskedIdNumber 匹配为演示逻辑，不照搬。
+    """
+    queryset = apply_person_scope(people_queryset(), account)
+    term = (keyword or "").strip()
+    if term:
+        queryset = queryset.filter(full_name__icontains=term)
+    return list(queryset.order_by("-id")[:20])
+
+
+def get_person(person_id: str, account):
+    """GET /people/{id}：软删行视为不存在（NOT_FOUND）。"""
+    obj = (
+        apply_person_scope(people_queryset(), account)
+        .filter(pk=parse_path_id(person_id))
+        .first()
+    )
+    if obj is None:
+        raise ApiError(NOT_FOUND)
+    return obj
+
+
+def get_own_person(person_id: str):
+    """GET /me/profile：按账号绑定 person_id 直取本人档案。
+
+    自读场景对象归属即本人，不经过 apply_person_scope（组织数据范围与
+    本人档案无关；person_id 由服务端签发，不接受客户端传入）。
+    软删行与 get_person 同口径视为不存在（NOT_FOUND）。
+    """
+    obj = people_queryset().filter(pk=parse_path_id(person_id)).first()
+    if obj is None:
+        raise ApiError(NOT_FOUND)
+    return obj
+
+
+def get_profile_match(account) -> dict:
+    """GET /me/profile-match：本人主档匹配状态（契约清单 B2）。
+
+    仅基于服务端账号绑定关系判定（接口文档 §6.5 规则：基于已验证注册凭证/
+    绑定关系查询，不支持向任意身份证探测——本接口无任何请求参数）。
+    三态映射实现口径（文档枚举 NO_MATCH / MATCHED_TO_SELF / REVIEW_REQUIRED）：
+    - 未绑定 / 绑定值非法 / 档案不存在或已软删 → NO_MATCH；
+    - 绑定档案 audit_status 非 APPROVED（DRAFT/PENDING/REJECTED）→
+      REVIEW_REQUIRED，不返回 personId/maskedIdNumber（文档规则：
+      "待复核只返回 REVIEW_REQUIRED，不暴露候选人详情"）；
+    - APPROVED → MATCHED_TO_SELF + personId + maskedIdNumber
+      （maskedIdNumber=冻结列 id_card_masked 直出，与 GET /me/profile 同源）。
+    与 GET /me/profile 的差异：本接口职责即探测绑定状态，绑定失效属
+    枚举内结果而非请求错误，因此不走 NOT_FOUND/400。
+    """
+    raw = (getattr(account, "person_id", "") or "").strip()
+    try:
+        person_pk = int(raw) if raw else 0
+    except ValueError:
+        return {"result": "NO_MATCH"}
+    if person_pk <= 0:
+        return {"result": "NO_MATCH"}
+    person = people_queryset().filter(pk=person_pk).first()
+    if person is None:
+        return {"result": "NO_MATCH"}
+    if person.audit_status != enums.AuditStatus.APPROVED:
+        return {"result": "REVIEW_REQUIRED"}
+    return {
+        "result": "MATCHED_TO_SELF",
+        "personId": str(person.pk),
+        "maskedIdNumber": person.id_card_masked,
+    }
+
+
+# ---------------------------------------------------------------- 人员主档写链
+# （POST/PUT/DELETE /people；kinds 方案C 多类别 1..2 由扩展档案行承载；
+#   乐观锁=B4 派生版本）
+
+def ensure_version(person, request_version) -> None:
+    """乐观锁校验：提交版本与当前派生版本不一致 → 409 VERSION_CONFLICT。"""
+    from apps.persons.schemas import person_version
+
+    current = person_version(person)
+    if int(request_version) != current:
+        raise ApiError(
+            VERSION_CONFLICT,
+            f"数据已被其他操作更新（当前版本 {current}，提交版本 {int(request_version)}）",
+        )
+
+
+def _gender_in(value: Optional[str], field: str) -> int:
+    """前端契约性别名（UNSPECIFIED/MALE/FEMALE）→ 冻结 TinyInt 值（0/1/2）。"""
+    from apps.persons.schemas import GENDER_IN
+
+    raw = (value or "").strip().upper()
+    if not raw:
+        return enums.Gender.UNKNOWN
+    if raw not in GENDER_IN:
+        raise ApiError(
+            INVALID_ARGUMENT,
+            f"{field} 非法（允许：{','.join(GENDER_IN)}）",
+            field_errors([(field, "不在允许值域内")]),
+        )
+    return GENDER_IN[raw]
+
+
+def _kind_list(kinds) -> list[str]:
+    """方案C（2026-10-24 用户拍板：前端多选为准）：kinds 数组 1..2 项。
+
+    值域校验+去重，不静默丢弃；person_category 存主类别（首项），
+    完整类别集合由扩展档案行存在性承载（见 _apply_kinds/_synthesized_kinds）。
+    """
+    if not isinstance(kinds, list) or not kinds:
+        raise ApiError(
+            INVALID_ARGUMENT,
+            "kinds 必填（1-2 项）",
+            field_errors([("kinds", "至少一项")]),
+        )
+    unknown = [k for k in kinds if k not in enums.PersonCategory.values]
+    if unknown:
+        raise ApiError(
+            INVALID_ARGUMENT,
+            f"kinds 非法（允许：{','.join(enums.PersonCategory.values)}）",
+            field_errors([("kinds", "不在允许值域内")]),
+        )
+    if len(set(kinds)) != len(kinds):
+        raise ApiError(
+            INVALID_ARGUMENT,
+            "kinds 存在重复类别",
+            field_errors([("kinds", "类别重复")]),
+        )
+    return list(kinds)
+
+
+# 扩展档案行的"业务数据"字段（类别移除保护：有数据即拒绝删行防丢失；
+# AthleteProfile.grade_level 为 NOT NULL 占位列，不计入业务数据）
+_ATHLETE_DATA_FIELDS = (
+    "student_no",
+    "position_code",
+    "guardian_name",
+    "guardian_relation",
+    "guardian_phone_cipher",
+    "ext_json",
+)
+_COACH_DATA_FIELDS = ("coach_level", "certificate_no", "certificate_expire_date", "ext_json")
+
+
+def _profile_has_data(profile, fields) -> bool:
+    return any(getattr(profile, f) not in (None, "") for f in fields)
+
+
+def _apply_kinds(person, new_kinds: list[str], old_kinds: list[str]) -> None:
+    """按 kinds 差集维护扩展档案行（方案C 承载）。
+
+    新增类别 → 建 profile 行（AthleteProfile.grade_level 为冻结 NOT NULL 列，
+    前端创建表单无学段字段，以空串占位待运动员档案回填）；
+    移除类别 → 行内无业务数据才删（有数据 409 拒绝，防档案数据丢失）。
+    """
+    added = [k for k in new_kinds if k not in old_kinds]
+    removed = [k for k in old_kinds if k not in new_kinds]
+    # 先校验后变更：任一移除项有数据则整体拒绝（事务回滚，不产生半变更）
+    for kind in removed:
+        if kind == "ATHLETE":
+            profile = AthleteProfile.objects.filter(person=person).first()
+            if profile is not None and _profile_has_data(profile, _ATHLETE_DATA_FIELDS):
+                raise ApiError(
+                    STATE_CONFLICT,
+                    "运动员档案已有数据（学籍/位置/监护人等），移除该类别将丢失档案，请先清理档案数据",
+                )
+        else:
+            profile = CoachProfile.objects.filter(person=person).first()
+            if profile is not None and _profile_has_data(profile, _COACH_DATA_FIELDS):
+                raise ApiError(
+                    STATE_CONFLICT,
+                    "教练员档案已有数据（等级/证书等），移除该类别将丢失档案，请先清理档案数据",
+                )
+    for kind in removed:
+        (AthleteProfile if kind == "ATHLETE" else CoachProfile).objects.filter(
+            person=person
+        ).delete()
+    for kind in added:
+        if kind == "ATHLETE":
+            AthleteProfile.objects.get_or_create(person=person, defaults={"grade_level": ""})
+        else:
+            CoachProfile.objects.get_or_create(person=person)
+
+
+def _resolve_school(school_org_id):
+    """schoolOrgId → School 外键。
+
+    映射口径（D 类差异在案）：前端键名为组织ID，当前值按冻结 School 主键解析；
+    org→school 正式映射待方案A′（成员2），确认后仅改本函数。
+    """
+    if school_org_id in (None, ""):
+        return None
+    try:
+        school_id = int(str(school_org_id).strip())
+    except (TypeError, ValueError) as exc:
+        raise ApiError(
+            INVALID_ARGUMENT,
+            "schoolOrgId 当前仅支持学校标识（组织映射待方案A′ 确认）",
+            field_errors([("schoolOrgId", "必须是学校ID")]),
+        ) from exc
+    school = School.objects.filter(pk=school_id, is_active=True).first()
+    if school is None:
+        raise ApiError(
+            INVALID_ARGUMENT,
+            "schoolOrgId 对应学校不存在或未启用",
+            field_errors([("schoolOrgId", "学校不存在或未启用")]),
+        )
+    return school
+
+
+def _resolve_avatar_file(avatar_file_id):
+    """avatarFileId → photo_file_id（校验文件存在且归属 PERSON，不绕过附件归属）。
+
+    FileRecord 主键为 new_file_id() 字符串（前端 avatarFileId 类型即 string）。
+    """
+    if not avatar_file_id:
+        return None
+    from apps.attachments.models import FileRecord
+
+    file_id = str(avatar_file_id).strip()
+    if not file_id:
+        return None
+    record = FileRecord.objects.filter(pk=file_id, owner_type="PERSON").first()
+    if record is None:
+        raise ApiError(
+            INVALID_ARGUMENT,
+            "avatarFileId 对应文件不存在或归属不符",
+            field_errors([("avatarFileId", "文件不存在或归属不符")]),
+        )
+    return file_id
+
+
+def _id_card_extras(id_number: str):
+    """身份证解析出生日期与性别（GB 11643：第7-14位出生、第17位奇男偶女）。
+
+    依据冻结 DDL birth_date 列注释"身份证解析"；请求显式传入时优先于解析值。
+    """
+    birth = None
+    gender = None
+    if len(id_number) == 18 and id_number[:17].isdigit():
+        try:
+            birth = datetime.strptime(id_number[6:14], "%Y%m%d").date()
+        except ValueError:
+            birth = None
+        gender = enums.Gender.MALE if int(id_number[16]) % 2 else enums.Gender.FEMALE
+    return birth, gender
+
+
+def _phone_fields(phone: Optional[str]) -> dict:
+    if not phone:
+        return {"phone_cipher": None, "phone_hash": None, "phone_masked": None}
+    return {
+        "phone_cipher": crypto.encrypt_text(phone),
+        "phone_hash": crypto.lookup_hash(phone),
+        "phone_masked": crypto.mask_phone(phone),
+    }
+
+
+def _log_change(person, change_type: str, field_changes, reason: str = "") -> None:
+    PersonChangeLog.objects.create(
+        person=person,
+        change_type=change_type,
+        field_changes=field_changes or None,
+        changed_by=None,  # 底座用户ID映射未定，一期保持 NULL（AuditLog 留痕）
+        reason=reason or "",
+    )
+
+
+def _bind_avatar(avatar_file_id, person) -> None:
+    """先传后绑（前端新建人员时先传头像，FileRecord.owner_id 为空）：
+    人员落库后回填文件归属，保证后续归属校验（can_access 的 verifier 路径）完整。
+    """
+    from apps.attachments.models import FileRecord
+
+    FileRecord.objects.filter(pk=str(avatar_file_id), owner_type="PERSON").update(
+        owner_id=str(person.pk)
+    )
+
+
+def _current_kinds(person) -> list[str]:
+    """当前 DB 行存在性 → kinds（与 schemas._synthesized_kinds 同口径，固定顺序）。"""
+    kinds: list[str] = []
+    if AthleteProfile.objects.filter(person=person).exists():
+        kinds.append("ATHLETE")
+    if CoachProfile.objects.filter(person=person).exists():
+        kinds.append("COACH")
+    return kinds
+
+
+def create_person(payload: dict, account):
+    """POST /people：创建人员主档（DRAFT 起步）+ 变更留痕。
+
+    - kinds 方案C：person_category 存主类别（首项），按类别建扩展档案行；
+    - idNumber 一期必填（服务层）：冻结 id_card_hash 无 NULL 且唯一含软删行；
+      查重覆盖软删行（唯一约束），冲突 409 不复活（恢复语义待确认）；
+    - birthDate/gender 未传时按身份证解析（DDL 列注释口径）。
+    """
+    kind_list = _kind_list(payload.get("kinds"))
+    id_number = (payload.get("idNumber") or "").strip().upper() or None
+    phone = (payload.get("phone") or "").strip() or None
+    school = _resolve_school(payload.get("schoolOrgId"))
+    avatar = _resolve_avatar_file(payload.get("avatarFileId"))
+    if not id_number:
+        raise ApiError(
+            INVALID_ARGUMENT,
+            "身份证号必填（无证件档案的承载受冻结唯一约束限制，待确认）",
+            field_errors([("idNumber", "必填")]),
+        )
+    duplicate = Person.objects.filter(id_card_hash=crypto.lookup_hash(id_number)).first()
+    if duplicate is not None:
+        suffix = "（当前为已删除状态，恢复需另行确认）" if duplicate.is_deleted else ""
+        raise ApiError(
+            DUPLICATE_RESOURCE,
+            f"该证件号已存在档案{suffix}",
+            field_errors([("idNumber", "证件号重复")]),
+        )
+    birth_date = payload.get("birthDate")
+    raw_birth, raw_gender = _id_card_extras(id_number)
+    if birth_date is None:
+        birth_date = raw_birth
+    gender_value = _gender_in(payload.get("gender"), "gender")
+    if not (payload.get("gender") or "").strip():
+        gender_value = raw_gender if raw_gender is not None else enums.Gender.UNKNOWN
+
+    with transaction.atomic():
+        person = Person(
+            full_name=payload["realName"].strip(),
+            gender=gender_value,
+            birth_date=birth_date,
+            person_category=kind_list[0],
+            id_card_cipher=crypto.encrypt_text(id_number),
+            id_card_hash=crypto.lookup_hash(id_number),
+            id_card_masked=crypto.mask_id_number(id_number),
+            **_phone_fields(phone),
+            school=school,
+            photo_file_id=avatar,
+            audit_status=enums.AuditStatus.DRAFT,
+            status=enums.EnableStatus.ACTIVE,
+        )
+        person.save()
+        # person_no 按 DDL 列注释回填：P+年份+8位id（应用层回填）
+        person.person_no = f"P{person.created_at:%Y}{person.pk:08d}"
+        person.save()
+        # 方案C：按 kinds 建扩展档案行（空档案，业务字段待对应页面回填）
+        if "ATHLETE" in kind_list:
+            AthleteProfile.objects.create(person=person, grade_level="")
+        if "COACH" in kind_list:
+            CoachProfile.objects.create(person=person)
+        if avatar:
+            _bind_avatar(avatar, person)
+        _log_change(person, enums.ChangeType.CREATE, None)
+    return person
+
+
+def update_person(person_id: str, payload: dict, account):
+    """PUT /people/{id}：版本校验 → 必填字段全量替换 + 可选字段缺省保留 → diff 留痕。
+
+    idNumber 不接受（身份证变更走更正流程，一期不开放）；
+    education/coachCategory 声明但不持久化（承载待定）。
+    """
+    person = get_person(person_id, account)
+    ensure_version(person, payload["version"])
+    kind_list = _kind_list(payload.get("kinds"))
+    old_kinds = _current_kinds(person)
+    gender_value = _gender_in(payload.get("gender"), "gender")
+    primary_category = kind_list[0]
+
+    changes: list[dict] = []
+
+    def track(field: str, old, new) -> None:
+        if old != new:
+            # field_changes 落 JSONField：date 等非 JSON 原生类型转 ISO 字符串
+            old_out = old.isoformat() if hasattr(old, "isoformat") else old
+            new_out = new.isoformat() if hasattr(new, "isoformat") else new
+            changes.append({"field": field, "old": old_out, "new": new_out})
+
+    # 类别移除保护（有档案数据 409）必须在落库前校验；_apply_kinds 在事务内执行
+    with transaction.atomic():
+        new_name = payload["realName"].strip()
+        track("realName", person.full_name, new_name)
+        person.full_name = new_name
+
+        track("gender", person.gender, gender_value)
+        person.gender = gender_value
+
+        track("birthDate", person.birth_date, payload.get("birthDate"))
+        person.birth_date = payload.get("birthDate")
+
+        track("kinds", old_kinds, kind_list)
+        track("personCategory", person.person_category, primary_category)
+        person.person_category = primary_category
+
+        # 可选字段：请求未传 → 保留原值（编辑表单无对应输入，缺省清空=静默丢数据）
+        school = _resolve_school(payload.get("schoolOrgId"))
+        if school is not None:
+            track("school", person.school_id, school.pk)
+            person.school = school
+        avatar = _resolve_avatar_file(payload.get("avatarFileId"))
+        if avatar is not None:
+            track("photoFileId", person.photo_file_id, avatar)
+            person.photo_file_id = avatar
+        phone = (payload.get("phone") or "").strip() or None
+        if phone:
+            track("phoneMasked", person.phone_masked, crypto.mask_phone(phone))
+            person.__dict__.update(_phone_fields(phone))
+
+        person.save()
+        _apply_kinds(person, kind_list, old_kinds)
+        if avatar:
+            _bind_avatar(avatar, person)
+        _log_change(
+            person,
+            enums.ChangeType.UPDATE,
+            changes,
+            reason=(payload.get("changeReason") or "").strip(),
+        )
+    # 重新查询：get_person 的 annotate（exists 快照）与 save 后的 updated_at
+    # 都可能过期，返回值须反映建/删行后的真实合成 kinds 与新版本号
+    return get_person(person_id, account)
+
+
+def _change_entry(field: str, old, new) -> Optional[dict]:
+    """变更条目（ChangeLog.field_changes 用）：无变化返回 None；
+    date 等非 JSON 原生类型转 ISO 字符串。"""
+    if old == new:
+        return None
+    old_out = old.isoformat() if hasattr(old, "isoformat") else old
+    new_out = new.isoformat() if hasattr(new, "isoformat") else new
+    return {"field": field, "old": old_out, "new": new_out}
+
+
+def update_own_person(person_id: str, payload: dict):
+    """PUT /me/profile：本人档案更新（字段集=MyProfileUpdate，前端实际提交集）。
+
+    - 对象解析：服务端 person_id（不信任客户端任何 id 字段）；软删行 404 同 get_own_person；
+    - version 必填乐观锁（与 /people 写链同规则：缺失/非法=400 统一校验错误，不匹配=409）；
+    - 身份字段边界：kinds/schoolOrgId/phone/idNumber/avatarFileId 不在本人可改集
+      （身份与归属变更走管理员链路；手机号/身份证按页面声明走复核更正）；
+    - schoolName/education/coachCategory：接受不持久化（D2 在案），不虚构回显；
+    - 留痕复用 _log_change；审计走 API 层 audit_state。
+    """
+    person = people_queryset().filter(pk=parse_path_id(person_id)).first()
+    if person is None:
+        raise ApiError(NOT_FOUND)
+    ensure_version(person, payload["version"])
+    gender_value = _gender_in(payload.get("gender"), "gender")
+
+    changes: list[dict] = []
+    with transaction.atomic():
+        new_name = payload["realName"].strip()
+        entry = _change_entry("realName", person.full_name, new_name)
+        if entry:
+            changes.append(entry)
+        person.full_name = new_name
+
+        entry = _change_entry("gender", person.gender, gender_value)
+        if entry:
+            changes.append(entry)
+        person.gender = gender_value
+
+        entry = _change_entry("birthDate", person.birth_date, payload.get("birthDate"))
+        if entry:
+            changes.append(entry)
+        person.birth_date = payload.get("birthDate")
+
+        person.save()
+        _log_change(
+            person,
+            enums.ChangeType.UPDATE,
+            changes,
+            reason="本人更新档案",
+        )
+    # 重查取 save 后的 updated_at（派生 version 必须与持久化结果一致）
+    return people_queryset().filter(pk=person.pk).first()
+
+
+def confirm_own_person(person_id: str, version: int):
+    """POST /me/profile-confirmation：本人确认档案，提交进入复核。
+
+    语义依据链：create_person 初值 audit_status=DRAFT（本模块写链）+ 前端
+    确认成功文案"档案已确认，等待管理员复核"（MyProfileView.vue:80）+
+    AuditStatus.PENDING label"待审核" → 确认=DRAFT→PENDING（提交复核），
+    而非直接通过（mock 直接置 APPROVED 与前端文案自相矛盾，不作依据）。
+    - 绑定失效（未绑定/软删）→ 403 PROFILE_BINDING_REQUIRED（文档 §6.5 规则
+      "只有已验证绑定的本人可确认"；错误码/状态映射/默认消息均已在
+      common/errors 预留——与 myProfileGet 的 404 口径不同，按各自文档定稿）；
+    - version 必填乐观锁（文档 ProfileConfirmation，同 /people 写链规则）；
+    - 状态分支：
+      DRAFT → PENDING（提交复核）；
+      APPROVED → 409 STATE_CONFLICT（前端按钮 disabled=reviewStatus==='APPROVED'，
+      重复确认无业务意义）；
+      REJECTED → 409（驳回后本人能否自行重新提交待业务确认，保守拒绝，
+      待管理员链路；未决项在契约清单 B3 在案）；
+      PENDING → 幂等成功（前端按钮该状态可点，重复提交无副作用：状态不变、
+      不重复写 ChangeLog；实现选择在案）；
+    - 留痕：状态变化写 _log_change（audit_status old/new）；审计走 API 层。
+    """
+    person = people_queryset().filter(pk=parse_path_id(person_id)).first()
+    if person is None:
+        raise ApiError(PROFILE_BINDING_REQUIRED)
+    ensure_version(person, version)
+    current = person.audit_status
+    if current == enums.AuditStatus.APPROVED:
+        raise ApiError(STATE_CONFLICT, "档案已复核，无需重复确认")
+    if current == enums.AuditStatus.REJECTED:
+        raise ApiError(STATE_CONFLICT, "档案已被驳回，请联系管理员处理")
+    if current == enums.AuditStatus.PENDING:
+        return person  # 幂等：已处于待复核，无状态变化
+    with transaction.atomic():
+        person.audit_status = enums.AuditStatus.PENDING
+        person.save()
+        _log_change(
+            person,
+            enums.ChangeType.UPDATE,
+            [
+                {
+                    "field": "audit_status",
+                    "old": str(current),
+                    "new": enums.AuditStatus.PENDING.value,
+                }
+            ],
+            reason="本人确认档案",
+        )
+    # 重查取 save 后的 updated_at（派生 version 与持久化结果一致）
+    return people_queryset().filter(pk=person.pk).first()
+
+
+def list_own_teams(person_id: str) -> list[dict]:
+    """GET /me/teams：本人现役（CURRENT）球员/教练关系的球队，数组直出。
+
+    契约依据（前端实码优先，契约清单 B4）：
+    - meApi.teams() 无任何请求参数、响应 Team[]（zuqiu src/api/index.ts:69）；
+      权威文档原写分页 TeamPage+active 参数，按前端实现数组直出；
+    - 范围=正式关系 TeamMember/TeamCoach 且 status=CURRENT：mock 将"自报归属
+      VERIFIED"并入（adapter.ts:340-343），冻结模型无申请表（B5），不采用；
+      EXITED 历史关系属履历（/me/team-affiliations 域），不进本接口；
+    - UNIVERSITY 全校分支（mock adapter.ts:335-337 按 orgId 过滤全校球队）
+      依赖 org→school 映射（D1/方案A′ 未批），暂停实现，权限点仅 ATHLETE/COACH；
+    - 字段适配（前端 Team 类型 types.ts:185-206 vs 冻结 Team 模型）：
+      无承载且页面未消费的字段不输出（shortName/campusName/gender/orgId/
+      cityOrgId）；flagUrl/emblemUrl/groupPhotoUrl 属受控下载契约（无公开
+      直链，storage 契约 5），不输出 url；status 直出 audit_status（Q2 审核
+      流程不启用默认 APPROVED；DRAFT/REJECTED 越出前端类型域，与人员
+      reviewStatus 同款处理）；version 派生 updated_at 微秒（B4 同款）；
+      coachName=球队现役（CURRENT）主教练（HEAD_COACH）全名合成。
+    """
+    pid = int(person_id)
+    team_ids = set(
+        TeamMember.objects.filter(
+            person_id=pid, status=enums.RelationStatus.CURRENT
+        ).values_list("team_id", flat=True)
+    ) | set(
+        TeamCoach.objects.filter(
+            person_id=pid, status=enums.RelationStatus.CURRENT
+        ).values_list("team_id", flat=True)
+    )
+    if not team_ids:
+        return []
+    head_coach_subq = TeamCoach.objects.filter(
+        team=OuterRef("pk"),
+        status=enums.RelationStatus.CURRENT,
+        duty=enums.CoachDuty.HEAD_COACH,
+    ).values("person__full_name")[:1]
+    rows = (
+        Team.objects.filter(pk__in=team_ids, is_deleted=False)
+        .select_related("school", "region")
+        .annotate(
+            member_count=Count(
+                "teammember",
+                filter=Q(teammember__status=enums.RelationStatus.CURRENT),
+            ),
+            head_coach_name=Subquery(head_coach_subq),
+        )
+        .order_by("created_at", "id")
+    )
+    return [_team_brief_out(row) for row in rows]
+
+
+def _team_brief_out(team) -> dict:
+    """/me/teams 单队输出（dict 直出，EnvelopeOut.data=Any 不进 components）。"""
+    return {
+        "id": str(team.pk),
+        "name": team.name,
+        "category": team.category_code,
+        "schoolName": team.school.name if team.school_id else None,
+        "cityName": team.region.name if team.region_id else None,
+        "intro": team.introduction,
+        "coachName": team.head_coach_name,
+        "memberCount": team.member_count,
+        "status": team.audit_status,
+        "version": int(team.updated_at.timestamp() * 1_000_000),
+        "createdAt": team.created_at.isoformat(),
+    }
+
+
+def delete_person(person_id: str, request_version, account) -> None:
+    """DELETE /people/{id}：软删（版本校验 + 现役球队/教练关联保护）。"""
+    person = get_person(person_id, account)
+    ensure_version(person, request_version)
+    if TeamMember.objects.filter(person=person, status=enums.RelationStatus.CURRENT).exists():
+        raise ApiError(
+            STATE_CONFLICT,
+            "人员仍在现役球队名单中，不能删除",
+        )
+    if TeamCoach.objects.filter(person=person).exists():
+        # 保守保护：教练关联行不含可辨状态口径前，存在即挡（待确认后放宽）
+        raise ApiError(
+            STATE_CONFLICT,
+            "人员存在教练关联记录，不能删除",
+        )
+    with transaction.atomic():
+        person.is_deleted = True
+        person.deleted_at = timezone.now()
+        person.save()
+        _log_change(
+            person,
+            enums.ChangeType.DISABLE,
+            [{"field": "isDeleted", "old": False, "new": True}],
+            reason="软删除",
+        )
+
+
+# ---------------------------------------------------------------- 遴选档案聚合（§6.8，批次 D-1）
+
+def _reject_undeployed_event_filters(payload: dict) -> None:
+    """eventId/groupId 筛选行为待决策（D-A）：契约仅定义参数、未规定过滤规则，
+    报名/比赛读模型未落地（冻结 22 表无此域）。非空一律 400 明确拒绝，
+    不默认空集、不虚构过滤语义。"""
+    for name in ("eventId", "groupId"):
+        if (payload.get(name) or "").strip():
+            raise ApiError(
+                INVALID_ARGUMENT,
+                f"{name} 筛选依赖报名/比赛读模型，尚未开放（待决策项 D-A）",
+                field_errors([(name, "暂不支持")]),
+            )
+
+
+def dossier_search_queryset(payload: dict, account) -> QuerySet:
+    """POST /selection-dossiers/search 查询构建（§6.8 L1736-1756 + §7 DossierSearch）。
+
+    复用：people_queryset（软删排除+档案行注解）、apply_person_scope（一期仅
+    ADMIN，D5 口径）、list_people 的 -id 排序先例、create_person 的
+    lookup_hash 受控检索链路；teamId=现役 TeamMember 关系（CURRENT 口径同
+    /me/teams）。检索资格：文档 L4708"仅运动员遴选档案受控检索，不允许借用
+    教练员或其他人员过滤字段扩大数据范围"→ 强制 athlete_profile_exists=True。
+    """
+    _reject_undeployed_event_filters(payload)
+    queryset = apply_person_scope(people_queryset(), account).filter(
+        athlete_profile_exists=True
+    )
+    name = (payload.get("athleteName") or "").strip()
+    if name:
+        queryset = queryset.filter(full_name__icontains=name)
+    id_number = (payload.get("idNumber") or "").strip().upper()
+    if id_number:
+        queryset = queryset.filter(id_card_hash=crypto.lookup_hash(id_number))
+    team_id = payload.get("teamId")
+    if team_id:
+        queryset = queryset.filter(
+            pk__in=TeamMember.objects.filter(
+                team_id=parse_path_id(str(team_id), "teamId"),
+                status=enums.RelationStatus.CURRENT,
+            ).values("person_id")
+        )
+    return queryset.order_by("-id")
+
+
+def dossier_out(person, account) -> dict:
+    """Person(+注解列) → CandidateDossier（§7 L4692-4704）。
+
+    - athlete：person_out（脱敏同源，idNumber 永不回显）；
+    - teams：list_own_teams 现役正式关系（批次 D-1 指令"复用现有正式球队
+      关系"，与 /me/teams 同一业务规则；EXITED 历史属履历域不并入，D-D）；
+    - materials：materials.services.material_list(PERSON, ownerId)（批次 C
+      未软删查询）+ materials.schemas.material_out（零第二套序列化）；逐行
+      调用与 /me/teams 同款（pageSize≤100 已限，批量优化待数据量增长）；
+    - enrollments/matchRecords：报名/比赛读模型未落地，契约字段可选
+      （§7 L4700-4701 必填=否）→ 空数组=无读模型数据，非伪造记录；
+    - id：person 主键字符串（无独立档案表，待决策项 D-B）；
+    - version：person_version 微秒派生（B4 同款，待决策项 D-C）。
+    """
+    from .schemas import person_out, person_version
+    from apps.materials.schemas import material_out
+    from apps.materials.services import material_list as _material_rows
+
+    materials = [
+        material_out(row, kind)
+        for row, kind in _material_rows(
+            {"ownerType": "PERSON", "ownerId": str(person.pk)}, account
+        )
+    ]
+    return {
+        "id": str(person.pk),
+        "athlete": person_out(person),
+        "teams": list_own_teams(person.pk),
+        "materials": materials,
+        "enrollments": [],
+        "matchRecords": [],
+        "version": person_version(person),
+        "createdAt": person.created_at,
+        "updatedAt": person.updated_at,
+    }
+
+
+def dossier_get(athlete_id: str, event_id: Optional[str], account) -> dict:
+    """GET /selection-dossiers/{athleteId}（§6.8 L1758-1773）。
+
+    非运动员（无 AthleteProfile 行）/软删/不存在 → 404（"仅运动员遴选档案"
+    资格口径同 dossier_search）；eventId 非空 → 400（D-A 待决策）。
+    """
+    if (event_id or "").strip():
+        raise ApiError(
+            INVALID_ARGUMENT,
+            "eventId 筛选依赖报名读模型，尚未开放（待决策项 D-A）",
+            field_errors([("eventId", "暂不支持")]),
+        )
+    person = (
+        apply_person_scope(people_queryset(), account)
+        .filter(pk=parse_path_id(athlete_id), athlete_profile_exists=True)
+        .first()
+    )
+    if person is None:
+        raise ApiError(NOT_FOUND, "遴选档案不存在")
+    return dossier_out(person, account)

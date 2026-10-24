@@ -11,15 +11,19 @@ from apps.attachments.api import router as attachments_router
 from apps.common.api import api_not_found
 from apps.common.api import router as common_router
 from apps.common.ninja_api import api
+from apps.materials.api import router as materials_router
 from apps.notices.api import router as notices_router
 from apps.persons.api import router as persons_router
 from apps.policyqa.api import router as policyqa_router
+from apps.teams.api import router as teams_router
 from apps.verification.api import router as verification_router
 
 # 路由必须在读取 api.urls 之前注册完毕
 api.add_router("", common_router, tags=["system"])
 api.add_router("", accounts_router, tags=["accounts"])
 api.add_router("", persons_router, tags=["base-data"])
+api.add_router("", teams_router, tags=["teams"])
+api.add_router("", materials_router, tags=["materials"])
 api.add_router("", notices_router, tags=["notices"])
 api.add_router("", attachments_router, tags=["files"])
 api.add_router("", verification_router, tags=["identity"])

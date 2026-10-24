@@ -61,6 +61,16 @@ def _check_owner(account, owner_type: str, owner_id: str) -> None:
             "未知的文件归属类型",
             [{"field": "ownerType", "reason": "不在枚举范围内"}],
         )
+    if not (owner_id or "").strip():
+        # 先传后绑（前端新建人员先传头像）：文件暂无归属对象，仍按角色兜底校验
+        # ——只有管理/录入类角色可上传无主文件，普通账号不得借空归属绕过校验
+        roles = set(getattr(account, "roles", ()) or ())
+        if not roles & {ADMIN, PROVINCE_REVIEWER, MATCH_RECORDER}:
+            raise ApiError(
+                FORBIDDEN,
+                "文件归属对象尚未创建，暂无法受理该上传",
+            )
+        return
     verifier = OWNER_VERIFIERS.get(owner_type)
     if verifier is not None:
         verifier(account, owner_id)
