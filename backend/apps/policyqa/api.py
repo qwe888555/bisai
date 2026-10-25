@@ -24,6 +24,7 @@ class PolicyQuestion(StrictSchema):
 
 @router.post(
     "/public/policy-questions",
+    operation_id="policyQuestion",
     auth=None,
     response=EnvelopeOut,
     summary="政策与报名问答",

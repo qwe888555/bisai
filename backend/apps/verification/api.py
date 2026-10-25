@@ -83,6 +83,7 @@ def _identity_out(check: IdentityCheck) -> dict:
 
 @router.post(
     "/identity-checks",
+    operation_id="identityCreate",
     auth=_auth,
     response=EnvelopeOut,
     summary="球员现场身份核验",
@@ -112,6 +113,7 @@ def identity_create(request, payload: IdentityCheckCreate):
 
 @router.get(
     "/identity-checks/list",
+    operation_id="identityList",
     auth=_auth,
     response=EnvelopeOut,
     summary="身份核验记录列表",
@@ -129,6 +131,7 @@ def identity_list(request):
 
 @router.get(
     "/identity-checks/{identity_check_id}",
+    operation_id="identityGet",
     auth=_auth,
     response=EnvelopeOut,
     summary="身份核验结果",
@@ -141,6 +144,7 @@ def identity_get(request, identity_check_id: str):
 
 @router.post(
     "/identity-checks/{identity_check_id}/manual-review",
+    operation_id="identityReview",
     auth=_auth,
     response=EnvelopeOut,
     summary="身份核验人工复核",

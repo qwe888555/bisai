@@ -59,7 +59,7 @@ def _get_own_message(account, message_id: str) -> Message:
     return message
 
 
-@router.get("/me/messages", auth=_auth, response=EnvelopeOut, summary="本人系统消息列表")
+@router.get("/me/messages", operation_id="messageList", auth=_auth, response=EnvelopeOut, summary="本人系统消息列表")
 def message_list(request):
     actor = require("messageList")
     queryset = _own_messages(actor)
@@ -72,6 +72,7 @@ def message_list(request):
 
 @router.get(
     "/me/messages/{message_id}",
+    operation_id="messageGet",
     auth=_auth,
     response=EnvelopeOut,
     summary="本人消息详情",
@@ -84,6 +85,7 @@ def message_get(request, message_id: str):
 
 @router.post(
     "/me/messages/{message_id}/read",
+    operation_id="messageRead",
     auth=_auth,
     response=EnvelopeOut,
     summary="标记本人消息已读",
