@@ -8,7 +8,7 @@ coaches 属批次 C，matches 属比赛域，不在本轮。
 - 权限：查询多角色可见（menus.ts L145-176），但数据范围一期仅 ADMIN 全量
   （UNIVERSITY/TEAM 依赖 A′-min 映射，交付前 403 DATA_SCOPE_DENIED）；
   创建/更新=(ADMIN, UNIVERSITY)，成员管理=(ADMIN, UNIVERSITY, TEAM)，
-  学校解析依赖 ensure_business_org（未交付）；
+  学校解析经 A′-min 组织映射（ensure_business_org，2026-10-25 已移植交付）；
 - 写操作统一 audit_state()（team.create/team.update/team.member.*）；
 - audit_status 字段保留（Q2 审核流程不启用），创建即默认 APPROVED；
 - 成员状态直出冻结枚举 CURRENT/EXITED（不虚构审核状态，用户裁定）。
@@ -81,10 +81,10 @@ def team_get(request, team_id: str):
 @router.post("/teams", auth=_auth, response=EnvelopeOut, summary="创建球队档案")
 def team_create(request, body: s.TeamCreateBody):
     account = require("teamCreate")
-    # 学校解析：schoolOrgId（Organization id）→ School，依赖成员2 A′-min 接口
-    # ensure_business_org（尚未交付）——交付前统一明确报错，不绕过映射。
-    school_id = services._resolve_school(body.schoolOrgId, account)
-    team = services.create_team(body.model_dump(), school_id, account)
+    # 学校解析：schoolOrgId（Organization 节点 ID）→ 节点校验 + School 主档反查
+    # （A′-min 契约，ensure_business_org 已移植）；任一不满足 400 INVALID_ARGUMENT。
+    org, school = services._resolve_school(body.schoolOrgId)
+    team = services.create_team(body.model_dump(), org, school, account)
     audit_state(
         request,
         "team.create",

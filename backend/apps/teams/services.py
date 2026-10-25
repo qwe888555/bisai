@@ -8,9 +8,10 @@
 - 成员状态严格 CURRENT/EXITED（不虚构审核状态）；R2 现役唯一/R3 队内
   现役球衣号唯一为服务层规则；PENDING 转出单阻断直接移出；
 - 写链禁 queryset.update()（绕过 auto_now），统一 instance.save()；
-- 学校组织映射（A′-min：ensure_business_org）尚未交付（2026-10-24 复核）：
-  前端创建 payload 的 schoolOrgId（Organization id）→ persons.School 的解析
-  依赖该接口；未交付前 API 层返回明确冲突错误，不做任何绕过，不写 Organization；
+- 学校组织映射（A′-min，2026-10-25 契约确认并交付）：schoolOrgId（Organization
+  节点 ID）→ 节点校验（存在/未停用/学校类类型）→ org.code 反查 School 主档；
+  create_team 同事务经 accounts.ensure_business_org 建立 TEAM 组织节点
+  （code=team_no，parent=所属学校/高校组织节点）；
 - 无冻结承载的前端字段（shortName/gender/campusName/coachName 输入值）：
   声明但不持久化不回显（同 persons education/coachCategory 先例）；
   coachName 输出仅由现役（CURRENT）主教练关系合成（list_own_teams 先例）。
@@ -25,13 +26,19 @@ from django.db.models import Count, OuterRef, Q, QuerySet, Subquery
 from django.utils import timezone
 
 from apps.common import enums
-from apps.common.errors import DATA_SCOPE_DENIED, NOT_FOUND, STATE_CONFLICT, ApiError
+from apps.common.errors import (
+    DATA_SCOPE_DENIED,
+    INVALID_ARGUMENT,
+    NOT_FOUND,
+    STATE_CONFLICT,
+    ApiError,
+    field_errors,
+)
 from apps.common.permissions import ADMIN
 from apps.teams.models import Team, TeamCoach, TeamMember, TeamTransfer
 
-# ensure_business_org 由成员2在 accounts 域交付（A′-min 已确认方案）；
-# 本轮只读核实其尚未存在，映射交付后替换 _resolve_school 的占位实现。
-_ORG_SERVICE_NOT_DELIVERED = "学校组织映射（accounts.ensure_business_org）尚未交付，暂无法定位所属学校"
+# ensure_business_org 已自 origin/main 最小移植进 accounts 域（2026-10-25，
+# A′-min 契约经用户批准）；球队与组织节点的映射统一经该入口完成。
 
 
 def _team_queryset() -> QuerySet[Team]:
@@ -92,38 +99,79 @@ def get_team(team_id: str, account) -> Team:
     return team
 
 
-def _resolve_school(school_org_id: Optional[str], account) -> Optional[int]:
-    """创建用：前端 schoolOrgId（Organization id）→ persons.School 主键解析。
+_SCHOOL_ORG_TYPES = ("SCHOOL", "UNIVERSITY")
 
-    A′-min 方案（成员2已确认）：业务侧经 accounts.ensure_business_org 获取
-    组织后保存解析后的业务 ID，过滤按 ID 执行；School 无 code 视为未注册。
-    该接口尚未交付（2026-10-24 全仓复核），映射交付前一律明确报错，
-    不把 Organization 主键当作 School 主键，不绕过、不直写 Organization。
+
+def _resolve_school(school_org_id) -> tuple:
+    """创建用：前端 schoolOrgId（Organization 节点 ID）→ (组织节点, School 主档)。
+
+    A′-min 契约（2026-10-25 用户确认）：schoolOrgId 一律按组织节点主键查询，
+    不当作 School.code 或 Organization.code；节点必须存在、未删除未停用、
+    类型属于学校类（SCHOOL/UNIVERSITY，CITY/PROVINCE/TEAM 等一律拒绝）；
+    随后按 org.code=School.code 反查学校主档（Team.school 外键固化，必须有
+    业务主档承载）。任一不满足 → 400 INVALID_ARGUMENT + 可定位字段明细。
+    返回的 org 作为 TEAM 组织节点的父节点（见 create_team）。
     """
-    from apps.accounts import services as accounts_services
+    from apps.accounts.models import Organization
+    from apps.persons.models import School
 
-    resolver = getattr(accounts_services, "ensure_business_org", None)
-    if resolver is None:
-        raise ApiError(STATE_CONFLICT, _ORG_SERVICE_NOT_DELIVERED)
-    # 映射交付后在此实现：ensure_business_org(...) → Organization(SCHOOL)
-    # → School.objects.filter(code=org.code) → school.pk；School 无 code=未注册
-    raise ApiError(STATE_CONFLICT, _ORG_SERVICE_NOT_DELIVERED)  # pragma: no cover
+    raw = str(school_org_id or "").strip()
+    if not raw:
+        raise ApiError(
+            INVALID_ARGUMENT, "所属学校组织不能为空", field_errors([("schoolOrgId", "必填")])
+        )
+    org = Organization.objects.filter(pk=raw).first()
+    if org is None:
+        raise ApiError(
+            INVALID_ARGUMENT,
+            "所属学校组织不存在",
+            field_errors([("schoolOrgId", "组织节点不存在")]),
+        )
+    if org.deleted_at is not None or not org.enabled:
+        raise ApiError(
+            INVALID_ARGUMENT,
+            "所属学校组织已停用",
+            field_errors([("schoolOrgId", "组织节点已停用或已删除")]),
+        )
+    if org.org_type not in _SCHOOL_ORG_TYPES:
+        raise ApiError(
+            INVALID_ARGUMENT,
+            "所属组织类型不符",
+            field_errors(
+                [("schoolOrgId", f"球队必须挂在 SCHOOL/UNIVERSITY 节点下，当前为 {org.org_type}")]
+            ),
+        )
+    school = School.objects.filter(code=org.code, is_active=True).first()
+    if school is None:
+        raise ApiError(
+            INVALID_ARGUMENT,
+            "组织节点未关联学校主档",
+            field_errors([("schoolOrgId", f"组织节点 {org.code} 未关联学校主档")]),
+        )
+    return org, school
 
 
-def create_team(data: dict, school_id: Optional[int], account) -> Team:
-    """POST /teams：创建球队 + team_no 回填（事务内；API 层负责审计留痕）。
+def create_team(data: dict, org, school, account) -> Team:
+    """POST /teams：创建球队 + team_no 回填 + TEAM 组织节点（同一事务）。
 
-    - school_id 由 API 层经 _resolve_school 解析后传入（服务层保留参数以便
+    - org/school 由 API 层经 _resolve_school 解析后传入（服务层保留参数以便
       独立测试编号回填/媒体映射等规则）；
+    - TEAM 组织节点经 accounts.ensure_business_org 在同一事务建立（A′-min
+      契约 2026-10-25）：Organization.code=team_no、name=队名、parent=所属
+      学校/高校组织节点；幂等/复活/类型冲突 409/并发唯一约束兜底/层级校验
+      复用 accounts 实现，异常上抛 → 本事务整体回滚，不产生孤立球队或孤立
+      组织节点（accounts 侧不吞异常）；
     - 忽略无承载字段：shortName/gender/campusName（schema 声明以放行前端
       真实 payload，服务层不写入，不虚构保存结果）；
     - audit_status 用模型默认 APPROVED（Q2 审核流程不启用）。
     """
+    from apps.accounts.services import ensure_business_org
+
     with transaction.atomic():
         team = Team.objects.create(
             name=data["name"],
             category_code=data["groupCategory"],
-            school_id=school_id,
+            school=school,
             introduction=data.get("intro"),
             flag_file_id=data.get("flagFileId"),
             logo_file_id=data.get("emblemFileId"),
@@ -134,6 +182,10 @@ def create_team(data: dict, school_id: Optional[int], account) -> Team:
         # →编号天然唯一，uk_team_no 兜底；整段在事务内，失败即整体回滚）
         team.team_no = f"T{team.created_at:%Y}{team.pk:08d}"
         team.save()
+        # TEAM 组织节点与球队同事务建立（契约：球队创建失败不得留下孤立组织
+        # 节点，反之亦然；业务模块禁止直写 Organization，统一走 accounts 唯一
+        # 同步入口，父层级校验由 ensure_business_org 内部完成）
+        ensure_business_org("TEAM", team.team_no, team.name, parent_org_id=org.pk)
     return team
 
 

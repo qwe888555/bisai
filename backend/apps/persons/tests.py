@@ -16,12 +16,12 @@ from datetime import date
 from django.test import TestCase
 from django.utils import timezone
 
-from apps.accounts.models import Account, AuditLog
+from apps.accounts.models import Account, AuditLog, Organization
 from apps.attachments.models import FileRecord
 from apps.common import enums
 from apps.common.authentication import issue_access_token, make_password
 from apps.common.crypto import encrypt_text, lookup_hash, mask_id_number
-from apps.common.ids import new_account_id, new_file_id
+from apps.common.ids import new_account_id, new_file_id, new_organization_id
 from apps.materials.models import MaterialType, PersonMaterial
 from apps.persons.models import (
     AthleteProfile,
@@ -655,7 +655,14 @@ class PeopleApiTests(TestCase):
 
         region = Region.objects.create(name="甲省", code="800000", level=1)
         cls.school = School.objects.create(
-            name="甲一小", school_type="PRIMARY", region=region
+            name="甲一小", code="SCH-800100-101", school_type="PRIMARY", region=region
+        )
+        # A′-min 映射夹具：org.code = School.code（schoolOrgId 按组织节点 ID）
+        cls.org_school = Organization.objects.create(
+            id=new_organization_id(),
+            name="甲一小组织",
+            org_type="SCHOOL",
+            code="SCH-800100-101",
         )
         team = Team.objects.create(
             team_no="T202600000001",
@@ -754,7 +761,7 @@ class PeopleApiTests(TestCase):
         self.assertEqual(athlete_row["maskedStudentNumber"], "G1******89")
         self.assertEqual(athlete_row["gender"], "MALE")
         self.assertEqual(athlete_row["birthDate"], "2013-05-01")
-        self.assertEqual(athlete_row["schoolOrgId"], str(self.school.pk))
+        self.assertEqual(athlete_row["schoolOrgId"], str(self.org_school.pk))
         self.assertEqual(athlete_row["schoolName"], "甲一小")
         self.assertEqual(athlete_row["teamName"], "甲一队")
         self.assertIsNone(athlete_row["maskedPhone"])
@@ -900,7 +907,29 @@ class PeopleWriteApiTests(TestCase):
         cls.uni_token = issue_access_token(cls.uni)[0]
         region = Region.objects.create(name="乙省", code="810000", level=1)
         cls.school = School.objects.create(
-            name="乙一小", school_type="PRIMARY", region=region
+            name="乙一小", code="SCH-810100-201", school_type="PRIMARY", region=region
+        )
+        # A′-min 映射夹具：org.code = School.code（schoolOrgId 按组织节点 ID）
+        cls.org_school = Organization.objects.create(
+            id=new_organization_id(),
+            name="乙一小组织",
+            org_type="SCHOOL",
+            code="SCH-810100-201",
+        )
+        # 已停用学校组织节点（写入 400 用例）
+        cls.org_school_disabled = Organization.objects.create(
+            id=new_organization_id(),
+            name="停用学校组织",
+            org_type="SCHOOL",
+            code="SCH-DISABLED-201",
+            enabled=False,
+        )
+        # 类型不符节点（TEAM 不能作为 schoolOrgId）
+        cls.org_team = Organization.objects.create(
+            id=new_organization_id(),
+            name="别队组织",
+            org_type="TEAM",
+            code="T209901010002",
         )
 
     @staticmethod
@@ -937,7 +966,7 @@ class PeopleWriteApiTests(TestCase):
             "realName": "王测试",
             "idNumber": self.ID_CARD,
             "phone": "13800001111",
-            "schoolOrgId": str(self.school.pk),
+            "schoolOrgId": str(self.org_school.pk),
         }
         payload.update(overrides)
         resp = self._post(payload)
@@ -953,7 +982,7 @@ class PeopleWriteApiTests(TestCase):
         self.assertEqual(data["maskedIdNumber"], "110101********1234")
         self.assertEqual(data["maskedPhone"], "138****1111")
         self.assertEqual(data["reviewStatus"], "DRAFT")
-        self.assertEqual(data["schoolOrgId"], str(self.school.pk))
+        self.assertEqual(data["schoolOrgId"], str(self.org_school.pk))
         # 身份证解析（DDL birth_date 注释口径）：第7-14位出生、第17位奇→男
         self.assertEqual(data["birthDate"], "2013-05-01")
         self.assertEqual(data["gender"], "MALE")
@@ -1022,6 +1051,30 @@ class PeopleWriteApiTests(TestCase):
                 "realName": "错学校",
                 "idNumber": "110101201305015678",
                 "schoolOrgId": "999999",
+            }
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.json()["code"], "INVALID_ARGUMENT")
+
+    def test_create_school_org_disabled_returns_400(self):
+        resp = self._post(
+            {
+                "kinds": ["ATHLETE"],
+                "realName": "停用学校",
+                "idNumber": "110101201305015678",
+                "schoolOrgId": str(self.org_school_disabled.pk),
+            }
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.json()["code"], "INVALID_ARGUMENT")
+
+    def test_create_school_org_wrong_type_returns_400(self):
+        resp = self._post(
+            {
+                "kinds": ["ATHLETE"],
+                "realName": "类型不符",
+                "idNumber": "110101201305015678",
+                "schoolOrgId": str(self.org_team.pk),
             }
         )
         self.assertEqual(resp.status_code, 400)
@@ -1337,7 +1390,14 @@ class MyProfileApiTests(TestCase):
     def setUpTestData(cls):
         region = Region.objects.create(name="甲省", code="800000", level=1)
         cls.school = School.objects.create(
-            name="甲一小", school_type="PRIMARY", region=region
+            name="甲一小", code="SCH-800100-301", school_type="PRIMARY", region=region
+        )
+        # A′-min 映射夹具：org.code = School.code（schoolOrgId 输出按组织节点 ID）
+        cls.org_school = Organization.objects.create(
+            id=new_organization_id(),
+            name="甲一小组织",
+            org_type="SCHOOL",
+            code="SCH-800100-301",
         )
         cls.athlete = Person.objects.create(
             person_no="P202600000001",
@@ -1514,7 +1574,7 @@ class MyProfileApiTests(TestCase):
         self.assertEqual(data["reviewStatus"], "APPROVED")
         self.assertEqual(data["maskedIdNumber"], "110101********1234")
         self.assertEqual(data["maskedStudentNumber"], "G1******89")
-        self.assertEqual(data["schoolOrgId"], str(self.school.pk))
+        self.assertEqual(data["schoolOrgId"], str(self.org_school.pk))
         from apps.persons.schemas import person_version
 
         self.assertEqual(data["version"], person_version(self.athlete))

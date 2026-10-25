@@ -34,6 +34,7 @@ from apps.common.errors import (
     ApiError,
     field_errors,
 )
+from apps.accounts.models import Organization
 from apps.persons.models import (
     AthleteProfile,
     CoachProfile,
@@ -428,6 +429,11 @@ def people_queryset() -> QuerySet:
                 AthleteProfile.objects.filter(person=OuterRef("pk"))
             ),
             coach_profile_exists=Exists(CoachProfile.objects.filter(person=OuterRef("pk"))),
+            # schoolOrgId 输出（A′-min）：School.code → 组织节点主键（免 N+1；
+            # Organization.code 唯一，至多一命中）
+            school_org_id_val=Subquery(
+                Organization.objects.filter(code=OuterRef("school__code")).values("pk")[:1]
+            ),
         )
     )
 
@@ -673,27 +679,45 @@ def _apply_kinds(person, new_kinds: list[str], old_kinds: list[str]) -> None:
 
 
 def _resolve_school(school_org_id):
-    """schoolOrgId → School 外键。
+    """schoolOrgId（Organization 节点 ID）→ School 主档（A′-min 契约）。
 
-    映射口径（D 类差异在案）：前端键名为组织ID，当前值按冻结 School 主键解析；
-    org→school 正式映射待方案A′（成员2），确认后仅改本函数。
+    2026-10-25 契约确认：按组织节点主键查询，不把该值当作 School.code 或
+    Organization.code；节点必须存在、未删除未停用、类型属于学校类
+    （SCHOOL/UNIVERSITY，CITY/PROVINCE/TEAM 等一律拒绝）；随后按
+    org.code=School.code 反查学校主档（Person.school 外键固化，必须有业务
+    主档承载）。任一不满足 → 400 INVALID_ARGUMENT + 可定位字段明细。
+    未传（None/空串）→ None（保留既有"未传=不清空"语义）。
     """
-    if school_org_id in (None, ""):
+    raw = str(school_org_id or "").strip()
+    if not raw:
         return None
-    try:
-        school_id = int(str(school_org_id).strip())
-    except (TypeError, ValueError) as exc:
+    org = Organization.objects.filter(pk=raw).first()
+    if org is None:
         raise ApiError(
             INVALID_ARGUMENT,
-            "schoolOrgId 当前仅支持学校标识（组织映射待方案A′ 确认）",
-            field_errors([("schoolOrgId", "必须是学校ID")]),
-        ) from exc
-    school = School.objects.filter(pk=school_id, is_active=True).first()
+            "所属学校组织不存在",
+            field_errors([("schoolOrgId", "组织节点不存在")]),
+        )
+    if org.deleted_at is not None or not org.enabled:
+        raise ApiError(
+            INVALID_ARGUMENT,
+            "所属学校组织已停用",
+            field_errors([("schoolOrgId", "组织节点已停用或已删除")]),
+        )
+    if org.org_type not in ("SCHOOL", "UNIVERSITY"):
+        raise ApiError(
+            INVALID_ARGUMENT,
+            "所属组织类型不符",
+            field_errors(
+                [("schoolOrgId", f"人员归属必须是 SCHOOL/UNIVERSITY 节点，当前为 {org.org_type}")]
+            ),
+        )
+    school = School.objects.filter(code=org.code, is_active=True).first()
     if school is None:
         raise ApiError(
             INVALID_ARGUMENT,
-            "schoolOrgId 对应学校不存在或未启用",
-            field_errors([("schoolOrgId", "学校不存在或未启用")]),
+            "组织节点未关联学校主档",
+            field_errors([("schoolOrgId", f"组织节点 {org.code} 未关联学校主档")]),
         )
     return school
 

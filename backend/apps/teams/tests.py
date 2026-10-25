@@ -16,10 +16,10 @@ from unittest import mock
 from django.test import TestCase
 from django.utils import timezone
 
-from apps.accounts.models import Account, AuditLog
+from apps.accounts.models import Account, AuditLog, Organization
 from apps.common import crypto, enums
 from apps.common.authentication import issue_access_token, make_password
-from apps.common.ids import new_account_id
+from apps.common.ids import new_account_id, new_organization_id
 from apps.persons.models import AthleteProfile, Person, Region, School
 from apps.teams.models import Team, TeamCoach, TeamMember, TeamTransfer
 
@@ -68,7 +68,50 @@ class TeamApiTests(TestCase):
             name="甲州市", code="800100", level=2, parent=province
         )
         cls.school = School.objects.create(
-            name="甲一小", school_type="PRIMARY", region=cls.city
+            name="甲一小", code="SCH-800100-001", school_type="PRIMARY", region=cls.city
+        )
+        # ---- 组织树（A′-min 映射夹具：org.code = School.code）----
+        cls.org_prov = Organization.objects.create(
+            id=new_organization_id(), name="甲省组织", org_type="PROVINCE", code="ORG-PROV-TF"
+        )
+        cls.org_city = Organization.objects.create(
+            id=new_organization_id(),
+            name="甲市组织",
+            org_type="CITY",
+            code="ORG-CITY-TF",
+            parent=cls.org_prov,
+        )
+        cls.org_school = Organization.objects.create(
+            id=new_organization_id(),
+            name="甲一小组织",
+            org_type="SCHOOL",
+            code="SCH-800100-001",
+            parent=cls.org_city,
+        )
+        # 学校类型但无 School 主档承接的孤立节点（反查主档失败用例）
+        cls.org_school_lone = Organization.objects.create(
+            id=new_organization_id(),
+            name="无主档学校组织",
+            org_type="SCHOOL",
+            code="SCH-NO-MASTER",
+            parent=cls.org_city,
+        )
+        # 已停用学校组织节点
+        cls.org_school_disabled = Organization.objects.create(
+            id=new_organization_id(),
+            name="停用学校组织",
+            org_type="SCHOOL",
+            code="SCH-DISABLED-01",
+            parent=cls.org_city,
+            enabled=False,
+        )
+        # 类型不符节点（TEAM 不能作为 schoolOrgId）
+        cls.org_team = Organization.objects.create(
+            id=new_organization_id(),
+            name="别队组织",
+            org_type="TEAM",
+            code="T209901010001",
+            parent=cls.org_school,
         )
 
         # ---- 人员（主教练合成来源）----
@@ -276,30 +319,105 @@ class TeamApiTests(TestCase):
         )
         self.assertEqual(resp.status_code, 400)
 
-    def test_create_university_blocked_by_missing_org_mapping(self):
-        """学校映射（ensure_business_org）未交付：UNIVERSITY 建队明确报错，不落库。"""
+    def test_create_invalid_school_org_returns_400(self):
+        """A′-min（2026-10-25 交付）：schoolOrgId 须为真实组织节点 ID；
+        不存在的节点 → 400 INVALID_ARGUMENT + 字段明细，不落库。"""
         resp = self._post(
             BASE,
             {"name": "新队", "groupCategory": "PRIMARY", "schoolOrgId": "42"},
             token=self.uni_token,
         )
-        self.assertEqual(resp.status_code, 409)
-        self.assertEqual(resp.json()["code"], "STATE_CONFLICT")
-        self.assertIn("ensure_business_org", resp.json()["message"])
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.json()["code"], "INVALID_ARGUMENT")
+        # field_errors 为列表信封：data = [{"field", "reason"}]
+        self.assertEqual(resp.json()["data"][0]["field"], "schoolOrgId")
         self.assertEqual(Team.objects.count(), 3)
 
-    def test_create_admin_also_blocked_by_missing_org_mapping(self):
-        """ADMIN 同样受映射阻塞（不虚构 schoolId 解析），属登记在案的依赖。"""
+    def test_create_admin_success_creates_team_org_node(self):
+        """创建成功 → 同事务建立 TEAM 组织节点：code=team_no、name=队名、
+        parent=所属学校组织节点（A′-min 契约）。"""
         resp = self._post(
             BASE,
-            {"name": "新队", "groupCategory": "PRIMARY", "schoolOrgId": "42"},
+            {
+                "name": "映射新队",
+                "groupCategory": "PRIMARY",
+                "schoolOrgId": str(self.org_school.pk),
+                "intro": "映射链路用",
+            },
             token=self.admin_token,
         )
-        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()["data"]
+        team = Team.objects.filter(team_no=data["teamNo"]).first()
+        self.assertIsNotNone(team)
+        self.assertEqual(team.school_id, self.school.pk)
+        org = Organization.objects.filter(code=data["teamNo"]).first()
+        self.assertIsNotNone(org)
+        self.assertEqual(org.org_type, "TEAM")
+        self.assertEqual(org.name, "映射新队")
+        self.assertEqual(org.parent_id, self.org_school.pk)
+        self.assertTrue(org.enabled)
+        self.assertEqual(Organization.objects.filter(org_type="TEAM").count(), 2)  # 夹具1+新建1
+
+    def test_create_school_org_disabled_returns_400(self):
+        """schoolOrgId 节点已停用 → 400 INVALID_ARGUMENT，不落库。"""
+        resp = self._post(
+            BASE,
+            {"name": "新队", "groupCategory": "PRIMARY", "schoolOrgId": str(self.org_school_disabled.pk)},
+            token=self.admin_token,
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.json()["code"], "INVALID_ARGUMENT")
         self.assertEqual(Team.objects.count(), 3)
 
+    def test_create_school_org_wrong_type_returns_400(self):
+        """schoolOrgId 为 TEAM 类型节点 → 400 类型不符，不落库。"""
+        resp = self._post(
+            BASE,
+            {"name": "新队", "groupCategory": "PRIMARY", "schoolOrgId": str(self.org_team.pk)},
+            token=self.admin_token,
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.json()["code"], "INVALID_ARGUMENT")
+        self.assertEqual(Team.objects.count(), 3)
+
+    def test_create_school_org_without_school_master_returns_400(self):
+        """组织节点类型合法但 org.code 无 School 主档承接 → 400，不落库。"""
+        resp = self._post(
+            BASE,
+            {"name": "新队", "groupCategory": "PRIMARY", "schoolOrgId": str(self.org_school_lone.pk)},
+            token=self.admin_token,
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.json()["code"], "INVALID_ARGUMENT")
+        self.assertEqual(Team.objects.count(), 3)
+
+    def test_create_rollback_leaves_no_orphan_team_or_org(self):
+        """TEAM 组织节点建立失败（父层级校验等）→ 同事务球队行一并回滚，
+        无孤立球队/孤立组织节点（A′-min 原子性契约）。"""
+        from apps.common.errors import STATE_CONFLICT, ApiError
+
+        with mock.patch(
+            "apps.accounts.services.ensure_business_org",
+            side_effect=ApiError(STATE_CONFLICT, "模拟组织同步失败"),
+        ):
+            resp = self._post(
+                BASE,
+                {
+                    "name": "回滚新队",
+                    "groupCategory": "PRIMARY",
+                    "schoolOrgId": str(self.org_school.pk),
+                },
+                token=self.admin_token,
+            )
+        self.assertEqual(resp.status_code, 409)
+        self.assertFalse(Team.objects.filter(name="回滚新队").exists())
+        self.assertEqual(
+            Organization.objects.filter(org_type="TEAM").count(), 1
+        )  # 仅夹具节点，无新节点
+
     def test_create_service_level_full_rules(self):
-        """服务层直测（映射交付前的规则锚定）：编号回填/媒体映射/默认状态/无承载字段。"""
+        """服务层直测（A′-min 映射交付后的规则锚定）：编号回填/媒体映射/默认状态/无承载字段。"""
         team = None
         from apps.teams import services
 
@@ -314,7 +432,8 @@ class TeamApiTests(TestCase):
                 "emblemFileId": "f-logo",
                 "groupPhotoFileId": "f-photo",
             },
-            school_id=self.school.pk,
+            org=self.org_school,
+            school=self.school,
             account=self.admin,
         )
         year = team.created_at.year
@@ -332,12 +451,14 @@ class TeamApiTests(TestCase):
 
         first = services.create_team(
             {"name": "队A", "groupCategory": "PRIMARY"},
-            school_id=self.school.pk,
+            org=self.org_school,
+            school=self.school,
             account=self.admin,
         )
         second = services.create_team(
             {"name": "队B", "groupCategory": "PRIMARY"},
-            school_id=self.school.pk,
+            org=self.org_school,
+            school=self.school,
             account=self.admin,
         )
         self.assertNotEqual(first.team_no, second.team_no)
@@ -364,7 +485,8 @@ class TeamApiTests(TestCase):
             with self.assertRaises(RuntimeError):
                 services.create_team(
                     {"name": "回滚队", "groupCategory": "PRIMARY"},
-                    school_id=self.school.pk,
+                    org=self.org_school,
+                    school=self.school,
                     account=self.admin,
                 )
         self.assertFalse(Team.objects.filter(name="回滚队").exists())
@@ -439,12 +561,13 @@ class TeamApiTests(TestCase):
 
         team = services.create_team(
             {"name": "审计队", "groupCategory": "PRIMARY"},
-            school_id=self.school.pk,
+            org=self.org_school,
+            school=self.school,
             account=self.admin,
         )
         self._post(
             BASE, {"name": "审计队2", "groupCategory": "PRIMARY"}, token=self.admin_token
-        )  # API 层 create 会被映射阻塞；审计断言针对服务层+API update 组合
+        )  # 缺 schoolOrgId → 400，不建队；审计断言针对服务层 create+API update 组合
         resp = self._put(
             f"{BASE}/{team.pk}",
             {"intro": "改简介", "version": self._current_version(team)},

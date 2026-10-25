@@ -303,6 +303,26 @@ def _synthesized_kinds(person) -> list[str]:
     return kinds
 
 
+def _school_org_id_out(person):
+    """schoolOrgId 输出：组织节点 ID（A′-min 契约，2026-10-25 确认）。
+
+    列表/详情经 people_queryset 的 school_org_id_val 注解免 N+1；注解缺失
+    （孤立调用）时按 School.code 反查兜底（school 已 select_related，至多
+    一次额外查询）。学校无 code 或无对应组织节点 → None（不虚构）。
+    """
+    annotated = getattr(person, "school_org_id_val", None)
+    if annotated:
+        return annotated
+    if not person.school_id:
+        return None
+    from apps.accounts.models import Organization
+
+    code = getattr(person.school, "code", None)
+    if not code:
+        return None
+    return Organization.objects.filter(code=code).values_list("pk", flat=True).first()
+
+
 def person_out(person) -> dict:
     """冻结 Person(+扩展档案注解列) → zuqiu Person 字段映射。
 
@@ -311,7 +331,10 @@ def person_out(person) -> dict:
       person_category 单值列存主类别（提交首项），AthleteProfile/CoachProfile
       扩展档案行存在性承载完整类别集合（冻结模型天然支持各 0..1 行），
       输出按行存在性合成、固定 ATHLETE→COACH 顺序；
-    - schoolOrgId：前端组织ID vs 冻结 school 主键 → 输出 school 主键字符串（D 类）；
+    - schoolOrgId：**A′-min 契约（2026-10-25 确认）**——输入输出均为组织节点
+      ID；输出经 people_queryset 的 school_org_id_val 注解（School.code →
+      Organization 主键，免 N+1），注解缺失时按 school.code 反查兜底；
+      学校无 code 或无对应组织节点 → None（不虚构）；
     - coachCategory：**不输出**（用户 2026-10-24 决策）——冻结列 coach_level 语义为
       "教练等级"，与前端 coachCategory"教练类别"无法确认同一，字典清单（成员5）
       未交付前停止输出该映射，避免错误值进入前端表单；前端字段为可选，读取侧
@@ -334,7 +357,7 @@ def person_out(person) -> dict:
         ),
         "gender": GENDER_OUT.get(person.gender, "UNSPECIFIED"),
         "birthDate": person.birth_date.isoformat() if person.birth_date else None,
-        "schoolOrgId": str(person.school_id) if person.school_id else None,
+        "schoolOrgId": _school_org_id_out(person),
         "schoolName": person.school.name if person.school_id else None,
         "teamName": getattr(person, "team_name_val", None),
         "avatarFileId": person.photo_file_id,
