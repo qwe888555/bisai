@@ -399,6 +399,46 @@ class ApiSmokeTests(TestCase):
         )
         self.assertEqual(scoped_accounts(admin).count(), Account.objects.count())
 
+    def test_ensure_business_org_type_conflict_and_rollback(self):
+        from django.db import transaction
+
+        from apps.accounts.models import Organization
+        from apps.accounts.services import ensure_business_org
+        from apps.common.errors import ApiError
+        from apps.common.ids import new_account_id
+        from apps.accounts.models import Account
+
+        token = self.login()
+        city = self.create_org(
+            token,
+            {"name": "挂靠市", "orgType": "CITY", "code": "BIZ_CITY_FOR_ENSURE", "parentId": "org_prov"},
+        )
+
+        with transaction.atomic():
+            ensure_business_org("UNIVERSITY", "BIZ_CONFLICT_CODE", "冲突高校", "org_prov")
+
+        with self.assertRaises(ApiError) as caught:
+            with transaction.atomic():
+                ensure_business_org("SCHOOL", "BIZ_CONFLICT_CODE", "冲突学校", city["id"])
+        self.assertEqual(caught.exception.code, "STATE_CONFLICT")
+
+        # 组织创建失败时，同事务内的业务记录必须一起回滚
+        username = "rollback_case"
+        try:
+            with transaction.atomic():
+                Account.objects.create(
+                    id=new_account_id(),
+                    username=username,
+                    display_name="回滚用例",
+                    roles=["COACH"],
+                    password="x",
+                )
+                ensure_business_org("TEAM", "BIZ_ROLLBACK_TEAM", "回滚球队", "org_prov")
+        except ApiError:
+            pass
+        self.assertFalse(Account.all_objects.filter(username=username).exists())
+        self.assertFalse(Organization.all_objects.filter(code="BIZ_ROLLBACK_TEAM").exists())
+
     def test_init_admin_command(self):
         from django.core.management import CommandError
 
