@@ -7,9 +7,18 @@ from selection.models import PublicityRecord
 from selection.services.publicity import mask_id_card
 from selection.services.publicity_source import get_publicity_source_client
 
-PUBLICITY_PATH = "/api/selection/publicity/"
+from .utils import api_prefix
+
+API_PREFIX = api_prefix()
+PUBLICITY_PATH = f"{API_PREFIX}publicity/"
 
 
+@override_settings(
+    SELECTION_AUTH_MODE="none",
+    SELECTION_ENVELOPE_MODE="native",
+    SELECTION_ARCHIVE_MODE="demo",
+    SELECTION_PUBLICITY_SOURCE_MODE="demo",
+)
 class PublicityApiTests(TestCase):
     def setUp(self):
         self.client = Client()

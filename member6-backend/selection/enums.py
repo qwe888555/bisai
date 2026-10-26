@@ -8,6 +8,10 @@ class GroupType:
     MIDDLE = "MIDDLE"
     PRIMARY = "PRIMARY"
 
+    # 主程序 apps.events.EventGroup.category 使用 UNIVERSITY，成员6内部仍
+    # 使用 HIGHER；这里提供同义常量，便于适配器代码直接引用。
+    UNIVERSITY = HIGHER
+
     CHOICES = (
         (HIGHER, "高校组"),
         (MIDDLE, "中学组"),
@@ -26,7 +30,8 @@ class GroupType:
         if not code:
             raise BusinessError(
                 400,
-                f"不支持的{field_name}: {value}（可选 HIGHER/MIDDLE/PRIMARY）",
+                f"不支持的{field_name}: {value}"
+                "（可选 HIGHER/UNIVERSITY/MIDDLE/PRIMARY）",
             )
         return code
 
@@ -73,6 +78,8 @@ for _code, _label in GroupType.CHOICES:
 
 GroupType._ALIASES.update(
     {
+        # 主程序 apps.events.EventGroup.category 的取值
+        "UNIVERSITY": GroupType.HIGHER,
         "高校": GroupType.HIGHER,
         "大学组": GroupType.HIGHER,
         "大学": GroupType.HIGHER,

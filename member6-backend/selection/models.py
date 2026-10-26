@@ -23,7 +23,9 @@ class ScoreTemplate(models.Model):
     status = models.SmallIntegerField(
         "状态", default=1, help_text="1=启用，0=停用"
     )
-    created_by = models.BigIntegerField("创建人ID", default=0)
+    created_by = models.CharField(
+        "创建人ID", max_length=64, blank=True, default=""
+    )
     created_at = models.DateTimeField("创建时间", auto_now_add=True)
     updated_at = models.DateTimeField("更新时间", auto_now=True)
 
@@ -86,7 +88,7 @@ class Score(models.Model):
     rounds independent while preventing duplicate submissions in one round.
     """
 
-    event_id = models.BigIntegerField("赛事ID")
+    event_id = models.CharField("赛事ID", max_length=64)
     group_type = models.CharField(
         "组别", max_length=16, choices=GroupType.CHOICES
     )
@@ -99,7 +101,7 @@ class Score(models.Model):
         related_name="scores",
         verbose_name="评分模板",
     )
-    candidate_id = models.BigIntegerField("球员档案ID")
+    candidate_id = models.CharField("球员档案ID", max_length=64)
     candidate_name = models.CharField("球员姓名", max_length=64)
     team_name = models.CharField("所属球队", max_length=128, blank=True, default="")
     player_position = models.CharField(
@@ -107,9 +109,13 @@ class Score(models.Model):
     )
     total_score = models.DecimalField("总分", max_digits=6, decimal_places=2)
     version = models.IntegerField("版本号", default=0)
-    created_by = models.BigIntegerField("录入人ID", default=0)
+    created_by = models.CharField(
+        "录入人ID", max_length=64, blank=True, default=""
+    )
     created_at = models.DateTimeField("录入时间", auto_now_add=True)
-    updated_by = models.BigIntegerField("修改人ID", default=0)
+    updated_by = models.CharField(
+        "修改人ID", max_length=64, blank=True, default=""
+    )
     updated_at = models.DateTimeField("修改时间", auto_now=True)
 
     class Meta:
@@ -178,7 +184,7 @@ class ScoreItem(models.Model):
 class ResultBatch(models.Model):
     """One generated best-player selection result (versioned batch)."""
 
-    event_id = models.BigIntegerField("赛事ID")
+    event_id = models.CharField("赛事ID", max_length=64)
     group_type = models.CharField(
         "组别", max_length=16, choices=GroupType.CHOICES
     )
@@ -198,7 +204,9 @@ class ResultBatch(models.Model):
     stale = models.BooleanField(
         "是否已过期", default=False, help_text="评分修改后自动置为已过期"
     )
-    generated_by = models.BigIntegerField("生成人ID", default=0)
+    generated_by = models.CharField(
+        "生成人ID", max_length=64, blank=True, default=""
+    )
     generated_at = models.DateTimeField("生成时间", auto_now_add=True)
 
     class Meta:
@@ -233,7 +241,7 @@ class ResultItem(models.Model):
         verbose_name="结果批次",
     )
     rank_no = models.IntegerField("排名")
-    candidate_id = models.BigIntegerField("球员档案ID")
+    candidate_id = models.CharField("球员档案ID", max_length=64)
     candidate_name = models.CharField("球员姓名", max_length=64)
     team_name = models.CharField("所属球队", max_length=128, blank=True, default="")
     player_position = models.CharField(
@@ -276,7 +284,7 @@ class PublicityRecord(models.Model):
     transformed into ``id_card_masked`` while the snapshot is built.
     """
 
-    event_id = models.BigIntegerField("赛事ID")
+    event_id = models.CharField("赛事ID", max_length=64)
     group_type = models.CharField(
         "组别", max_length=16, choices=GroupType.CHOICES
     )
@@ -304,9 +312,13 @@ class PublicityRecord(models.Model):
         choices=PublicityStatus.CHOICES,
         default=PublicityStatus.PUBLISHED,
     )
-    published_by = models.BigIntegerField("公示操作人ID", default=0)
+    published_by = models.CharField(
+        "公示操作人ID", max_length=64, blank=True, default=""
+    )
     published_at = models.DateTimeField("公示时间", default=timezone.now)
-    cancelled_by = models.BigIntegerField("取消操作人ID", default=0)
+    cancelled_by = models.CharField(
+        "取消操作人ID", max_length=64, blank=True, default=""
+    )
     cancelled_at = models.DateTimeField("取消时间", null=True, blank=True)
     cancel_reason = models.CharField(
         "取消原因", max_length=200, blank=True, default=""

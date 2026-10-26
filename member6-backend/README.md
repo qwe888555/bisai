@@ -87,7 +87,7 @@ football-systerm/
 │   ├── management/commands/
 │   │   └── seed_demo.py          # 一键演示数据
 │   ├── migrations/
-│   └── tests/                    # 30 个自动化测试
+│   └── tests/                    # 33 个测试（3 个主程序适配器测试并入后才运行）
 └── docs/
     ├── API.md                    # 正式接口文档（参数、返回字段、错误码）
     └── selection-api.http        # 可直接在 IDE 里执行的接口示例
@@ -103,14 +103,16 @@ football-systerm/
 python -m pip install -r requirements.txt
 python manage.py migrate
 python manage.py seed_demo
-python manage.py runserver
+python manage.py runserver 8001
 ```
+
+> 独立运行时使用 **8001** 端口，避免和主程序默认的 8000 冲突。也可以继续用 8000，只是不能同时启动主程序。
 
 浏览器或接口工具访问：
 
 ```
-http://127.0.0.1:8000/api/selection/docs          # Swagger UI（自动生成）
-http://127.0.0.1:8000/api/selection/openapi.json  # OpenAPI 3 描述
+http://127.0.0.1:8001/api/selection/docs          # Swagger UI（自动生成）
+http://127.0.0.1:8001/api/selection/openapi.json  # OpenAPI 3 描述
 ```
 
 `seed_demo` 会生成：
@@ -121,7 +123,7 @@ http://127.0.0.1:8000/api/selection/openapi.json  # OpenAPI 3 描述
 - 3 个组别各 1 个复选结果批次，默认名额 11
 - 3 个组别 ×（3 名运动员 + 1 名教练员 + 1 支球队）= **15 条公示记录**
 
-演示报名档案 ID：
+演示报名档案 ID（**接口中一律按字符串传递和返回**）：
 
 | 类型 | 高校组 | 中学组 | 小学组 |
 |---|---|---|---|
@@ -129,7 +131,7 @@ http://127.0.0.1:8000/api/selection/openapi.json  # OpenAPI 3 描述
 | 教练员 COACH | C1001–C1005 | C2001–C2005 | C3001–C3005 |
 | 球队 TEAM | T1001–T1003 | T2001–T2003 | T3001–T3003 |
 
-演示市州为 `江城市`、`南湖市`、`东林市`。所有演示评分和公示记录属于 `event_id=1`。
+演示市州为 `江城市`、`南湖市`、`东林市`。所有演示评分和公示记录属于 `event_id="1"`。正式并入主程序后，`event_id` 是成员5的 `evt_...`，球员 ID 是成员4的 `rst_...` / 人员 ID，**不要假设它们是整数**。
 
 重置演示数据：
 
@@ -147,7 +149,7 @@ python manage.py seed_demo --reset --templates-only
 
 ```bash
 python manage.py createsuperuser
-# 然后访问 http://127.0.0.1:8000/admin/
+# 然后访问 http://127.0.0.1:8001/admin/
 ```
 
 ---
@@ -157,16 +159,20 @@ python manage.py createsuperuser
 ### 4.1 框架与自动文档
 
 - 路由由 `selection/api.py` 中的 `NinjaAPI` + `Router` 提供，`selection/urls.py` 只负责挂载 `api.urls`。
-- 每个路径仍然带结尾斜杠，完整前缀为 `/api/selection/`。
+- 每个路径仍然带结尾斜杠。
+  - 独立部署：完整前缀为 `/api/selection/`。
+  - 并入主程序：推荐挂到主程序的 `/api/v1/` 下，前缀为 `/api/v1/selection/`（见第 8 节）。
 - django-ninja 会自动生成 OpenAPI 文档：
-  - Swagger UI：`/api/selection/docs`
-  - OpenAPI JSON：`/api/selection/openapi.json`
+  - 独立部署：`/api/selection/docs`、`/api/selection/openapi.json`
+  - 并入主程序：`/api/v1/docs`、`/api/v1/openapi.json`（与主程序共用）
 - 业务异常、参数校验异常和未捕获异常都通过 Ninja 的 `exception_handler` 转成下面的统一响应，HTTP 状态码与 `code` 一致。
 - Excel 导出接口直接返回 `HttpResponse`，Ninja 会原样透传文件流。
 
 ### 4.2 统一响应
 
-成功：
+响应格式自动跟随部署方式（`SELECTION_ENVELOPE_MODE=auto`）：
+
+**独立运行**（`{code: 0, message: "ok", data}`）：
 
 ```json
 {
@@ -186,6 +192,21 @@ python manage.py createsuperuser
 }
 ```
 
+**并入主程序**（自动使用主程序契约信封）：
+
+```json
+{
+  "code": "OK",
+  "message": "成功",
+  "data": {},
+  "requestId": "req_..."
+}
+```
+
+失败时 `code` 是主程序错误码（如 `INVALID_ARGUMENT`、`NOT_FOUND`、`STATE_CONFLICT`），HTTP 状态码与主程序约定一致。分页数据也从独立模式的 `{records,total,page,size}` 自动切换为主程序的 `{items,page,pageSize,total}`。
+
+可用 `SELECTION_ENVELOPE_MODE` 强制指定：`auto`（默认）/ `native` / `main`。
+
 ### 4.3 参数命名
 
 - 请求体同时接受 `snake_case` 和 `camelCase`：
@@ -196,12 +217,14 @@ python manage.py createsuperuser
   - `initial_weight` / `initialWeight`
 - 响应统一使用 `snake_case`。
 - 所有 URL 以 `/` 结尾（项目关闭了 `APPEND_SLASH`，避免 POST 被重定向后丢失请求体）。
+- **赛事 ID、球员 ID、报名档案 ID 都是不透明字符串**（最长 64），前端不要按整数处理。独立演示是 `"1"`、`"10001"`；主程序是 `evt_...`、`rst_...` 等。
 - 组别和轮次同时接受英文代码和中文：
-  - `HIGHER` / `高校组` / `高校` / `大学组`
+  - `HIGHER` / `UNIVERSITY` / `高校组` / `高校` / `大学组`
   - `MIDDLE` / `中学组` / `中学` / `初中组` / `高中组`
   - `PRIMARY` / `小学组` / `小学`
   - `INITIAL` / `初选` / `初赛` / `初轮`
   - `FINAL` / `复选` / `复赛` / `决赛` / `终选`
+  - `UNIVERSITY` 是主程序 `EventGroup.category` 的取值，内部会统一成 `HIGHER`。
 
 ### 4.4 接口清单
 
@@ -254,11 +277,11 @@ POST /api/selection/templates/
 ```json
 POST /api/selection/scores/
 {
-  "event_id": 1,
+  "event_id": "1",
   "group_type": "HIGHER",
   "round": "INITIAL",
   "template_id": 1,
-  "candidate_id": 10001,
+  "candidate_id": "10001",
   "scores": [
     {"dimension_code": "TECH", "score": 92},
     {"dimension_code": "MATCH", "score": 88},
@@ -287,7 +310,7 @@ PUT /api/selection/scores/1/
 ```json
 POST /api/selection/results/generate/
 {
-  "event_id": 1,
+  "event_id": "1",
   "group_type": "HIGHER",
   "result_round": "FINAL",
   "quota": 11,
@@ -301,7 +324,7 @@ POST /api/selection/results/generate/
 ```json
 POST /api/selection/publicity/
 {
-  "event_id": 1,
+  "event_id": "1",
   "publicity_type": "ATHLETE",
   "source_id": "10001"
 }
@@ -540,13 +563,13 @@ from selection.services.publicity_source import (
 
 
 class RegistrationPublicitySource(PublicitySourceClient):
-    def get_registration(self, publicity_type, source_id):
+    def get_registration(self, publicity_type, source_id, event_id=None):
         row = load_registration(publicity_type, source_id)  # 成员4的表
         if row is None:
             return None
         return PublicitySourceRecord(
             source_id=str(row.id),
-            event_id=row.event_id,
+            event_id=str(row.event_id),
             group_type=row.group_type,   # HIGHER/MIDDLE/PRIMARY
             city=row.city,
             publicity_type=publicity_type,
@@ -566,7 +589,7 @@ class RegistrationPublicitySource(PublicitySourceClient):
 然后在主程序 `settings.py` 中设置：
 
 ```python
-SELECTION_PUBLICITY_SOURCE_MODE = "none"
+SELECTION_PUBLICITY_SOURCE_MODE = "main"   # 或保留 auto
 SELECTION_PUBLICITY_SOURCE_CLIENT = (
     "apps.registrations.services.RegistrationPublicitySource"
 )
@@ -574,30 +597,52 @@ SELECTION_PUBLICITY_SOURCE_CLIENT = (
 
 `SELECTION_PUBLICITY_SOURCE_CLIENT` 指向一个“可调用对象”，可以是类，也可以是返回实例的函数。
 
+> 如果直接使用主程序现有的成员4模型，**不需要写这个适配器**：`SELECTION_PUBLICITY_SOURCE_MODE=auto` 会自动读取 `Enrollment/RosterItem/TeamCoach/Team/Person`，只取 `status=APPROVED` 的报名单。
+
 ---
 
 ## 8. 并入主程序
 
 ### 8.1 基本步骤
 
-1. 把整个 `selection/` 目录复制到主程序的 Django 项目根目录。
-2. 在主程序 `settings.py` 的 `INSTALLED_APPS` 中加入 `"selection"`。
-3. 在主程序 `urls.py` 中加入：
+1. **只复制 `member6-backend/selection/`** 到主程序的 `backend/` 下（和 `apps/` 同级）。
+   **不要复制** `config/`、`manage.py`、`db.sqlite3`，否则会覆盖主程序的 settings/urls/数据库配置。
+2. 在主程序 `backend/config/settings.py` 的 `INSTALLED_APPS` 中加入 `"selection"`。
+3. 在主程序 `backend/config/urls.py` 中注册（必须在读取 `api.urls` 之前）：
+   ```python
+   from selection.api import register_routes as register_selection_routes
+
+   # 放在其它 api.add_router(...) 之后
+   register_selection_routes(api)
+   ```
+   这样接口会挂在 `/api/v1/selection/...`，并复用主程序的 JWT、统一信封和错误处理。
+   如果不想改主程序 `api`，也可以单独挂载：
    ```python
    path("api/selection/", include("selection.urls")),
    ```
+   此时路径是 `/api/selection/...`，鉴权/信封仍会自动检测主程序。
 4. 执行：
    ```bash
    python manage.py migrate
    ```
-   会创建 7 张 `sel_*` 表（6 张遴选评分表 + `sel_publicity` 公示表）。
+   会创建 7 张 `sel_*` 表（6 张遴选评分表 + `sel_publicity` 公示表）。重复执行是安全的。
 5. 主程序需要安装 `django-ninja` 和 `openpyxl`（本模块的 `requirements.txt` 已固定版本范围）：
    ```bash
    python -m pip install "django-ninja>=1.6,<2.0" "openpyxl>=3.1,<4"
    ```
    > 注意：主程序成员5的代码使用了 `from ninja import Status`，要求 django-ninja >= 1.6。不要把本模块依赖固定回 1.3，否则会降级同一环境中的 django-ninja，导致主程序启动时报 `ImportError: cannot import name 'Status' from 'ninja'`。
-   如果主程序本身也提供 Ninja API，可以保留本模块独立的 `NinjaAPI` 实例，也可以把 `selection.api.router` 挂到主程序的 `NinjaAPI` 上。
 6. 如果主程序已有同名 `selection` App，请重命名本 App 并同步修改 import（或把本 App 作为子模块放入一个独立命名空间）。
+
+并入后默认行为（`SELECTION_*=auto`）：
+
+| 能力 | 自动选择 |
+|---|---|
+| 鉴权 | 导入 `apps.common.authentication.JWTAuth`，管理接口需要主程序登录令牌；门户公示 GET 仍然公开 |
+| 响应信封 | 主程序 `{code:"OK",message:"成功",data,requestId}` |
+| 分页 | 主程序 `{items,page,pageSize,total}` |
+| 评分球员档案 | 读取成员4 `RosterItem`（只取 `APPROVED` 报名单） |
+| 公示数据源 | 读取成员4 `Enrollment/RosterItem/TeamCoach/Team/Person` |
+| CORS | 由主程序 `apps.common.middleware.CorsMiddleware` 处理，本模块的 CORS 中间件不安装 |
 
 ### 8.2 接入成员4的球员档案
 
@@ -605,9 +650,13 @@ SELECTION_PUBLICITY_SOURCE_CLIENT = (
 
 ```python
 class SelectionArchiveClient(ABC):
-    def get_candidate(self, candidate_id: int) -> SelectionCandidate | None: ...
+    def get_candidate(
+        self, candidate_id: str, event_id: str | None = None
+    ) -> SelectionCandidate | None: ...
     def list_candidates(self, group_type: str) -> list[SelectionCandidate]: ...
 ```
+
+> `candidate_id` 是不透明字符串，可能是成员4的 `RosterItem.id`，也可能是人员 ID；`event_id` 已由请求传入，适配器可用它限定赛事。返回值里的 `SelectionCandidate.candidate_id` 会被规范化后写库，所以按名单 ID 和按人员 ID 录入同一球员不会产生两条评分。
 
 在主程序中实现它，例如：
 
@@ -617,13 +666,13 @@ from apps.players.models import Player
 
 
 class PlayerArchiveClient(SelectionArchiveClient):
-    def get_candidate(self, candidate_id):
+    def get_candidate(self, candidate_id, event_id=None):
         player = Player.objects.filter(pk=candidate_id).first()
         if not player:
             return None
         return SelectionCandidate(
-            candidate_id=player.id,
-            event_id=player.event_id,
+            candidate_id=str(player.id),
+            event_id=str(player.event_id),
             name=player.name,
             team_name=player.team.name if player.team else "",
             group_type=player.group_type,       # HIGHER / MIDDLE / PRIMARY
@@ -648,9 +697,11 @@ SELECTION_ARCHIVE_CLIENT = "apps.players.services.PlayerArchiveClient"
 
 ### 8.3 接入成员2的登录用户
 
-本模块需要记录 `created_by` / `updated_by` / `generated_by`。有两种方式：
+本模块需要记录 `created_by` / `updated_by` / `generated_by`，这些字段是字符串，主程序账号 ID `acc_...` 可以原样保存。
 
-**方式一（推荐）**：主程序已经使用 Django 登录系统，设置：
+**方式一（推荐，默认）**：并入主程序后 `SELECTION_CURRENT_USER_MODE=auto`，会优先读取主程序 JWT 认证后的 `request.auth` / `request.user`，不需要额外配置。
+
+**方式二**：Django Session 登录：
 
 ```python
 SELECTION_CURRENT_USER_MODE = "django"
@@ -658,32 +709,41 @@ SELECTION_CURRENT_USER_MODE = "django"
 
 此时会读取 `request.user.id`。
 
-**方式二**：自定义函数：
+**方式三**：自定义函数：
 
 ```python
 # apps/accounts/utils.py
 def get_current_user_id(request):
-    return request.user.id if request.user.is_authenticated else 0
+    account = getattr(request, "auth", None) or getattr(request, "user", None)
+    return str(getattr(account, "id", "") or "")
 ```
 
 ```python
-SELECTION_CURRENT_USER_MODE = "none"
 SELECTION_CURRENT_USER_PROVIDER = "apps.accounts.utils.get_current_user_id"
 ```
 
-独立演示默认使用 `X-User-Id` 请求头，**只适合本地演示，不能用于正式环境**。
+独立演示默认使用 `X-User-Id` 请求头（`SELECTION_CURRENT_USER_MODE=auto` 会在没有主程序登录信息时回退到它），**只适合本地演示，不能用于正式环境**。
 
 ### 8.4 接入成员5的赛事
 
 所有评分、结果和公示都带 `event_id`。前端调用时传当前赛事 ID；档案适配器返回的 `SelectionCandidate.event_id` 或 `PublicitySourceRecord.event_id` 也会被校验，不一致会返回 400。
 
-### 8.5 权限与 CSRF
+### 8.5 权限、鉴权模式与 CORS
 
-- 本模块的 `NinjaAPI` 没有配置 `auth`，与独立演示一致；并入主程序后必须补上权限校验。
-- 建议用 Ninja 的 `auth`（例如 `HttpBearer`）统一校验成员2签发的登录凭证，或在中间件/反向代理层做角色校验，也可以用 Ninja 的 `Router` 级 `auth` 只保护管理类接口。
-- 公示的 `POST /publicity/`、`/publicity/batch/`、`/publicity/<id>/cancel/` 属于管理操作，必须加管理员/赛事运营权限；门户的 `GET` 列表和详情可以公开。
-- django-ninja 的 `NinjaAPI` 默认 `csrf=False`，本模块保持该默认值，便于接口工具直接调用。如果主程序使用 Session 登录并希望沿用 CSRF 防护，创建 API 时传 `csrf=True`；纯 Token 鉴权的前后端分离场景可以继续保持 `csrf=False`。
-- 如果前后端不同源，安装 `django-cors-headers` 并按 `config/settings.py` 底部注释配置；生产环境不要 `CORS_ALLOW_ALL_ORIGINS=True`。
+`selection/auth.py` 提供 `SelectionAuth`，所有管理接口默认继承：
+
+| `SELECTION_AUTH_MODE` | 行为 |
+|---|---|
+| `auto`（默认） | 主程序存在 `apps.common.authentication.JWTAuth` 时强制 JWT；独立运行时开放（审计使用 `X-User-Id`） |
+| `main` | 强制主程序 JWT；缺少主程序时启动/请求直接报配置错误，不会静默放行 |
+| `none` | 关闭鉴权，仅用于自动化测试或本地工具 |
+| `header` | 独立部署，审计身份只取 `X-User-Id` |
+
+- 门户公开接口 `GET /publicity/`、`GET /publicity/cities/`、`GET /publicity/<id>/` 显式 `auth=None`，无需登录。
+- 其余接口（模板、评分、结果、公示管理/发布/取消）并入主程序后需要成员2签发的 JWT。
+- 主程序现有的角色权限（如 `selectionGenerate`）由主程序鉴权层负责；本模块只保证“未登录不能调用管理接口”。
+- 独立运行时自带 `selection.middleware.SelectionCorsMiddleware`，默认放行 Vite 的 `5173` 和 React 的 `3000`；可用 `SELECTION_CORS_ORIGINS` 覆盖。并入主程序后改用主程序的 `apps.common.middleware.CorsMiddleware`，本中间件不安装。
+- 生产环境把 `SELECTION_CORS_ALLOW_ALL` 保持为 `0`（默认），按实际前端域名填写 `SELECTION_CORS_ORIGINS`。
 
 ### 8.6 时区
 
@@ -722,7 +782,7 @@ python manage.py migrate
 python manage.py test selection
 ```
 
-当前共 **30 个测试**，覆盖：
+当前共 **33 个测试**（独立运行时 3 个主程序适配器测试自动跳过），覆盖：
 
 - 加权总分、权重归一化、非 100 满分、综合分、单轮回退
 - 模板创建、列表、修改、组别/轮次不可变、权重之和校验、重复维度
@@ -735,8 +795,13 @@ python manage.py test selection
 - 取消后门户列表/详情立即不可见、CMS 仍可审计、重新公示
 - 按组别/市州/类型查询、市州选项、批量公示幂等
 - 公示参数校验（未知类型、档案不存在、赛事不匹配）
+- 字符串赛事/球员 ID、`UNIVERSITY` 组别别名
+- 并入主程序后的真实适配器（只取 `APPROVED` 报名单、主教练优先、DRAFT 不外泄）
 
-本机运行结果：`Ran 30 tests ... OK`。
+本机运行结果：
+
+- 独立运行：`Ran 33 tests ... OK (skipped=3)`
+- 并入临时主程序后：`Ran 55 tests ... OK`（含主程序原有测试，未修改他人代码）
 
 ---
 
@@ -754,21 +819,22 @@ python manage.py test selection
 | 复选结果是否必须有初选成绩 | 不强制；缺失时用复选总分 | `selection/services/results.py` |
 | 初选结果是否要求复选成绩 | 不要求 | `selection/services/results.py` |
 | 公示字段白名单 | 运动员 7 项、教练员 6 项、球队 3 项 | `SELECTION_PUBLICITY_FIELD_WHITELIST` |
-| 公示数据源 | demo（演示报名档案） | `SELECTION_PUBLICITY_SOURCE_MODE` / `SELECTION_PUBLICITY_SOURCE_CLIENT` |
+| 公示数据源 | `auto`（主程序存在时读成员4报名表，否则 demo） | `SELECTION_PUBLICITY_SOURCE_MODE` / `SELECTION_PUBLICITY_SOURCE_CLIENT` |
 
 ---
 
 ## 12. 已知边界与注意事项
 
-1. **演示档案是假的**：`DemoSelectionArchiveClient` 只有 45 名模拟球员；`DemoPublicitySourceClient` 只有 45 名运动员、15 名教练员、9 支球队（event_id=1）。正式联调必须替换为成员4的档案/报名实现。
-2. **演示用户是请求头**：`X-User-Id` 可伪造，只用于本地演示。正式环境请用成员2的登录用户。
-3. **没有做登录/权限**：这是成员2的职责；并入主程序时请给接口加权限。
+1. **演示档案是假的**：`DemoSelectionArchiveClient` 只有 45 名模拟球员；`DemoPublicitySourceClient` 只有 45 名运动员、15 名教练员、9 支球队（event_id="1"）。并入主程序后 `auto` 会自动切到成员4的真实表，不需要改业务代码；只有显式设置 `demo` 才继续用演示数据。
+2. **演示用户是请求头**：`X-User-Id` 可伪造，只用于本地演示。并入主程序且 `SELECTION_AUTH_MODE=auto` 时会强制主程序 JWT。
+3. **登录/角色权限**：本模块已接入主程序 JWT 鉴权（未登录不能调用管理接口），但“赛事运营/管理员角色”细粒度权限仍由成员2的主程序鉴权层负责。
 4. **SQLite 适合演示**：正式多用户并发请使用 MySQL；评分修改已做乐观锁，但 SQLite 的并发能力有限。
-5. **结果版本不会自动清理**：每次生成都会保留历史批次，便于追溯。如果数据量大，可在主程序里加定期归档策略。
-6. **初选/复选模板独立**：同一组别的初选和复选可以有不同的维度和权重；评分明细保存的是录入时的快照。
-7. **公示只存脱敏快照**：`sel_publicity` 不保存身份证原文，只保存 `id_card_masked` 和白名单字段。如果成员4的报名表需要保留原文，请留在成员4的表中，不要传给本模块。
-8. **取消不是删除**：取消公示只把 `status` 改为 `CANCELLED`，记录仍保留用于审计；公开接口会自动过滤掉。
-9. **Windows 控制台中文乱码**：如果 `seed_demo` 的输出在 cmd 中显示乱码，是终端编码问题，数据库内容本身是 UTF-8；可在 PowerShell 或 VS Code 终端中运行，或先执行 `chcp 65001`。
+5. **主程序 ID 类型**：成员4/5 使用不透明字符串 ID（`evt_...`、`rst_...`、`acc_...`），本模块已按字符串存储；但 `Person` / `Team` 主键目前是自增整数，适配器会自动转成字符串。如果成员4后续把人员/球队主键也改成不透明 ID，需要同步调整 `main_adapters.py` 的 `_get_person/_get_team` 查询。
+6. **结果版本不会自动清理**：每次生成都会保留历史批次，便于追溯。如果数据量大，可在主程序里加定期归档策略。
+7. **初选/复选模板独立**：同一组别的初选和复选可以有不同的维度和权重；评分明细保存的是录入时的快照。
+8. **公示只存脱敏快照**：`sel_publicity` 不保存身份证原文，只保存 `id_card_masked` 和白名单字段。如果成员4的报名表需要保留原文，请留在成员4的表中，不要传给本模块。
+9. **取消不是删除**：取消公示只把 `status` 改为 `CANCELLED`，记录仍保留用于审计；公开接口会自动过滤掉。
+10. **Windows 控制台中文乱码**：如果 `seed_demo` 的输出在 cmd 中显示乱码，是终端编码问题，数据库内容本身是 UTF-8；可在 PowerShell 或 VS Code 终端中运行，或先执行 `chcp 65001`。
 
 ---
 

@@ -7,14 +7,22 @@ project (DRF, Ninja or plain Django views).
 """
 
 import logging
-from typing import Any
+from typing import Any, Union
 
 from django.http import HttpRequest, JsonResponse
 from ninja import Body, NinjaAPI, Router, Schema
 from ninja.errors import ValidationError
 from ninja.renderers import JSONRenderer
 
-from .common import BusinessError, fail, ok, parse_int, parse_page
+from .auth import SelectionAuth
+from .common import (
+    BusinessError,
+    fail,
+    ok,
+    parse_event_id,
+    parse_int,
+    parse_page,
+)
 from .enums import GroupType, RoundType
 from .services import excel as excel_service
 from .services import publicity as publicity_service
@@ -27,11 +35,16 @@ logger = logging.getLogger("selection")
 
 
 class ResponseEnvelope(Schema):
-    """Every JSON endpoint keeps the original unified envelope."""
+    """Supported envelopes.
 
-    code: int = 0
+    Standalone: ``{code: 0, message: "ok", data}``.
+    Main app:  ``{code: "OK", message: "成功", data, requestId}``.
+    """
+
+    code: Union[int, str] = 0
     message: str = "ok"
     data: Any = None
+    requestId: str | None = None
 
 
 class UTF8JSONRenderer(JSONRenderer):
@@ -45,7 +58,10 @@ api = NinjaAPI(
     urls_namespace="selection",
     renderer=UTF8JSONRenderer(),
 )
-router = Router()
+selection_auth = SelectionAuth()
+
+# 所有管理接口默认继承此鉴权；公开的门户公示接口在装饰器里显式 auth=None。
+router = Router(auth=selection_auth)
 api.add_router("", router)
 
 
@@ -77,6 +93,26 @@ def handle_unexpected_error(request: HttpRequest, exc: Exception):
     )
 
 
+try:  # Only present when selection is merged into the main backend.
+    from apps.common.errors import ApiError as MainApiError
+    from apps.common.errors import error_envelope as main_error_envelope
+except Exception:  # pragma: no cover - standalone deployment
+    MainApiError = None
+    main_error_envelope = None
+
+
+if MainApiError is not None:
+
+    @api.exception_handler(MainApiError)
+    def handle_main_api_error(request: HttpRequest, exc: MainApiError):
+        """Main JWT/auth raises apps.common.errors.ApiError."""
+        return JsonResponse(
+            main_error_envelope(exc.code, exc.message, exc.data),
+            status=exc.status,
+            json_dumps_params={"ensure_ascii": False},
+        )
+
+
 # ---------------------------------------------------------------------------
 # Query helpers
 # ---------------------------------------------------------------------------
@@ -89,11 +125,9 @@ def _query(request, *names):
 
 
 def _parse_score_query(request):
-    event_id = parse_int(
+    event_id = parse_event_id(
         _query(request, "event_id", "eventId"),
         "event_id",
-        required=True,
-        min_value=1,
     )
     group_type = GroupType.parse(
         _query(request, "group_type", "groupType")
@@ -105,11 +139,9 @@ def _parse_score_query(request):
 
 
 def _parse_result_query(request):
-    event_id = parse_int(
+    event_id = parse_event_id(
         _query(request, "event_id", "eventId"),
         "event_id",
-        required=True,
-        min_value=1,
     )
     group_type = GroupType.parse(
         _query(request, "group_type", "groupType")
@@ -118,11 +150,9 @@ def _parse_result_query(request):
 
 
 def _publicity_event_id(request):
-    return parse_int(
+    return parse_event_id(
         _query(request, "event_id", "eventId"),
         "event_id",
-        required=True,
-        min_value=1,
     )
 
 
@@ -281,7 +311,7 @@ def result_export(request):
 # ---------------------------------------------------------------------------
 # Registration publicity
 # ---------------------------------------------------------------------------
-@router.get("/publicity/", response=ResponseEnvelope)
+@router.get("/publicity/", response=ResponseEnvelope, auth=None)
 def list_publicity(request):
     event_id = _publicity_event_id(request)
     page, size = parse_page(request)
@@ -332,7 +362,7 @@ def manage_publicity_detail(request, record_id: int):
     return ok(publicity_service.get_management_detail(record_id))
 
 
-@router.get("/publicity/cities/", response=ResponseEnvelope)
+@router.get("/publicity/cities/", response=ResponseEnvelope, auth=None)
 def publicity_cities(request):
     event_id = _publicity_event_id(request)
     return ok(
@@ -353,7 +383,7 @@ def batch_publish_publicity(request, payload: dict = Body(...)):
     )
 
 
-@router.get("/publicity/{record_id}/", response=ResponseEnvelope)
+@router.get("/publicity/{record_id}/", response=ResponseEnvelope, auth=None)
 def publicity_detail(request, record_id: int):
     return ok(publicity_service.get_public_detail(record_id))
 
@@ -367,3 +397,19 @@ def cancel_publicity(request, record_id: int, payload: dict | None = Body(None))
             record_id, payload or {}, get_current_user_id(request)
         )
     )
+
+
+def register_routes(target_api, prefix="selection"):
+    """Mount member6 on the main project's existing NinjaAPI.
+
+    Call this in ``backend/config/urls.py`` **before** ``api.urls`` is read::
+
+        from selection.api import register_routes
+        register_routes(api)
+
+    The main project keeps its own JWT auth, envelope and error handling; this
+    function only adds the router and the module's ``BusinessError`` handler.
+    """
+    target_api.add_router(prefix, router, tags=["selection"])
+    target_api.exception_handler(BusinessError)(handle_business_error)
+    return router

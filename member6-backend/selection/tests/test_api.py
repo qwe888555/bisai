@@ -1,15 +1,27 @@
 import json
 from io import BytesIO
 
-from django.test import Client, TestCase
+from django.test import Client, TestCase, override_settings
 from openpyxl import load_workbook
 
 from selection.models import ResultBatch
 
-TEMPLATE_PATH = "/api/selection/templates/"
-SCORE_PATH = "/api/selection/scores/"
+from .utils import api_prefix
+
+# Standalone: /api/selection/...  Merged: /api/v1/selection/...
+API_PREFIX = api_prefix()
+
+TEMPLATE_PATH = f"{API_PREFIX}templates/"
+SCORE_PATH = f"{API_PREFIX}scores/"
+RESULTS_PATH = f"{API_PREFIX}results/"
 
 
+@override_settings(
+    SELECTION_AUTH_MODE="none",
+    SELECTION_ENVELOPE_MODE="native",
+    SELECTION_ARCHIVE_MODE="demo",
+    SELECTION_PUBLICITY_SOURCE_MODE="demo",
+)
 class SelectionApiTests(TestCase):
     def setUp(self):
         self.client = Client()
@@ -308,7 +320,7 @@ class SelectionApiTests(TestCase):
         summary = self.body(response)["data"]
         self.assertEqual(
             [item["candidate_id"] for item in summary],
-            [10001, 10002, 10003],
+            ["10001", "10002", "10003"],
         )
         self.assertEqual([item["rank_no"] for item in summary], [1, 2, 3])
 
@@ -335,7 +347,7 @@ class SelectionApiTests(TestCase):
             },
         )
         summary = self.body(response)["data"]
-        self.assertEqual(summary[0]["candidate_id"], 10002)
+        self.assertEqual(summary[0]["candidate_id"], "10002")
         self.assertEqual(summary[0]["total_score"], 100.0)
 
         response = self.get_json(
@@ -400,7 +412,7 @@ class SelectionApiTests(TestCase):
         summary = self.body(response)["data"]
         self.assertEqual(summary[0]["total_score"], 80.0)
         self.assertEqual(summary[1]["total_score"], 80.0)
-        self.assertEqual(summary[0]["candidate_id"], 10001)
+        self.assertEqual(summary[0]["candidate_id"], "10001")
 
     def test_group_alias_in_query(self):
         template = self.create_template()
@@ -415,6 +427,19 @@ class SelectionApiTests(TestCase):
             **self.headers,
         )
         self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(self.body(response)["data"]), 1)
+
+        # The main backend calls this category "UNIVERSITY"; it maps to HIGHER.
+        response = self.client.get(
+            f"{SCORE_PATH}summary/",
+            data={
+                "event_id": 1,
+                "group_type": "UNIVERSITY",
+                "round": "INITIAL",
+            },
+            **self.headers,
+        )
+        self.assertEqual(response.status_code, 200, response.content)
         self.assertEqual(len(self.body(response)["data"]), 1)
 
     # ------------------------------------------------------------------
@@ -465,7 +490,7 @@ class SelectionApiTests(TestCase):
         initial_scores = self._seed_two_rounds()
 
         response = self.post_json(
-            "/api/selection/results/generate/",
+            f"{RESULTS_PATH}generate/",
             {
                 "event_id": 1,
                 "group_type": "HIGHER",
@@ -482,7 +507,7 @@ class SelectionApiTests(TestCase):
         self.assertEqual(len(batch["items"]), 2)
         self.assertEqual(
             [item["candidate_id"] for item in batch["items"]],
-            [10001, 10002],
+            ["10001", "10002"],
         )
         self.assertAlmostEqual(
             batch["items"][0]["composite_score"], 89.0
@@ -495,14 +520,14 @@ class SelectionApiTests(TestCase):
         )
 
         response = self.get_json(
-            "/api/selection/results/latest/",
+            f"{RESULTS_PATH}latest/",
             {"event_id": 1, "group_type": "HIGHER"},
         )
         self.assertEqual(response.status_code, 200)
         self.assertEqual(self.body(response)["data"]["version_no"], 1)
 
         response = self.get_json(
-            "/api/selection/results/export/",
+            f"{RESULTS_PATH}export/",
             {"event_id": 1, "group_type": "HIGHER"},
         )
         self.assertEqual(response.status_code, 200)
@@ -526,20 +551,20 @@ class SelectionApiTests(TestCase):
         self.assertEqual(response.status_code, 200, response.content)
 
         response = self.get_json(
-            "/api/selection/results/latest/",
+            f"{RESULTS_PATH}latest/",
             {"event_id": 1, "group_type": "HIGHER"},
         )
         self.assertTrue(self.body(response)["data"]["stale"])
 
         response = self.get_json(
-            "/api/selection/results/export/",
+            f"{RESULTS_PATH}export/",
             {"event_id": 1, "group_type": "HIGHER"},
         )
         self.assertEqual(response.status_code, 409)
         self.assertEqual(self.body(response)["code"], 409)
 
         response = self.post_json(
-            "/api/selection/results/generate/",
+            f"{RESULTS_PATH}generate/",
             {
                 "event_id": 1,
                 "group_type": "HIGHER",
@@ -558,7 +583,7 @@ class SelectionApiTests(TestCase):
         self.assertFalse(old_batch.active)
 
         response = self.get_json(
-            "/api/selection/results/batches/",
+            f"{RESULTS_PATH}batches/",
             {"event_id": 1, "group_type": "HIGHER"},
         )
         history = self.body(response)["data"]
@@ -586,7 +611,7 @@ class SelectionApiTests(TestCase):
         )
 
         response = self.post_json(
-            "/api/selection/results/generate/",
+            f"{RESULTS_PATH}generate/",
             {
                 "event_id": 1,
                 "group_type": "HIGHER",
@@ -608,7 +633,7 @@ class SelectionApiTests(TestCase):
         template = self.create_template(round_code="INITIAL")
         self.create_score(template["id"], 10001)
         response = self.post_json(
-            "/api/selection/results/generate/",
+            f"{RESULTS_PATH}generate/",
             {
                 "event_id": 1,
                 "group_type": "HIGHER",

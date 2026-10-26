@@ -10,6 +10,7 @@ from ..common import (
     BusinessError,
     get_field,
     parse_decimal,
+    parse_event_id,
     parse_int,
     to_datetime_str,
     to_float,
@@ -99,10 +100,9 @@ def result_batch_detail(batch, include_items=True):
 
 
 def generate_result(data, user_id):
-    event_id = parse_int(
+    event_id = parse_event_id(
         get_field(data, "event_id", "eventId", required=True, label="赛事ID"),
         "赛事ID",
-        min_value=1,
     )
     group_type = GroupType.parse(get_field(data, "group_type", "groupType"))
     result_round = RoundType.parse(

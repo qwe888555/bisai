@@ -1,10 +1,10 @@
 # 省级中小学足球系统 · 成员6后端 API 文档
 
 > 模块：T6-03 遴选评分（模块 6.2） + T6-04 报名公示（模块 7.3）  
-> 版本：1.0.0  
-> 更新时间：2026-10-23  
+> 版本：1.1.0  
+> 更新时间：2026-10-26  
 > 技术基线：Python > 3.10.9、Django 5.2 LTS、django-ninja >=1.6,<2.0（与主程序一致）  
-> 代码目录：`football-systerm/`
+> 代码目录：`member6-backend/selection/`
 
 ---
 
@@ -27,23 +27,26 @@
 python -m pip install -r requirements.txt
 python manage.py migrate
 python manage.py seed_demo
-python manage.py runserver
+python manage.py runserver 8001
 ```
+
+> 独立运行使用 8001，避免与主程序默认的 8000 冲突。
 
 ### 2.2 基础地址
 
 ```text
-http://127.0.0.1:8000/api/selection
+独立运行：  http://127.0.0.1:8001/api/selection
+并入主程序：http://127.0.0.1:8000/api/v1/selection
 ```
 
 ### 2.3 自动接口文档
 
 项目启动后可访问：
 
-| 类型 | 地址 |
-|---|---|
-| Swagger UI | `http://127.0.0.1:8000/api/selection/docs` |
-| OpenAPI JSON | `http://127.0.0.1:8000/api/selection/openapi.json` |
+| 类型 | 独立运行 | 并入主程序 |
+|---|---|---|
+| Swagger UI | `http://127.0.0.1:8001/api/selection/docs` | `http://127.0.0.1:8000/api/v1/docs` |
+| OpenAPI JSON | `http://127.0.0.1:8001/api/selection/openapi.json` | `http://127.0.0.1:8000/api/v1/openapi.json` |
 
 ### 2.4 可执行请求示例
 
@@ -69,21 +72,35 @@ http://127.0.0.1:8000/api/selection
   - `initial_weight` / `initialWeight`
 - 响应字段统一使用 `snake_case`。
 
-### 3.2 演示身份
+### 3.2 身份与鉴权
 
-独立演示环境通过请求头记录操作人：
+**独立演示**：通过请求头记录操作人；没有令牌时所有接口可用。
 
 ```http
 X-User-Id: 1
 ```
 
-该值只写入 `created_by`、`updated_by`、`published_by`、`cancelled_by`、`generated_by` 等审计字段，默认值为 `0`。
+该值只写入 `created_by`、`updated_by`、`published_by`、`cancelled_by`、`generated_by` 等审计字段。
 
-> 该请求头可以伪造，只适合本地演示。并入主程序后应改为成员2的登录用户或 Token 鉴权。
+**并入主程序**：`SELECTION_AUTH_MODE=auto` 会自动导入主程序 `apps.common.authentication.JWTAuth`，管理接口需要：
+
+```http
+Authorization: Bearer <成员2签发的 accessToken>
+```
+
+未登录返回 HTTP 401 + `{"code":"UNAUTHENTICATED",...}`。以下门户接口无需登录：
+
+- `GET /publicity/`
+- `GET /publicity/cities/`
+- `GET /publicity/<id>/`
+
+> `X-User-Id` 可伪造，只适合本地演示，正式环境不要作为身份凭证。
 
 ### 3.3 统一响应结构
 
-所有 JSON 接口返回统一结构：
+响应格式随部署方式自动切换（`SELECTION_ENVELOPE_MODE=auto`）。
+
+**独立运行**：
 
 ```json
 {
@@ -93,7 +110,7 @@ X-User-Id: 1
 }
 ```
 
-失败时：
+失败时 `code` 与 HTTP 状态码一致：
 
 ```json
 {
@@ -103,7 +120,18 @@ X-User-Id: 1
 }
 ```
 
-**HTTP 状态码与 `code` 保持一致。**
+**并入主程序**：
+
+```json
+{
+  "code": "OK",
+  "message": "成功",
+  "data": {},
+  "requestId": "req_..."
+}
+```
+
+失败时 `code` 使用主程序错误码（如 `INVALID_ARGUMENT`、`NOT_FOUND`、`STATE_CONFLICT`、`UNAUTHENTICATED`），HTTP 状态码与主程序契约一致。
 
 ### 3.4 状态码约定
 
@@ -125,7 +153,7 @@ X-User-Id: 1
 | `page` | 1 | 最小 1 |
 | `size` | 10 | 最小 1，最大 100，超过 100 按 100 处理 |
 
-分页返回：
+独立运行分页返回：
 
 ```json
 {
@@ -136,16 +164,29 @@ X-User-Id: 1
 }
 ```
 
+并入主程序后自动使用主程序分页字段：
+
+```json
+{
+  "items": [],
+  "page": 1,
+  "pageSize": 10,
+  "total": 0
+}
+```
+
 ### 3.6 时间与数字
 
 - 时间格式：`YYYY-MM-DD HH:MM:SS`，时区为 `Asia/Shanghai`。
 - 分数、权重、综合分等按浮点数返回，保留两位小数。
 - `max_score`、`weight`、`score` 的入库精度为两位小数。
 
-### 3.7 演示环境的 CSRF 与权限
+### 3.7 CSRF、CORS 与权限
 
-- `NinjaAPI` 使用默认 `csrf=False`，便于独立演示和接口工具直接调用。
-- 当前没有配置登录鉴权；并入主程序后必须为管理类接口补充权限。
+- `NinjaAPI` 使用默认 `csrf=False`，便于前后端分离和接口工具直接调用。
+- 独立运行自带 `SelectionCorsMiddleware`，默认放行 `localhost:5173`、`localhost:3000`；可用 `SELECTION_CORS_ORIGINS` 覆盖。
+- 并入主程序后由主程序 `apps.common.middleware.CorsMiddleware` 处理 CORS。
+- 管理接口已接入主程序 JWT；赛事运营/管理员角色权限由成员2的鉴权层负责。
 - 正式环境不要把演示用的 `X-User-Id` 当作身份凭证。
 
 ---
@@ -156,9 +197,11 @@ X-User-Id: 1
 
 | 代码 | 名称 | 可接受的别名 |
 |---|---|---|
-| `HIGHER` | 高校组 | `higher`、`高校`、`大学组`、`大学` |
+| `HIGHER` | 高校组 | `higher`、`UNIVERSITY`、`university`、`高校`、`大学组`、`大学` |
 | `MIDDLE` | 中学组 | `middle`、`中学`、`初中组`、`初中`、`高中组`、`高中` |
 | `PRIMARY` | 小学组 | `primary`、`小学`、`小学组` |
+
+> 主程序 `EventGroup.category` 用 `UNIVERSITY` 表示高校组；传入 `UNIVERSITY` 会统一按 `HIGHER` 处理，响应中的 `group_type` 仍为 `HIGHER`。
 
 ### 4.2 轮次 `round` / `result_round`
 
@@ -377,7 +420,7 @@ GET /scores/
 
 | 参数 | 必填 | 说明 |
 |---|---|---|
-| `event_id` | 是 | 赛事 ID，最小 1 |
+| `event_id` | 是 | 赛事 ID，不透明字符串（演示为 `"1"`，主程序为 `evt_...`） |
 | `group_type` | 是 | 组别 |
 | `round` | 是 | 轮次 |
 | `keyword` | 否 | 按球员姓名或球队模糊搜索，最长 50 字符 |
@@ -410,11 +453,11 @@ POST /scores/
 
 | 字段 | 类型 | 必填 | 说明 |
 |---|---|---|---|
-| `event_id` | integer | 是 | 赛事 ID |
+| `event_id` | string | 是 | 赛事 ID，最长 64，不透明字符串 |
 | `group_type` | string | 是 | 组别 |
 | `round` | string | 是 | 轮次 |
 | `template_id` | integer | 是 | 评分模板 ID |
-| `candidate_id` | integer | 是 | 球员档案 ID |
+| `candidate_id` | string | 是 | 球员档案 ID / 报名名单 ID，最长 64 |
 | `scores` | array | 是 | 维度得分数组 |
 | `scores[].dimension_code` | string | 是 | 维度编码，必须与模板一致 |
 | `scores[].score` | number | 是 | 维度得分，0 到该维度满分 |
@@ -432,11 +475,11 @@ POST /scores/
 
 ```json
 {
-  "event_id": 1,
+  "event_id": "1",
   "group_type": "HIGHER",
   "round": "INITIAL",
   "template_id": 1,
-  "candidate_id": 10001,
+  "candidate_id": "10001",
   "scores": [
     {"dimension_code": "TECH", "score": 92},
     {"dimension_code": "MATCH", "score": 88},
@@ -600,7 +643,7 @@ POST /results/generate/
 
 | 字段 | 类型 | 必填 | 默认值 | 说明 |
 |---|---|---|---|---|
-| `event_id` | integer | 是 | - | 赛事 ID |
+| `event_id` | string | 是 | - | 赛事 ID（不透明字符串，最长 64） |
 | `group_type` | string | 是 | - | 组别 |
 | `result_round` | string | 否 | `FINAL` | 结果依据轮次 |
 | `quota` | integer | 否 | 11 | 遴选名额，最小 1 |
@@ -624,7 +667,7 @@ POST /results/generate/
 
 ```json
 {
-  "event_id": 1,
+  "event_id": "1",
   "group_type": "HIGHER",
   "result_round": "FINAL",
   "quota": 11,
@@ -778,7 +821,7 @@ POST /publicity/
 
 | 字段 | 类型 | 必填 | 说明 |
 |---|---|---|---|
-| `event_id` | integer | 是 | 赛事 ID |
+| `event_id` | string | 是 | 赛事 ID（不透明字符串，最长 64） |
 | `publicity_type` | string | 是 | `ATHLETE` / `COACH` / `TEAM` |
 | `source_id` | string | 是 | 成员4报名/档案记录 ID |
 
@@ -802,7 +845,7 @@ POST /publicity/
 
 ```json
 {
-  "event_id": 1,
+  "event_id": "1",
   "publicity_type": "ATHLETE",
   "source_id": "10001"
 }
@@ -933,7 +976,7 @@ POST /publicity/batch/
 
 | 字段 | 类型 | 必填 | 说明 |
 |---|---|---|---|
-| `event_id` | integer | 是 | 赛事 ID |
+| `event_id` | string | 是 | 赛事 ID（不透明字符串，最长 64） |
 | `group_type` | string | 否 | 组别 |
 | `publicity_type` | string | 否 | 公示类型 |
 | `city` | string | 否 | 市州 |
@@ -949,7 +992,7 @@ POST /publicity/batch/
 
 ```json
 {
-  "event_id": 1,
+  "event_id": "1",
   "group_type": "MIDDLE",
   "publicity_type": "COACH"
 }
@@ -1070,21 +1113,21 @@ GET /publicity/manage/{record_id}/
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | `id` | integer | 评分 ID |
-| `event_id` | integer | 赛事 ID |
+| `event_id` | string | 赛事 ID（不透明字符串） |
 | `group_type` | string | 组别代码 |
 | `group_type_label` | string | 组别中文名 |
 | `round` | string | 轮次代码 |
 | `round_label` | string | 轮次中文名 |
 | `template_id` | integer | 模板 ID |
-| `candidate_id` | integer | 球员档案 ID |
+| `candidate_id` | string | 球员档案 ID（不透明字符串） |
 | `candidate_name` | string | 球员姓名 |
 | `team_name` | string | 所属球队 |
 | `position` | string | 场上位置 |
 | `total_score` | number | 加权总分 |
 | `version` | integer | 乐观锁版本号 |
-| `created_by` | integer | 录入人 ID |
+| `created_by` | string | 录入人 ID |
 | `created_at` | string | 录入时间 |
-| `updated_by` | integer | 修改人 ID |
+| `updated_by` | string | 修改人 ID |
 | `updated_at` | string | 修改时间 |
 | `items` | array | 维度得分明细 |
 
@@ -1107,7 +1150,7 @@ GET /publicity/manage/{record_id}/
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | `id` | integer | 批次 ID |
-| `event_id` | integer | 赛事 ID |
+| `event_id` | string | 赛事 ID（不透明字符串） |
 | `group_type` | string | 组别代码 |
 | `group_type_label` | string | 组别中文名 |
 | `result_round` | string | 结果依据轮次 |
@@ -1119,7 +1162,7 @@ GET /publicity/manage/{record_id}/
 | `version_no` | integer | 结果版本号 |
 | `active` | boolean | 是否当前有效结果 |
 | `stale` | boolean | 是否已因评分变更而过期 |
-| `generated_by` | integer | 生成人 ID |
+| `generated_by` | string | 生成人 ID |
 | `generated_at` | string | 生成时间 |
 | `items` | array | 结果明细数组；历史批次接口中不返回 |
 | `item_count` | integer | 仅历史批次接口返回，表示明细数量 |
@@ -1129,7 +1172,7 @@ GET /publicity/manage/{record_id}/
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | `rank_no` | integer | 排名 |
-| `candidate_id` | integer | 球员档案 ID |
+| `candidate_id` | string | 球员档案 ID（不透明字符串） |
 | `candidate_name` | string | 球员姓名 |
 | `team_name` | string | 所属球队 |
 | `position` | string | 场上位置 |
@@ -1160,7 +1203,7 @@ GET /publicity/manage/{record_id}/
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | `id` | integer | 公示记录 ID |
-| `event_id` | integer | 赛事 ID |
+| `event_id` | string | 赛事 ID（不透明字符串） |
 | `group_type` | string | 组别代码 |
 | `group_type_label` | string | 组别中文名 |
 | `city` | string | 市州 |
@@ -1223,8 +1266,8 @@ GET /publicity/manage/{record_id}/
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | `source_id` | string | 成员4报名档案 ID |
-| `published_by` | integer | 公示操作人 ID |
-| `cancelled_by` | integer | 取消操作人 ID，未取消为 0 |
+| `published_by` | string | 公示操作人 ID |
+| `cancelled_by` | string | 取消操作人 ID，未取消为空字符串 |
 | `cancelled_at` | string/null | 取消时间 |
 | `cancel_reason` | string | 取消原因 |
 | `created_at` | string | 创建时间 |
@@ -1346,7 +1389,7 @@ python manage.py seed_demo --reset
 
 演示市州：`江城市`、`南湖市`、`东林市`。
 
-所有演示评分和公示数据属于 `event_id=1`。
+所有演示评分和公示数据属于 `event_id="1"`。接口中赛事 ID、球员 ID、报名档案 ID 一律按字符串传递。
 
 只生成模板：
 
@@ -1360,12 +1403,16 @@ python manage.py seed_demo --reset --templates-only
 
 ### 13.1 基本步骤
 
-1. 复制 `selection/` 到主程序根目录。
-2. 在 `INSTALLED_APPS` 中加入 `"selection"`。
-3. 在主程序 `urls.py` 中加入：
+1. **只复制 `selection/`** 到主程序 `backend/`（与 `apps/` 同级）；不要复制 `config/`、`manage.py`、`db.sqlite3`。
+2. 在主程序 `backend/config/settings.py` 的 `INSTALLED_APPS` 中加入 `"selection"`。
+3. 在主程序 `backend/config/urls.py` 中注册（必须在读取 `api.urls` 之前）：
    ```python
-   path("api/selection/", include("selection.urls")),
+   from selection.api import register_routes as register_selection_routes
+
+   register_selection_routes(api)
    ```
+   接口挂在 `/api/v1/selection/...`，复用主程序 JWT、统一信封和错误处理。
+   也可以单独挂载 `path("api/selection/", include("selection.urls"))`。
 4. 安装依赖：
    ```bash
    python -m pip install "django-ninja>=1.6,<2.0" "openpyxl>=3.1,<4"
@@ -1377,20 +1424,25 @@ python manage.py seed_demo --reset --templates-only
    ```
    会创建 7 张 `sel_*` 表。
 
-### 13.2 需要替换的适配器
+### 13.2 自动适配（默认，无需写代码）
 
-| 能力 | 当前演示实现 | 主程序应配置 |
-|---|---|---|
-| 球员档案 | `DemoSelectionArchiveClient` | `SELECTION_ARCHIVE_MODE=none` + `SELECTION_ARCHIVE_CLIENT` |
-| 报名档案 | `DemoPublicitySourceClient` | `SELECTION_PUBLICITY_SOURCE_MODE=none` + `SELECTION_PUBLICITY_SOURCE_CLIENT` |
-| 当前用户 | 读取 `X-User-Id` | `SELECTION_CURRENT_USER_MODE=django` 或自定义 provider |
+| 能力 | `auto` 下的行为 |
+|---|---|
+| 球员档案 | 读取成员4 `RosterItem`，只取 `Enrollment.status=APPROVED` |
+| 报名档案 | 读取 `Enrollment/RosterItem/TeamCoach/Team/Person` |
+| 鉴权 | 自动使用 `apps.common.authentication.JWTAuth` |
+| 响应/分页 | 自动使用主程序信封和 `{items,page,pageSize,total}` |
+| 当前用户 | 优先 `request.auth` / `request.user`，其次 `X-User-Id` |
+
+需要自定义时，可用 `SELECTION_ARCHIVE_CLIENT` / `SELECTION_PUBLICITY_SOURCE_CLIENT` / `SELECTION_CURRENT_USER_PROVIDER` 指向自己的实现，并把对应 `MODE` 设为 `main`。
 
 ### 13.3 权限建议
 
 - 模板、评分、结果生成/导出：建议限制为管理员或赛事运营角色。
 - 公示发布、批量公示、取消公示：必须限制为管理员或赛事运营角色。
-- 门户公示列表和详情：可以公开。
+- 门户公示列表、详情、市州选项：公开（已显式 `auth=None`）。
 - 使用 Session 登录时，可在创建 `NinjaAPI` 时传 `csrf=True`；使用 Token 时可保持默认 `csrf=False`。
+- `SELECTION_AUTH_MODE=main` 可强制要求主程序 JWT，避免配置错误时静默放行。
 
 ---
 
@@ -1400,7 +1452,7 @@ python manage.py seed_demo --reset --templates-only
 python manage.py test selection
 ```
 
-当前共 30 个测试，覆盖：
+当前共 33 个测试（独立运行时 3 个主程序适配器测试自动跳过），覆盖：
 
 - 加权总分、综合分、同分排序；
 - 模板创建、修改、权重校验；
@@ -1410,12 +1462,15 @@ python manage.py test selection
 - 三类公示、字段白名单、身份证脱敏；
 - 取消后立即不可见、管理端审计、重新公示；
 - 组别/市州/类型查询、批量公示幂等；
-- 参数校验和错误码。
+- 参数校验和错误码；
+- 字符串赛事/球员 ID、`UNIVERSITY` 组别别名；
+- 并入主程序后的真实适配器（只取 `APPROVED`、主教练优先、DRAFT 不外泄）。
 
 本机验证结果：
 
 ```text
-Ran 30 tests ... OK
+独立运行：Ran 33 tests ... OK (skipped=3)
+并入主程序：Ran 55 tests ... OK
 System check identified no issues (0 silenced).
 No changes detected
 ```
@@ -1430,4 +1485,5 @@ No changes detected
 | D6 | 完成 T6-04 报名公示：公示、取消、查询、脱敏、白名单 |
 | 2026-10-21 | 升级 Django 5.2 LTS + django-ninja 1.3，保留原接口契约 |
 | 2026-10-26 | django-ninja 约束调整为 >=1.6,<2.0，与主程序统一，修复依赖降级导致的启动失败 |
+| 2026-10-26 | 赛事/球员 ID 改为字符串；自动复用主程序 JWT、信封、分页；自动读取成员4真实报名数据；新增 CORS 与 `UNIVERSITY` 别名；独立端口改为 8001 |
 | 2026-10-23 | 整理正式 API 文档 |

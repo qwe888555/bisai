@@ -11,7 +11,9 @@ from ..common import (
     BusinessError,
     get_field,
     paginated,
+    parse_candidate_id,
     parse_decimal,
+    parse_event_id,
     parse_int,
 )
 from ..enums import GroupType, RoundType
@@ -159,10 +161,9 @@ def summary(event_id, group_type, score_round):
 # ---------------------------------------------------------------------------
 @transaction.atomic
 def create_score(data, user_id):
-    event_id = parse_int(
+    event_id = parse_event_id(
         get_field(data, "event_id", "eventId", required=True, label="赛事ID"),
         "赛事ID",
-        min_value=1,
     )
     group_type = GroupType.parse(get_field(data, "group_type", "groupType"))
     score_round = RoundType.parse(
@@ -175,7 +176,7 @@ def create_score(data, user_id):
         "模板ID",
         min_value=1,
     )
-    candidate_id = parse_int(
+    candidate_id = parse_candidate_id(
         get_field(
             data,
             "candidate_id",
@@ -184,7 +185,6 @@ def create_score(data, user_id):
             label="球员ID",
         ),
         "球员ID",
-        min_value=1,
     )
     raw_scores = get_field(
         data, "scores", required=True, label="评分明细"
@@ -204,6 +204,20 @@ def create_score(data, user_id):
     if template.score_round != score_round:
         raise BusinessError(400, "评分模板轮次与请求不一致")
 
+    candidate = get_archive_client().get_candidate(
+        candidate_id, event_id=event_id
+    )
+    if not candidate:
+        raise BusinessError(400, f"未找到球员档案: {candidate_id}")
+    if candidate.group_type != group_type:
+        raise BusinessError(400, "球员档案组别与请求组别不一致")
+    if str(candidate.event_id) != str(event_id):
+        raise BusinessError(400, "球员档案赛事与请求赛事不一致")
+
+    # The archive may accept a roster-item id or a person id; always store the
+    # archive's canonical candidate id so duplicates cannot slip through.
+    candidate_id = str(candidate.candidate_id)
+
     if Score.objects.filter(
         event_id=event_id,
         score_round=score_round,
@@ -212,14 +226,6 @@ def create_score(data, user_id):
         raise BusinessError(
             409, "该球员本轮评分已存在，请使用修改接口"
         )
-
-    candidate = get_archive_client().get_candidate(candidate_id)
-    if not candidate:
-        raise BusinessError(400, f"未找到球员档案: {candidate_id}")
-    if candidate.group_type != group_type:
-        raise BusinessError(400, "球员档案组别与请求组别不一致")
-    if candidate.event_id != event_id:
-        raise BusinessError(400, "球员档案赛事与请求赛事不一致")
 
     template_items = list(template.items.all())
     values, total = _build_snapshot(

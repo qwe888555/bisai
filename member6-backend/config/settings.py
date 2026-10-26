@@ -39,6 +39,7 @@ INSTALLED_APPS = [
 
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
+    "selection.middleware.SelectionCorsMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
@@ -124,24 +125,40 @@ APPEND_SLASH = False
 # ---------------------------------------------------------------------------
 # Selection scoring module settings
 # ---------------------------------------------------------------------------
-# demo  : use the built-in DemoSelectionArchiveClient (45 fake candidates)
-# none  : do not create a demo client; the main project must provide one
-SELECTION_ARCHIVE_MODE = os.environ.get("SELECTION_ARCHIVE_MODE", "demo")
+# auto  : use the main project's member4 tables when installed, else demo data
+# demo  : always use the built-in 45 fake candidates
+# main  : require the main project's member4 tables
+SELECTION_ARCHIVE_MODE = os.environ.get("SELECTION_ARCHIVE_MODE", "auto")
 
 # Dotted path of a callable that returns a SelectionArchiveClient instance.
 # Example: "apps.archives.services.ArchiveClient"
 SELECTION_ARCHIVE_CLIENT = os.environ.get("SELECTION_ARCHIVE_CLIENT", "")
 
-# header : read user id from the X-User-Id request header (demo only)
-# django : use request.user.id (set this after merging into the main project)
-# none   : the main project must provide SELECTION_CURRENT_USER_PROVIDER
-SELECTION_CURRENT_USER_MODE = os.environ.get("SELECTION_CURRENT_USER_MODE", "header")
+# auto   : use main JWT when apps.common.authentication is importable,
+#          otherwise keep the standalone demo open (X-User-Id for audit)
+# none   : disable authentication (tests / local tools)
+# main   : require main JWT (fails fast when the main project is absent)
+# header : standalone only, audit id comes from X-User-Id
+SELECTION_AUTH_MODE = os.environ.get("SELECTION_AUTH_MODE", "auto")
 
-# Dotted path of a callable: (request) -> int user id.
+# auto   : prefer request.auth/request.user, then X-User-Id
+# header : read user id from the X-User-Id request header (demo only)
+# django : use request.user.id
+# main   : use the authenticated main account id only
+SELECTION_CURRENT_USER_MODE = os.environ.get(
+    "SELECTION_CURRENT_USER_MODE", "auto"
+)
+
+# Dotted path of a callable: (request) -> str user id.
 # Example: "apps.accounts.utils.get_current_user_id"
 SELECTION_CURRENT_USER_PROVIDER = os.environ.get(
     "SELECTION_CURRENT_USER_PROVIDER", ""
 )
+
+# native : {code: 0, message: "ok", data}
+# auto   : main envelope when apps.common.envelope is importable, else native
+# main   : require {code: "OK", message: "成功", data, requestId}
+SELECTION_ENVELOPE_MODE = os.environ.get("SELECTION_ENVELOPE_MODE", "auto")
 
 # D1 确认后修改这些默认值；也可以在生成结果时按请求传参覆盖。
 SELECTION_DEFAULT_QUOTA = int(os.environ.get("SELECTION_DEFAULT_QUOTA", "11"))
@@ -158,11 +175,12 @@ SELECTION_TIE_BREAK_DIMENSION_CODE = os.environ.get(
 # ---------------------------------------------------------------------------
 # Registration publicity (module 7.3, T6-04)
 # ---------------------------------------------------------------------------
-# demo : use the built-in DemoPublicitySourceClient (45 athletes, 15 coaches,
-#        9 teams, event_id=1)
-# none : the main project must provide SELECTION_PUBLICITY_SOURCE_CLIENT
+# auto : use the main project's enrollments/persons/teams when installed,
+#        otherwise the built-in demo source (45 athletes, 15 coaches, 9 teams)
+# demo : always use the built-in demo source
+# main : require the main project's registration tables
 SELECTION_PUBLICITY_SOURCE_MODE = os.environ.get(
-    "SELECTION_PUBLICITY_SOURCE_MODE", "demo"
+    "SELECTION_PUBLICITY_SOURCE_MODE", "auto"
 )
 
 # Dotted path of a callable that returns a PublicitySourceClient instance.
@@ -199,12 +217,21 @@ SELECTION_PUBLICITY_FIELD_WHITELIST = {
     ),
 }
 
-# CORS (only needed when the frontend runs on a different origin):
-#   pip install django-cors-headers
-#   add "corsheaders" to INSTALLED_APPS and
-#   "corsheaders.middleware.CorsMiddleware" before CommonMiddleware
-#   CORS_ALLOW_ALL_ORIGINS = DEBUG
-# Never allow all origins in production.
+# ---------------------------------------------------------------------------
+# CORS (standalone only; the main backend already includes its own middleware)
+# ---------------------------------------------------------------------------
+SELECTION_CORS_ORIGINS = [
+    item.strip()
+    for item in os.environ.get(
+        "SELECTION_CORS_ORIGINS",
+        "http://localhost:5173,http://127.0.0.1:5173,"
+        "http://localhost:3000,http://127.0.0.1:3000",
+    ).split(",")
+    if item.strip()
+]
+SELECTION_CORS_ALLOW_ALL = (
+    os.environ.get("SELECTION_CORS_ALLOW_ALL", "0") == "1"
+)
 
 # Logging: keep API errors visible in the console during development.
 LOGGING = {

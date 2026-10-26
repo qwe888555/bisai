@@ -18,8 +18,8 @@ from ..enums import GroupType
 
 @dataclass(frozen=True)
 class SelectionCandidate:
-    candidate_id: int
-    event_id: int
+    candidate_id: str
+    event_id: str
     name: str
     team_name: str
     group_type: str
@@ -31,8 +31,14 @@ class SelectionArchiveClient(ABC):
     """Minimal interface required by the scoring module."""
 
     @abstractmethod
-    def get_candidate(self, candidate_id: int) -> Optional[SelectionCandidate]:
-        """Return a candidate or None when the archive id does not exist."""
+    def get_candidate(
+        self, candidate_id: str, event_id: Optional[str] = None
+    ) -> Optional[SelectionCandidate]:
+        """Return a candidate or None when the archive id does not exist.
+
+        ``event_id`` is optional for the demo client and used by the main
+        project adapter to disambiguate a person enrolled in several events.
+        """
 
     def list_candidates(self, group_type: str) -> List[SelectionCandidate]:
         """Return candidates of one group; used by the demo seeder."""
@@ -63,7 +69,7 @@ class DemoSelectionArchiveClient(SelectionArchiveClient):
     POSITIONS = ["前锋", "中场", "后卫", "门将"]
 
     def __init__(self):
-        self._candidates: Dict[int, SelectionCandidate] = {}
+        self._candidates: Dict[str, SelectionCandidate] = {}
         self._build()
 
     def _build(self):
@@ -75,21 +81,24 @@ class DemoSelectionArchiveClient(SelectionArchiveClient):
         for group_type, base_id, name_offset in groups:
             teams = self.GROUP_TEAMS[group_type]
             for index in range(15):
-                candidate_id = base_id + index + 1
+                numeric_id = base_id + index + 1
+                candidate_id = str(numeric_id)
                 self._candidates[candidate_id] = SelectionCandidate(
                     candidate_id=candidate_id,
-                    event_id=1,
+                    event_id="1",
                     name=self.NAMES[name_offset + index],
                     team_name=teams[index % len(teams)],
                     group_type=group_type,
                     position=self.POSITIONS[index % len(self.POSITIONS)],
                     id_card_masked=(
-                        f"{candidate_id}**********{candidate_id % 100:02d}"
+                        f"{numeric_id}**********{numeric_id % 100:02d}"
                     ),
                 )
 
-    def get_candidate(self, candidate_id: int) -> Optional[SelectionCandidate]:
-        return self._candidates.get(candidate_id)
+    def get_candidate(
+        self, candidate_id: str, event_id: Optional[str] = None
+    ) -> Optional[SelectionCandidate]:
+        return self._candidates.get(str(candidate_id))
 
     def list_candidates(self, group_type: str) -> List[SelectionCandidate]:
         return [
@@ -103,8 +112,16 @@ _CLIENT_CACHE = {}
 
 
 def get_archive_client() -> SelectionArchiveClient:
-    """Resolve the configured archive client, with a small instance cache."""
-    mode = getattr(settings, "SELECTION_ARCHIVE_MODE", "demo")
+    """Resolve the configured archive client, with a small instance cache.
+
+    Modes:
+    * ``auto``  – use the main project's member4 tables when this app is
+                  installed next to them; otherwise fall back to demo data;
+    * ``demo``  – always use the 45 fake candidates;
+    * ``main``  – require the main project's tables;
+    * custom    – ``SELECTION_ARCHIVE_CLIENT`` dotted factory wins.
+    """
+    mode = getattr(settings, "SELECTION_ARCHIVE_MODE", "auto")
     path = getattr(settings, "SELECTION_ARCHIVE_CLIENT", "")
     key = (mode, path)
 
@@ -125,10 +142,24 @@ def get_archive_client() -> SelectionArchiveClient:
             )
     elif mode == "demo":
         client = DemoSelectionArchiveClient()
+    elif mode in ("auto", "main"):
+        from .main_adapters import main_data_available
+        from .main_adapters import MainProjectArchiveClient
+
+        if main_data_available():
+            client = MainProjectArchiveClient()
+        elif mode == "auto":
+            client = DemoSelectionArchiveClient()
+        else:
+            raise BusinessError(
+                500,
+                "SELECTION_ARCHIVE_MODE=main，但主程序 apps.enrollments/"
+                "apps.persons/apps.teams/apps.events 未安装",
+            )
     else:
         raise BusinessError(
             500,
-            "未配置球员档案客户端，请设置 SELECTION_ARCHIVE_MODE=demo "
+            "未配置球员档案客户端，请设置 SELECTION_ARCHIVE_MODE=auto/demo "
             "或提供 SELECTION_ARCHIVE_CLIENT",
         )
 

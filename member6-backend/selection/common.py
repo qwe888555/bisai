@@ -6,11 +6,30 @@ import re
 from decimal import Decimal, InvalidOperation
 from functools import wraps
 
+from django.conf import settings
 from django.http import JsonResponse
 from django.utils import timezone
 from django.views.decorators.csrf import csrf_exempt
 
 logger = logging.getLogger("selection")
+
+MAX_ID_LENGTH = 64
+
+# HTTP status -> 主程序契约错误码。成员6独立运行时仍使用数字 code。
+_MAIN_ERROR_CODES = {
+    400: "INVALID_ARGUMENT",
+    401: "UNAUTHENTICATED",
+    403: "FORBIDDEN",
+    404: "NOT_FOUND",
+    405: "METHOD_NOT_ALLOWED",
+    409: "STATE_CONFLICT",
+    413: "BATCH_LIMIT_EXCEEDED",
+    415: "UNSUPPORTED_FILE_TYPE",
+    422: "BUSINESS_VALIDATION_FAILED",
+    429: "RATE_LIMITED",
+    500: "INTERNAL_ERROR",
+    503: "DEPENDENCY_UNAVAILABLE",
+}
 
 
 class BusinessError(Exception):
@@ -29,11 +48,53 @@ class BusinessError(Exception):
 # ---------------------------------------------------------------------------
 # Response envelope
 # ---------------------------------------------------------------------------
+def _main_envelope():
+    """Return the main project's envelope module when it is importable.
+
+    ``SELECTION_ENVELOPE_MODE``:
+    * ``native`` – always use the standalone ``{code: 0, ...}`` envelope;
+    * ``auto``   – use the main envelope when the app is merged into the main
+                   Django project, otherwise stay native;
+    * ``main``   – require the main envelope (raise if it is missing).
+    """
+    mode = getattr(settings, "SELECTION_ENVELOPE_MODE", "auto")
+    if mode == "native":
+        return None
+    try:
+        from apps.common import envelope as main_envelope
+    except Exception:
+        if mode == "main":
+            raise BusinessError(
+                500,
+                "SELECTION_ENVELOPE_MODE=main，但无法导入 apps.common.envelope",
+            )
+        return None
+    return main_envelope
+
+
+def using_main_envelope():
+    return _main_envelope() is not None
+
+
 def ok(data=None, message="ok"):
+    main_envelope = _main_envelope()
+    if main_envelope is not None:
+        main_message = "成功" if message in (None, "", "ok") else message
+        return main_envelope.ok(data, main_message)
     return {"code": 0, "message": message, "data": data}
 
 
 def fail(code, message):
+    main_envelope = _main_envelope()
+    if main_envelope is not None:
+        if isinstance(code, int):
+            code = _MAIN_ERROR_CODES.get(code, "INVALID_ARGUMENT")
+        # error_envelope lives in apps.common.errors (not apps.common.envelope).
+        try:
+            from apps.common.errors import error_envelope
+        except Exception:  # pragma: no cover - unusual partial merge
+            return main_envelope.Envelope(code, message, None).to_dict()
+        return error_envelope(code, message)
     return {"code": code, "message": message, "data": None}
 
 
@@ -140,6 +201,54 @@ def parse_int(
     return result
 
 
+def parse_identifier(
+    value,
+    field_name,
+    required=True,
+    default=None,
+    max_length=MAX_ID_LENGTH,
+):
+    """Parse an opaque business id (e.g. main project's ``evt_xxx``).
+
+    The main backend uses string ids for events, groups, accounts, rosters and
+    people (``evt_`` / ``evg_`` / ``acc_`` / ``rst_`` / ``per_``).  Member6
+    historically used integers, so numeric inputs are still accepted and
+    normalized to strings; the whole backend therefore works with both.
+    """
+    if _is_blank(value):
+        if default is not None:
+            return default
+        if required:
+            raise BusinessError(400, f"{field_name}不能为空")
+        return None
+    if isinstance(value, bool):
+        raise BusinessError(400, f"{field_name}格式不正确")
+    text = str(value).strip()
+    if not text:
+        if required:
+            raise BusinessError(400, f"{field_name}不能为空")
+        return None
+    if len(text) > max_length:
+        raise BusinessError(
+            400, f"{field_name}长度不能超过{max_length}个字符"
+        )
+    if any(char.isspace() for char in text):
+        raise BusinessError(400, f"{field_name}不能包含空白字符")
+    return text
+
+
+def parse_event_id(value, field_name="赛事ID", required=True, default=None):
+    return parse_identifier(
+        value, field_name, required=required, default=default
+    )
+
+
+def parse_candidate_id(value, field_name="球员ID", required=True, default=None):
+    return parse_identifier(
+        value, field_name, required=required, default=default
+    )
+
+
 def parse_decimal(
     value,
     field_name,
@@ -183,6 +292,14 @@ def parse_page(request):
 
 
 def paginated(records, total, page, size):
+    if using_main_envelope():
+        # 主程序契约：分页 data={items,page,pageSize,total}
+        return {
+            "items": records,
+            "page": page,
+            "pageSize": size,
+            "total": total,
+        }
     return {
         "records": records,
         "total": total,
