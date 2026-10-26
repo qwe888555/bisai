@@ -439,6 +439,19 @@ class ApiSmokeTests(TestCase):
         self.assertFalse(Account.all_objects.filter(username=username).exists())
         self.assertFalse(Organization.all_objects.filter(code="BIZ_ROLLBACK_TEAM").exists())
 
+    def test_database_url_decoding_and_mysql_shim(self):
+        from config.settings import _database_config
+
+        cfg = _database_config("mysql+pymysql://user:p%40ss@127.0.0.1:3306/football")
+        self.assertEqual(cfg["PASSWORD"], "p@ss")
+        self.assertEqual(cfg["NAME"], "football")
+        self.assertEqual(cfg["PORT"], 3306)
+
+        # pytest 不走 manage.py，PyMySQL 的 shim 必须在 config 包初始化里生效
+        import MySQLdb
+
+        self.assertTrue(hasattr(MySQLdb, "connect"))
+
     def test_init_admin_command(self):
         from django.core.management import CommandError
 
