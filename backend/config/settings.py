@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -86,10 +86,13 @@ INSTALLED_APPS = [
     "apps.attachments",
     "apps.verification",
     "apps.policyqa",
+    "apps.events",
     "apps.persons",
     "apps.teams",
     "apps.materials",
     "apps.infra",
+    "apps.enrollments",
+    "selection",
 ]
 
 # 中间件顺序不可随意调整：requestId 必须最外层，审计/限流在其内。
@@ -126,10 +129,11 @@ def _database_config(url: str) -> dict:
     parsed = urlparse(url)
     return {
         "ENGINE": "django.db.backends.mysql",
-        "NAME": parsed.path.lstrip("/"),
-        "USER": parsed.username or "",
-        "PASSWORD": parsed.password or "",
-        "HOST": parsed.hostname or "127.0.0.1",
+        # URL 里的百分号编码必须还原，否则密码含 @ 等字符时认证失败
+        "NAME": unquote(parsed.path.lstrip("/")),
+        "USER": unquote(parsed.username or ""),
+        "PASSWORD": unquote(parsed.password or ""),
+        "HOST": unquote(parsed.hostname or "127.0.0.1"),
         "PORT": parsed.port or 3306,
         "OPTIONS": {"charset": "utf8mb4"},
     }

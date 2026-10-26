@@ -13,7 +13,7 @@ from ninja.files import UploadedFile
 
 from apps.common.authentication import JWTAuth
 from apps.common.envelope import action_result, ok
-from apps.common.errors import INVALID_ARGUMENT, ApiError
+from apps.common.errors import INVALID_ARGUMENT, NOT_FOUND, ApiError
 from apps.common.middleware import audit_state
 from apps.common.permissions import ALL_ROLES, register_operation, require
 from apps.common.schemas import EnvelopeOut, StrictSchema
@@ -69,6 +69,8 @@ def _file_out(record: FileRecord) -> dict:
         data["category"] = record.category
     if record.content_type:
         data["contentType"] = record.content_type
+    if record.thumbnail_key:
+        data["thumbnailUrl"] = f"/files/{record.pk}/thumbnail"
     return data
 
 
@@ -86,7 +88,7 @@ def _require_version(request) -> int:
         raise ApiError(INVALID_ARGUMENT, "version 必须是整数") from exc
 
 
-@router.post("/files", auth=_auth, response=EnvelopeOut, summary="上传单个文件")
+@router.post("/files", operation_id="fileUpload", auth=_auth, response=EnvelopeOut, summary="上传单个文件")
 def file_upload(
     request,
     data: FileUploadIn = Form(...),
@@ -104,7 +106,7 @@ def file_upload(
     return ok(_file_out(record))
 
 
-@router.post("/files/batch", auth=_auth, response=EnvelopeOut, summary="批量上传文件")
+@router.post("/files/batch", operation_id="fileBatchUpload", auth=_auth, response=EnvelopeOut, summary="批量上传文件")
 def file_batch_upload(
     request,
     data: FileBatchUploadIn = Form(...),
@@ -124,14 +126,14 @@ def file_batch_upload(
     return ok({"files": [_file_out(item) for item in records], "count": count})
 
 
-@router.get("/files/{file_id}", auth=_auth, response=EnvelopeOut, summary="文件元数据")
+@router.get("/files/{file_id}", operation_id="fileGet", auth=_auth, response=EnvelopeOut, summary="文件元数据")
 def file_get(request, file_id: str):
     actor = require("fileGet")
     record = services.get_record(actor, file_id)
     return ok(_file_out(record))
 
 
-@router.delete("/files/{file_id}", auth=_auth, response=EnvelopeOut, summary="删除文件")
+@router.delete("/files/{file_id}", operation_id="fileDelete", auth=_auth, response=EnvelopeOut, summary="删除文件")
 def file_delete(request, file_id: str):
     actor = require("fileDelete")
     record = services.delete_record(actor, file_id, _require_version(request))
@@ -147,6 +149,7 @@ def file_delete(request, file_id: str):
 
 @router.get(
     "/files/{file_id}/content",
+    operation_id="fileDownload",
     auth=_auth,
     response=None,
     summary="授权下载私有文件",
@@ -167,4 +170,24 @@ def file_download(request, file_id: str):
         f"attachment; filename*=UTF-8''{quote(record.original_name)}"
     )
     response["Content-Length"] = str(record.size_bytes)
+    return response
+
+
+@router.get(
+    "/files/{file_id}/thumbnail",
+    operation_id="fileThumbnail",
+    auth=_auth,
+    response=None,
+    summary="图片缩略图（授权读取）",
+)
+def file_thumbnail(request, file_id: str):
+    actor = require("fileDownload")
+    from .storage import get_storage
+
+    record = services.get_record(actor, file_id)
+    if not record.thumbnail_key:
+        raise ApiError(NOT_FOUND, "该文件没有缩略图")
+    stream = get_storage().open(record.thumbnail_key)
+    response = FileResponse(stream, content_type="image/jpeg")
+    response["Cache-Control"] = "private, no-store"
     return response

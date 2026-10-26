@@ -43,12 +43,26 @@ Copy-Item .env.example .env
 python manage.py migrate
 python manage.py seed_demo      # 写入 8 个组织、8 类角色演示账号、14 条字典项
 python manage.py runserver
+python -m pytest               # 接口冒烟：登录/权限/400/401/403/404/409/幂等/文件/字典缓存
 ```
 
 - 默认 `DATABASE_URL=sqlite:///./data/football.db`，无需装 MySQL 即可启动；
 - 交互文档 http://127.0.0.1:8000/api/v1/docs ，OpenAPI 契约 http://127.0.0.1:8000/api/v1/openapi.json （Apifox 直接导入）；
 - 演示账号：`admin` / `province` / `city` / `university` / `team` / `coach` / `athlete` / `recorder`，初始密码统一 `Foot@2026`；
 - 切正式环境：`DATABASE_URL` 改 MySQL、`STORAGE_BACKEND` 改 `minio`、填 `REDIS_URL`，或直接 `docker compose up -d`。
+
+## 部署与运维
+
+```bash
+docker compose up -d                                   # MySQL + Redis + MinIO + web + nginx
+bash deploy/backup.sh                                  # 备份库/文件/MinIO 到 backups/<时间戳>
+bash deploy/restore.sh backups/<时间戳>                 # 从备份恢复
+python scripts/smoke_concurrency.py --path "/accounts" --total 100 --concurrency 50 --login "admin:Foot@2026"
+```
+
+- 生产 HTTPS：把 compose 里 nginx 的挂载换成 `deploy/nginx-https.conf`，证书放 `deploy/certs/`（不进仓库）；
+- 并发冒烟默认打 `/api/v1` 前缀，报名提交这类写接口加 `--idempotency` 让每次请求带不同幂等键；
+- 备份产物包含 `db.sql.gz`、`files.tar.gz`、`minio.tar.gz`，回滚先恢复再用 `docker compose restart web` 验证 `/api/v1/health`。
 
 ## 一个接口长什么样（照这个写）
 
@@ -89,6 +103,7 @@ def list_accounts(request):
 ## 提交前自检（DoD）
 
 - [ ] `python manage.py check` 无问题，`python manage.py runserver` 能起，`/api/v1/docs` 能看到自己的接口
+- [ ] `python -m pytest` 全绿（新增接口补一条冒烟用例）
 - [ ] 请求模型用 `StrictSchema`，未知字段被拒
 - [ ] 越权返回 403 且是契约信封（不是 500），版本冲突返回 409
 - [ ] 响应体是 `{code, message, data, requestId}`，分页 data 是 `{items, page, pageSize, total}`

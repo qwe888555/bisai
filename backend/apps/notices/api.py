@@ -11,7 +11,7 @@ from ninja import Router
 from apps.common.authentication import JWTAuth
 from apps.common.envelope import action_result, ok
 from apps.common.errors import NOT_FOUND, ApiError
-from apps.common.pagination import paginate_list
+from apps.common.pagination import paginate
 from apps.common.permissions import ALL_ROLES, register_operation, require
 from apps.common.schemas import EnvelopeOut
 from apps.common.versioning import bump
@@ -59,7 +59,7 @@ def _get_own_message(account, message_id: str) -> Message:
     return message
 
 
-@router.get("/me/messages", auth=_auth, response=EnvelopeOut, summary="本人系统消息列表")
+@router.get("/me/messages", operation_id="messageList", auth=_auth, response=EnvelopeOut, summary="本人系统消息列表")
 def message_list(request):
     actor = require("messageList")
     queryset = _own_messages(actor)
@@ -67,11 +67,12 @@ def message_list(request):
     if read not in (None, ""):
         queryset = queryset.filter(read=str(read).lower() in {"1", "true", "yes"})
     queryset = queryset.order_by("-created_at", "id")
-    return paginate_list(request, [_message_out(item) for item in queryset])
+    return paginate(request, queryset, mapper=_message_out)
 
 
 @router.get(
     "/me/messages/{message_id}",
+    operation_id="messageGet",
     auth=_auth,
     response=EnvelopeOut,
     summary="本人消息详情",
@@ -84,6 +85,7 @@ def message_get(request, message_id: str):
 
 @router.post(
     "/me/messages/{message_id}/read",
+    operation_id="messageRead",
     auth=_auth,
     response=EnvelopeOut,
     summary="标记本人消息已读",

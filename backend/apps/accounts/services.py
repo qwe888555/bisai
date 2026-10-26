@@ -10,6 +10,7 @@ import secrets
 from datetime import timedelta
 from typing import Any, Optional
 
+from django.core.cache import cache
 from django.db import IntegrityError, transaction
 from django.utils import timezone
 
@@ -42,6 +43,7 @@ from apps.common.scopes import (
     ensure_manageable_target,
     ensure_org_in_scope,
     is_admin,
+    is_global_admin,
     org_scope_ids,
 )
 from apps.common.versioning import bump, check_version
@@ -148,11 +150,11 @@ def create_invitation(actor: Account, data: dict) -> dict[str, Any]:
 # ---------------------------------------------------------------- 账号
 
 def scoped_accounts(actor: Account):
+    if is_global_admin(actor):
+        return Account.objects.all()
     scope = org_scope_ids(actor)
     if not scope:
         return Account.objects.none()
-    if is_admin(actor) and not getattr(actor, "organization_id", None):
-        return Account.objects.all()
     return Account.objects.filter(organization_id__in=scope)
 
 
@@ -274,6 +276,8 @@ def reset_password(
 # ---------------------------------------------------------------- 组织
 
 def scoped_organizations(actor: Account):
+    if is_global_admin(actor):
+        return Organization.objects.all()
     scope = org_scope_ids(actor)
     if not scope:
         return Organization.objects.none()
@@ -290,79 +294,6 @@ def list_organizations(actor: Account, filters: dict):
         queryset = queryset.filter(org_type=org_type)
     return queryset.order_by("org_type", "code")
 
-
-def create_organization(actor: Account, data: dict) -> Organization:
-    parent = None
-    if data.get("parentId"):
-        parent = Organization.objects.filter(pk=data["parentId"]).first()
-        if parent is None:
-            raise ApiError(INVALID_ARGUMENT, "父组织不存在", [{"field": "parentId", "reason": "不存在"}])
-        ensure_org_in_scope(actor, parent.pk)
-    if Organization.objects.filter(code=data["code"]).exists():
-        raise ApiError(DUPLICATE_RESOURCE, "组织编码已存在", [{"field": "code", "reason": "已被占用"}])
-    return Organization.objects.create(
-        id=new_organization_id(),
-        parent=parent,
-        name=data["name"],
-        org_type=data["orgType"],
-        code=data["code"],
-        enabled=bool(data.get("enabled", True)),
-    )
-
-
-def get_organization(actor: Account, org_id: str) -> Organization:
-    organization = scoped_organizations(actor).filter(pk=org_id).first()
-    if organization is None:
-        raise ApiError(NOT_FOUND)
-    return organization
-
-
-def update_organization(actor: Account, org_id: str, data: dict) -> Organization:
-    organization = get_organization(actor, org_id)
-    check_version(organization, data.get("version"))
-    parent = None
-    if data.get("parentId"):
-        if data["parentId"] == org_id:
-            raise ApiError(INVALID_ARGUMENT, "父组织不能是自身", [{"field": "parentId", "reason": "自引用"}])
-        parent = Organization.objects.filter(pk=data["parentId"]).first()
-        if parent is None:
-            raise ApiError(INVALID_ARGUMENT, "父组织不存在", [{"field": "parentId", "reason": "不存在"}])
-        ensure_org_in_scope(actor, parent.pk)
-    if (
-        Organization.objects.filter(code=data["code"])
-        .exclude(pk=organization.pk)
-        .exists()
-    ):
-        raise ApiError(DUPLICATE_RESOURCE, "组织编码已存在", [{"field": "code", "reason": "已被占用"}])
-
-    organization.parent = parent
-    organization.name = data["name"]
-    organization.org_type = data["orgType"]
-    organization.code = data["code"]
-    organization.enabled = bool(data.get("enabled", True))
-    bump(organization)
-    organization.save()
-    return organization
-
-
-def delete_organization(actor: Account, org_id: str, version: Optional[int]) -> Organization:
-    organization = get_organization(actor, org_id)
-    check_version(organization, version)
-    if Organization.objects.filter(parent_id=org_id).exists():
-        raise ApiError(STATE_CONFLICT, "存在下级组织，不能删除")
-    if Account.objects.filter(organization_id=org_id).exists():
-        raise ApiError(STATE_CONFLICT, "该组织下仍有账号，不能删除")
-    organization.deleted_at = timezone.now()
-    bump(organization)
-    organization.save()
-    return organization
-
-
-# ---------------------------------------------------------------- 业务主档组织映射（A′-min）
-# 以下 ORG_PARENT_TYPES / BIZ_TO_ORG_TYPE / _org_type_error / _validate_org_parent /
-# _apply_org_fields / ensure_business_org 自 origin/main（成员2 accounts 域交付，
-# 2026-10-25 经用户批准最小移植；逐字一致，供成员4 School/Team 主档挂接组织树）。
-# create/update/delete_organization 的既有行为在本分支保持不变。
 
 # 上级组织类型矩阵：省级为根，高校可直挂省（省属高校），其余严格逐级
 ORG_PARENT_TYPES: dict[str, set[str]] = {
@@ -455,6 +386,104 @@ def _apply_org_fields(
     return organization
 
 
+def create_organization(actor: Account, data: dict) -> Organization:
+    parent = None
+    if data.get("parentId"):
+        parent = Organization.objects.filter(pk=data["parentId"]).first()
+        if parent is None:
+            raise ApiError(INVALID_ARGUMENT, "父组织不存在", [{"field": "parentId", "reason": "不存在"}])
+        ensure_org_in_scope(actor, parent.pk)
+    else:
+        ensure_org_in_scope(actor, None)
+    _validate_org_parent(data["orgType"], parent)
+
+    existing = Organization.all_objects.filter(code=data["code"]).first()
+    if existing is not None:
+        if existing.deleted_at is None:
+            raise ApiError(DUPLICATE_RESOURCE, "组织编码已存在", [{"field": "code", "reason": "已被占用"}])
+        # 软删后同 code 重建：复活原节点，保留历史 ID 与子节点关系
+        return _apply_org_fields(
+            existing,
+            parent=parent,
+            name=data["name"],
+            org_type=data["orgType"],
+            code=data["code"],
+            enabled=bool(data.get("enabled", True)),
+        )
+    try:
+        return Organization.objects.create(
+            id=new_organization_id(),
+            parent=parent,
+            name=data["name"],
+            org_type=data["orgType"],
+            code=data["code"],
+            enabled=bool(data.get("enabled", True)),
+        )
+    except IntegrityError:
+        # 并发下唯一约束兜底，避免返回未格式化 500
+        raise ApiError(DUPLICATE_RESOURCE, "组织编码已存在", [{"field": "code", "reason": "已被占用"}])
+
+
+def get_organization(actor: Account, org_id: str) -> Organization:
+    organization = scoped_organizations(actor).filter(pk=org_id).first()
+    if organization is None:
+        raise ApiError(NOT_FOUND)
+    return organization
+
+
+def update_organization(actor: Account, org_id: str, data: dict) -> Organization:
+    organization = get_organization(actor, org_id)
+    check_version(organization, data.get("version"))
+    if data["code"] != organization.code:
+        raise ApiError(
+            INVALID_ARGUMENT,
+            "组织编码不可修改",
+            [{"field": "code", "reason": "业务主档按 code 映射组织，编码一期不可变"}],
+        )
+    parent = None
+    if data.get("parentId"):
+        if data["parentId"] == org_id:
+            raise ApiError(INVALID_ARGUMENT, "父组织不能是自身", [{"field": "parentId", "reason": "自引用"}])
+        parent = Organization.objects.filter(pk=data["parentId"]).first()
+        if parent is None:
+            raise ApiError(INVALID_ARGUMENT, "父组织不存在", [{"field": "parentId", "reason": "不存在"}])
+        ensure_org_in_scope(actor, parent.pk)
+    else:
+        ensure_org_in_scope(actor, None)
+    _validate_org_parent(data["orgType"], parent, current_id=org_id)
+
+    enabled = bool(data.get("enabled", True))
+    if organization.enabled and not enabled:
+        if Organization.objects.filter(parent_id=org_id).exists():
+            raise ApiError(
+                STATE_CONFLICT,
+                "存在启用中的下级组织，不能停用",
+                [{"field": "enabled", "reason": "请先迁移或停用下级组织"}],
+            )
+
+    return _apply_org_fields(
+        organization,
+        parent=parent,
+        name=data["name"],
+        org_type=data["orgType"],
+        code=organization.code,
+        enabled=enabled,
+    )
+
+
+def delete_organization(actor: Account, org_id: str, version: Optional[int]) -> Organization:
+    organization = get_organization(actor, org_id)
+    check_version(organization, version)
+    if Organization.objects.filter(parent_id=org_id).exists():
+        raise ApiError(STATE_CONFLICT, "存在下级组织，不能删除")
+    if Account.objects.filter(organization_id=org_id).exists():
+        raise ApiError(STATE_CONFLICT, "该组织下仍有账号，不能删除")
+    organization.deleted_at = timezone.now()
+    bump(organization)
+    organization.save()
+    return organization
+
+
 def ensure_business_org(
     biz_type: str,
     code: str,
@@ -530,11 +559,32 @@ def list_dictionary_items(filters: dict):
     return queryset.order_by("dict_type", "sort_order", "id")
 
 
+DICT_OPTIONS_TTL = 300  # 字典选项缓存 5 分钟；写操作立即失效
+
+
+def _dict_options_key(dict_type: str) -> str:
+    return f"dict:options:{dict_type}"
+
+
 def dictionary_options(dict_type: str):
-    return (
-        DictionaryItem.objects.filter(dict_type=dict_type, enabled=True)
-        .order_by("sort_order", "id")
+    """下拉选项：带缓存。写字典时由 _invalidate_dict_options 立即失效。"""
+    key = _dict_options_key(dict_type)
+    cached = cache.get(key)
+    if cached is not None:
+        return cached
+    items = list(
+        DictionaryItem.objects.filter(dict_type=dict_type, enabled=True).order_by(
+            "sort_order", "id"
+        )
     )
+    cache.set(key, items, DICT_OPTIONS_TTL)
+    return items
+
+
+def _invalidate_dict_options(*dict_types: str) -> None:
+    for dict_type in dict_types:
+        if dict_type:
+            cache.delete(_dict_options_key(dict_type))
 
 
 def create_dictionary_item(data: dict) -> DictionaryItem:
@@ -542,7 +592,7 @@ def create_dictionary_item(data: dict) -> DictionaryItem:
         dict_type=data["dictType"], value=data["value"]
     ).exists():
         raise ApiError(DUPLICATE_RESOURCE, "同一字典类型下 value 已存在")
-    return DictionaryItem.objects.create(
+    item = DictionaryItem.objects.create(
         id=new_dictionary_id(),
         dict_type=data["dictType"],
         value=data["value"],
@@ -550,6 +600,8 @@ def create_dictionary_item(data: dict) -> DictionaryItem:
         sort_order=int(data.get("sortOrder") or 0),
         enabled=bool(data.get("enabled", True)),
     )
+    _invalidate_dict_options(item.dict_type)
+    return item
 
 
 def get_dictionary_item(item_id: str) -> DictionaryItem:
@@ -562,6 +614,7 @@ def get_dictionary_item(item_id: str) -> DictionaryItem:
 def update_dictionary_item(item_id: str, data: dict) -> DictionaryItem:
     item = get_dictionary_item(item_id)
     check_version(item, data.get("version"))
+    old_dict_type = item.dict_type
     if (
         DictionaryItem.objects.filter(dict_type=data["dictType"], value=data["value"])
         .exclude(pk=item.pk)
@@ -575,6 +628,7 @@ def update_dictionary_item(item_id: str, data: dict) -> DictionaryItem:
     item.enabled = bool(data.get("enabled", True))
     bump(item)
     item.save()
+    _invalidate_dict_options(old_dict_type, item.dict_type)
     return item
 
 
@@ -584,6 +638,7 @@ def delete_dictionary_item(item_id: str, version: Optional[int]) -> DictionaryIt
     item.deleted_at = timezone.now()
     bump(item)
     item.save()
+    _invalidate_dict_options(item.dict_type)
     return item
 
 

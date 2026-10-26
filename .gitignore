@@ -17,9 +17,14 @@ backend/data/
 data/
 *.db
 *.sqlite3
+backups/
+backend/deploy/certs/
 
 # IDE / 系统
 .idea/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# 本地隔离安装的依赖（自测用临时目录）
+backend/.pylibs/

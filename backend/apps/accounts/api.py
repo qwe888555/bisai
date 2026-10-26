@@ -15,7 +15,7 @@ from apps.common.authentication import JWTAuth
 from apps.common.envelope import action_result, ok
 from apps.common.errors import INVALID_ARGUMENT, ApiError
 from apps.common.middleware import audit_state
-from apps.common.pagination import paginate_list
+from apps.common.pagination import paginate
 from apps.common.permissions import (
     ADMIN,
     ALL_ROLES,
@@ -77,7 +77,7 @@ def _require_version(version: Optional[int]) -> int:
 
 # ---------------------------------------------------------------- 认证
 
-@router.post("/auth/login", auth=None, response=EnvelopeOut, summary="登录")
+@router.post("/auth/login", operation_id="login", auth=None, response=EnvelopeOut, summary="登录")
 def login(request, body: s.LoginRequest):
     result = services.login(body.username, body.password)
     audit_state(
@@ -91,7 +91,7 @@ def login(request, body: s.LoginRequest):
     return ok(result)
 
 
-@router.post("/auth/registrations", auth=None, response=EnvelopeOut, summary="邀请注册建号")
+@router.post("/auth/registrations", operation_id="register", auth=None, response=EnvelopeOut, summary="邀请注册建号")
 def register(request, body: s.RegisterRequest):
     account = services.register(body.model_dump(exclude_unset=True))
     audit_state(
@@ -104,7 +104,7 @@ def register(request, body: s.RegisterRequest):
     return action_result(True, account.pk, account.version)
 
 
-@router.post("/auth/logout", auth=_auth, response=EnvelopeOut, summary="退出登录")
+@router.post("/auth/logout", operation_id="logout", auth=_auth, response=EnvelopeOut, summary="退出登录")
 def logout(request):
     require("logout")
     services.logout({"sid": (getattr(request, "token_payload", {}) or {}).get("sid")})
@@ -112,7 +112,7 @@ def logout(request):
     return action_result(True)
 
 
-@router.get("/me", auth=_auth, response=EnvelopeOut, summary="当前账号信息")
+@router.get("/me", operation_id="currentUser", auth=_auth, response=EnvelopeOut, summary="当前账号信息")
 def current_user(request):
     actor = require("currentUser")
     data = {
@@ -130,7 +130,7 @@ def current_user(request):
     return ok(data)
 
 
-@router.post("/me/password", auth=_auth, response=EnvelopeOut, summary="修改本人密码")
+@router.post("/me/password", operation_id="changePassword", auth=_auth, response=EnvelopeOut, summary="修改本人密码")
 def change_password(request, body: s.ChangePassword):
     actor = require("changePassword")
     services.change_password(actor, body.oldPassword, body.newPassword)
@@ -148,6 +148,7 @@ def change_password(request, body: s.ChangePassword):
 
 @router.post(
     "/accounts/registration-invitations",
+    operation_id="createInvite",
     auth=_auth,
     response=EnvelopeOut,
     summary="签发注册邀请凭证",
@@ -166,7 +167,7 @@ def create_invite(request, body: s.InviteRequest):
 
 # ---------------------------------------------------------------- 账号
 
-@router.get("/accounts", auth=_auth, response=EnvelopeOut, summary="账号列表")
+@router.get("/accounts", operation_id="accountList", auth=_auth, response=EnvelopeOut, summary="账号列表")
 def account_list(
     request,
     username: Optional[str] = None,
@@ -184,10 +185,10 @@ def account_list(
             "enabled": _bool_param(enabled),
         },
     )
-    return paginate_list(request, [s.account_out(account) for account in queryset])
+    return paginate(request, queryset, mapper=s.account_out)
 
 
-@router.post("/accounts", auth=_auth, response=EnvelopeOut, summary="创建账号")
+@router.post("/accounts", operation_id="accountCreate", auth=_auth, response=EnvelopeOut, summary="创建账号")
 def account_create(request, body: s.AccountCreate):
     actor = require("accountCreate")
     account = services.create_account(actor, body.model_dump(exclude_unset=True))
@@ -201,14 +202,14 @@ def account_create(request, body: s.AccountCreate):
     return ok(s.account_out(account))
 
 
-@router.get("/accounts/{account_id}", auth=_auth, response=EnvelopeOut, summary="账号详情")
+@router.get("/accounts/{account_id}", operation_id="accountGet", auth=_auth, response=EnvelopeOut, summary="账号详情")
 def account_get(request, account_id: str):
     actor = require("accountGet")
     account = services.get_account(actor, account_id)
     return ok(s.account_out(account))
 
 
-@router.put("/accounts/{account_id}", auth=_auth, response=EnvelopeOut, summary="修改账号")
+@router.put("/accounts/{account_id}", operation_id="accountUpdate", auth=_auth, response=EnvelopeOut, summary="修改账号")
 def account_update(request, account_id: str, body: s.AccountUpdate):
     actor = require("accountUpdate")
     account = services.update_account(
@@ -224,7 +225,7 @@ def account_update(request, account_id: str, body: s.AccountUpdate):
     return ok(s.account_out(account))
 
 
-@router.delete("/accounts/{account_id}", auth=_auth, response=EnvelopeOut, summary="删除账号")
+@router.delete("/accounts/{account_id}", operation_id="accountDelete", auth=_auth, response=EnvelopeOut, summary="删除账号")
 def account_delete(request, account_id: str, version: Optional[int] = None):
     actor = require("accountDelete")
     account = services.delete_account(actor, account_id, _require_version(version))
@@ -240,6 +241,7 @@ def account_delete(request, account_id: str, version: Optional[int] = None):
 
 @router.post(
     "/accounts/{account_id}/password-reset",
+    operation_id="resetPassword",
     auth=_auth,
     response=EnvelopeOut,
     summary="重置账号密码",
@@ -265,7 +267,7 @@ def reset_password(request, account_id: str, body: s.ResetPassword):
 
 # ---------------------------------------------------------------- 组织
 
-@router.get("/organizations", auth=_auth, response=EnvelopeOut, summary="组织列表")
+@router.get("/organizations", operation_id="organizationList", auth=_auth, response=EnvelopeOut, summary="组织列表")
 def organization_list(
     request,
     parentId: Optional[str] = None,
@@ -275,10 +277,10 @@ def organization_list(
     queryset = services.list_organizations(
         actor, {"parentId": parentId, "orgType": orgType}
     )
-    return paginate_list(request, [s.organization_out(o) for o in queryset])
+    return paginate(request, queryset, mapper=s.organization_out)
 
 
-@router.post("/organizations", auth=_auth, response=EnvelopeOut, summary="创建组织")
+@router.post("/organizations", operation_id="organizationCreate", auth=_auth, response=EnvelopeOut, summary="创建组织")
 def organization_create(request, body: s.OrganizationCreate):
     actor = require("organizationCreate")
     organization = services.create_organization(
@@ -296,6 +298,7 @@ def organization_create(request, body: s.OrganizationCreate):
 
 @router.get(
     "/organizations/{organization_id}",
+    operation_id="organizationGet",
     auth=_auth,
     response=EnvelopeOut,
     summary="组织详情",
@@ -308,6 +311,7 @@ def organization_get(request, organization_id: str):
 
 @router.put(
     "/organizations/{organization_id}",
+    operation_id="organizationUpdate",
     auth=_auth,
     response=EnvelopeOut,
     summary="修改组织",
@@ -329,6 +333,7 @@ def organization_update(request, organization_id: str, body: s.OrganizationUpdat
 
 @router.delete(
     "/organizations/{organization_id}",
+    operation_id="organizationDelete",
     auth=_auth,
     response=EnvelopeOut,
     summary="删除组织",
@@ -350,14 +355,14 @@ def organization_delete(request, organization_id: str, version: Optional[int] = 
 
 # ---------------------------------------------------------------- 字典
 
-@router.get("/dictionary-items", auth=_auth, response=EnvelopeOut, summary="字典项列表")
+@router.get("/dictionary-items", operation_id="dictionaryList", auth=_auth, response=EnvelopeOut, summary="字典项列表")
 def dictionary_list(request, dictType: Optional[str] = None):
     actor = require("dictionaryList")
     queryset = services.list_dictionary_items({"dictType": dictType})
-    return paginate_list(request, [s.dictionary_item_out(i) for i in queryset])
+    return paginate(request, queryset, mapper=s.dictionary_item_out)
 
 
-@router.post("/dictionary-items", auth=_auth, response=EnvelopeOut, summary="创建字典项")
+@router.post("/dictionary-items", operation_id="dictionaryCreate", auth=_auth, response=EnvelopeOut, summary="创建字典项")
 def dictionary_create(request, body: s.DictionaryItemCreate):
     actor = require("dictionaryCreate")
     item = services.create_dictionary_item(body.model_dump(exclude_unset=True))
@@ -373,6 +378,7 @@ def dictionary_create(request, body: s.DictionaryItemCreate):
 
 @router.get(
     "/dictionary-items/{dictionary_id}",
+    operation_id="dictionaryGet",
     auth=_auth,
     response=EnvelopeOut,
     summary="字典项详情",
@@ -385,6 +391,7 @@ def dictionary_get(request, dictionary_id: str):
 
 @router.put(
     "/dictionary-items/{dictionary_id}",
+    operation_id="dictionaryUpdate",
     auth=_auth,
     response=EnvelopeOut,
     summary="修改字典项",
@@ -406,6 +413,7 @@ def dictionary_update(request, dictionary_id: str, body: s.DictionaryItemUpdate)
 
 @router.delete(
     "/dictionary-items/{dictionary_id}",
+    operation_id="dictionaryDelete",
     auth=_auth,
     response=EnvelopeOut,
     summary="删除字典项",
@@ -425,19 +433,20 @@ def dictionary_delete(request, dictionary_id: str, version: Optional[int] = None
 
 @router.get(
     "/dictionaries/{dict_type}/options",
+    operation_id="dictionaryOptions",
     auth=_auth,
     response=EnvelopeOut,
     summary="字典选项",
 )
 def dictionary_options(request, dict_type: str):
     actor = require("dictionaryOptions")
-    queryset = services.dictionary_options(dict_type)
-    return paginate_list(request, [s.dictionary_item_out(i) for i in queryset])
+    items = services.dictionary_options(dict_type)
+    return paginate(request, items, mapper=s.dictionary_item_out)
 
 
 # ---------------------------------------------------------------- 审计日志
 
-@router.get("/audit-logs", auth=_auth, response=EnvelopeOut, summary="审计日志列表")
+@router.get("/audit-logs", operation_id="auditList", auth=_auth, response=EnvelopeOut, summary="审计日志列表")
 def audit_list(
     request,
     logType: Optional[str] = None,
@@ -461,4 +470,4 @@ def audit_list(
         actor,
         {"logType": logType, "objectId": objectId, **parsed},
     )
-    return paginate_list(request, [s.audit_log_out(log) for log in queryset])
+    return paginate(request, queryset, mapper=s.audit_log_out)

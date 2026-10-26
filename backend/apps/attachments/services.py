@@ -28,7 +28,7 @@ from apps.common.ids import new_file_id
 from apps.common.permissions import ADMIN, MATCH_RECORDER, PROVINCE_REVIEWER
 from apps.common.versioning import bump, check_version
 
-from .models import CATEGORY_EXTENSIONS, OWNER_TYPES, FileRecord
+from .models import CATEGORY_EXTENSIONS, IMAGE_CATEGORIES, OWNER_TYPES, FileRecord
 
 # 各业务模块注册"该 ownerId 是否归当前账号"的校验器：
 # OWNER_VERIFIERS["ENROLLMENT"] = lambda account, owner_id: ...
@@ -148,6 +148,23 @@ def _prepare(uploaded: UploadedFile, allowed_ext: tuple[str, ...]) -> tuple[str,
     return ext, data
 
 
+def _make_thumbnail(data: bytes, max_side: int = 320) -> Optional[bytes]:
+    """生成 JPEG 缩略图。非图片或解码失败返回 None，不影响上传主流程。"""
+    import io
+
+    from PIL import Image
+
+    try:
+        with Image.open(io.BytesIO(data)) as image:
+            image = image.convert("RGB")
+            image.thumbnail((max_side, max_side))
+            buffer = io.BytesIO()
+            image.save(buffer, format="JPEG", quality=82, optimize=True)
+            return buffer.getvalue()
+    except Exception:  # noqa: BLE001 - 缩略图失败不能阻塞上传
+        return None
+
+
 def _store(account, owner_type: str, owner_id: str, category: str, uploaded: UploadedFile) -> FileRecord:
     from .storage import get_storage
 
@@ -160,6 +177,14 @@ def _store(account, owner_type: str, owner_id: str, category: str, uploaded: Upl
     import io
 
     storage.save(storage_key, io.BytesIO(data))
+
+    thumbnail_key = ""
+    if ext in {"jpg", "jpeg", "png"} and category in IMAGE_CATEGORIES:
+        thumb = _make_thumbnail(data)
+        if thumb:
+            thumbnail_key = f"{file_id}.thumb.jpg"
+            storage.save(thumbnail_key, io.BytesIO(thumb))
+
     return FileRecord.objects.create(
         id=file_id,
         owner_type=owner_type,
@@ -171,6 +196,7 @@ def _store(account, owner_type: str, owner_id: str, category: str, uploaded: Upl
         private=True,
         storage_key=storage_key,
         storage_backend=getattr(storage, "backend", "local"),
+        thumbnail_key=thumbnail_key,
         uploaded_by=account.pk,
     )
 
