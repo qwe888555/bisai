@@ -16,6 +16,7 @@ from apps.enrollments.api import router as enrollments_router
 from apps.notices.api import router as notices_router
 from apps.policyqa.api import router as policyqa_router
 from apps.verification.api import router as verification_router
+from selection.api import register_routes as register_selection_routes
 
 # 路由必须在读取 api.urls 之前注册完毕
 api.add_router("", common_router, tags=["system"])
@@ -26,6 +27,9 @@ api.add_router("", verification_router, tags=["identity"])
 api.add_router("", policyqa_router, tags=["policy"])
 api.add_router("", enrollments_router, tags=["enrollments"])
 api.add_router("", events_router, tags=["events"])
+
+# 成员6：遴选评分（模块 6.2）与报名公示（模块 7.3）
+register_selection_routes(api)
 
 urlpatterns = [
     path("api/v1/", api.urls),
