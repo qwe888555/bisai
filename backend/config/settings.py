@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -120,9 +120,9 @@ def _database_config(url: str) -> dict:
     parsed = urlparse(url)
     return {
         "ENGINE": "django.db.backends.mysql",
-        "NAME": parsed.path.lstrip("/"),
-        "USER": parsed.username or "",
-        "PASSWORD": parsed.password or "",
+        "NAME": unquote(parsed.path.lstrip("/")),
+        "USER": unquote(parsed.username or ""),
+        "PASSWORD": unquote(parsed.password or ""),
         "HOST": parsed.hostname or "127.0.0.1",
         "PORT": parsed.port or 3306,
         "OPTIONS": {"charset": "utf8mb4"},
