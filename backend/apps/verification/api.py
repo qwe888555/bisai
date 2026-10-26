@@ -128,6 +128,18 @@ def identity_list(request):
 
 
 @router.get(
+    "/identity-checks",
+    auth=_auth,
+    response=EnvelopeOut,
+    summary="身份核验记录列表",
+)
+def identity_list_root(request):
+    """GET /identity-checks：zuqiu 前端 identityApi.list 实际调用路径
+    （src/api/index.ts L325），与原 /identity-checks/list 等价并存。"""
+    return identity_list(request)
+
+
+@router.get(
     "/identity-checks/{identity_check_id}",
     auth=_auth,
     response=EnvelopeOut,
