@@ -457,6 +457,38 @@ def apply_person_scope(queryset: QuerySet, account) -> QuerySet:
     )
 
 
+def verify_person_owner(account, owner_id) -> None:
+    """PERSON 附件归属校验器（经 PersonsConfig.ready() 注册进 attachments）。
+
+    PERSON 归属文件的上传与读取均由本校验器裁决业务资源所有权
+    （attachments._check_owner / can_access 调用），规则复用既有已确认口径：
+    - 归属记录不存在（人员不存在或已软删）→ 404，默认拒绝；
+    - ADMIN → 放行（A′ 一期数据范围仅 ADMIN 全量，同 apply_person_scope）；
+    - 账号绑定本人档案（account.person_id 服务端签发，与 /me/profile 同源）
+      → 放行（本人材料上传/查看，对应 materialList/Create 含 ATHLETE/COACH
+      的自服务场景）；
+    - 其余一律 DATA_SCOPE_DENIED——本市/本校/本队范围依赖 A′ 映射，未交付
+      前不得放行，不发明组织层级授权。
+    """
+    from apps.common.permissions import ADMIN
+
+    raw = str(owner_id or "").strip()
+    if not raw:
+        raise ApiError(DATA_SCOPE_DENIED, "文件归属对象未确定，暂无法校验归属")
+    if not Person.objects.filter(
+        pk=parse_path_id(raw, "ownerId"), is_deleted=False
+    ).exists():
+        raise ApiError(NOT_FOUND, "归属人员不存在或已删除")
+    if ADMIN in (getattr(account, "roles", ()) or ()):
+        return
+    if str(getattr(account, "person_id", "") or "") == raw:
+        return
+    raise ApiError(
+        DATA_SCOPE_DENIED,
+        "人员数据范围待组织映射方案确认后开放，当前仅管理员与本人可访问",
+    )
+
+
 def _check_enum(value: Optional[str], allowed: tuple, field: str) -> None:
     if value is not None and value not in allowed:
         raise ApiError(

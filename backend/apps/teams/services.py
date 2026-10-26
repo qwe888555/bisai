@@ -74,6 +74,28 @@ def _require_admin_scope(account) -> None:
     raise ApiError(DATA_SCOPE_DENIED)
 
 
+def verify_team_owner(account, owner_id: str) -> None:
+    """TEAM 附件归属校验器（经 TeamsConfig.ready() 注册进 attachments）。
+
+    TEAM 归属文件的上传与读取均由本校验器裁决业务资源所有权
+    （attachments._check_owner / can_access 调用）：
+    - 归属记录不存在（球队不存在或已软删）→ 404，默认拒绝；
+    - 数据范围复用 _require_admin_scope：一期仅 ADMIN（D5）——本校/本队
+      授权口径依赖 A′-min 组织映射，未交付前非 ADMIN 一律拒绝，不发明
+      球队授权关系；扩展点收口在 _require_admin_scope，映射交付后仅改一处。
+    """
+    from apps.persons.services import parse_path_id
+
+    raw = str(owner_id or "").strip()
+    if not raw:
+        raise ApiError(DATA_SCOPE_DENIED, "文件归属对象未确定，暂无法校验归属")
+    if not Team.objects.filter(
+        pk=parse_path_id(raw, "ownerId"), is_deleted=False
+    ).exists():
+        raise ApiError(NOT_FOUND, "归属球队不存在或已删除")
+    _require_admin_scope(account)
+
+
 def list_teams(filters: dict, account) -> QuerySet[Team]:
     """GET /teams：keyword/category/status 筛选 + 数据范围 + 分页。"""
     _require_admin_scope(account)

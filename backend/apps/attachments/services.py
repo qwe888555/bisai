@@ -222,20 +222,28 @@ def upload_batch(
 
 
 def can_access(record: FileRecord, account) -> bool:
-    """第四层校验：对象归属。业务模块注册校验器后由校验器裁决。"""
+    """第四层校验：对象归属。三条独立通道分别核对，不互相替代：
+    1) 上传者本人——文件所有者通道（谁上传谁可读，与业务归属无关）；
+    2) ADMIN 全局——A′ 一期数据范围仅 ADMIN 全量（已确认决策）；
+    3) 业务归属校验器——业务资源所有权通道，由各业务域注册（见
+       register_owner_verifier）；PROVINCE_REVIEWER/MATCH_RECORDER 等
+       特权角色不再凭角色放行，PERSON/TEAM 私有附件必须通过归属裁决
+       （T4-04 安全缺口修复）。
+    未注册校验器或归属无法确认 → 一律拒绝（deny-by-default，不默认放行）。
+    """
     if record.uploaded_by == account.pk:
         return True
     roles = set(getattr(account, "roles", ()) or ())
-    if roles & {ADMIN, PROVINCE_REVIEWER, MATCH_RECORDER}:
+    if ADMIN in roles:
         return True
     verifier = OWNER_VERIFIERS.get(record.owner_type)
-    if verifier is not None:
-        try:
-            verifier(account, record.owner_id)
-            return True
-        except ApiError:
-            return False
-    return False
+    if verifier is None:
+        return False
+    try:
+        verifier(account, record.owner_id)
+        return True
+    except ApiError:
+        return False
 
 
 def get_record(account, file_id: str, *, require_access: bool = True) -> FileRecord:
