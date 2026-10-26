@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
 from typing import Callable, Iterable, Optional
 
 from django.core.files.uploadedfile import UploadedFile
@@ -273,4 +274,76 @@ def delete_record(account, file_id: str, version: Optional[int]) -> FileRecord:
     record.deleted_at = timezone.now()
     bump(record)
     record.save()
+    return record
+
+
+def _signing_key() -> bytes:
+    return (conf.CRYPTO_KEY or conf.JWT_SECRET).encode("utf-8")
+
+
+def _signature(file_id: str, variant: str, expires_at: int) -> str:
+    import base64
+    import hashlib
+    import hmac
+
+    message = f"{file_id}:{variant}:{expires_at}".encode("utf-8")
+    digest = hmac.new(_signing_key(), message, hashlib.sha256).digest()
+    return base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+
+
+def signed_url(record: FileRecord, variant: str = "content", ttl_seconds: Optional[int] = None) -> dict:
+    """生成短期可直连的展示地址，供 <img> 等无法带 Authorization 头的场景使用。
+
+    签名绑定 fileId + variant + 过期时间，泄露的旧地址到期自动失效；
+    文件本身仍是私有对象，不属于公开资源。
+    """
+    import time
+
+    if variant not in {"content", "thumbnail"}:
+        raise ApiError(
+            INVALID_ARGUMENT,
+            "未知的展示类型",
+            [{"field": "variant", "reason": "仅支持 content / thumbnail"}],
+        )
+    if variant == "thumbnail" and not record.thumbnail_key:
+        raise ApiError(NOT_FOUND, "该文件没有缩略图")
+    default_ttl = int(conf.FILE_TICKET_TTL_SECONDS)
+    ttl = max(30, min(int(ttl_seconds or default_ttl), 30 * 24 * 3600))
+    expires_at = int(time.time()) + ttl
+    signature = _signature(record.pk, variant, expires_at)
+    return {
+        "url": f"/api/v1/public/files/{record.pk}/{variant}?exp={expires_at}&sign={signature}",
+        "expiresAt": timezone.now() + timedelta(seconds=ttl),
+        "variant": variant,
+    }
+
+
+def portal_image_url(file_id: str, variant: str = "content") -> str:
+    """门户公开投影专用：为已发布内容的图片签发长期地址（默认 7 天）。
+
+    调用方是公开读接口（如 `/public/portal-resources`）在组装 PublicResource.imageUrl
+    时使用；业务方必须先确认该资源已发布，不要把草稿内容投影出去。
+    """
+    record = get_public_record(file_id)
+    return signed_url(record, variant, conf.PORTAL_FILE_TICKET_TTL_SECONDS)["url"]
+
+
+
+def verify_signature(file_id: str, variant: str, expires_at: int, signature: str) -> None:
+    import hmac
+    import time
+
+    if variant not in {"content", "thumbnail"}:
+        raise ApiError(FORBIDDEN, "展示地址无效")
+    if expires_at < int(time.time()):
+        raise ApiError(FORBIDDEN, "展示地址已过期，请重新获取")
+    expected = _signature(file_id, variant, expires_at)
+    if not hmac.compare_digest(expected, signature or ""):
+        raise ApiError(FORBIDDEN, "展示地址签名无效")
+
+
+def get_public_record(file_id: str) -> FileRecord:
+    record = FileRecord.objects.filter(pk=file_id).first()
+    if record is None:
+        raise ApiError(NOT_FOUND)
     return record

@@ -27,6 +27,9 @@ MAX_FILE_SIZE_MB: int = getattr(_s, "MAX_FILE_SIZE_MB", 10)
 MAX_BATCH_FILES: int = getattr(_s, "MAX_BATCH_FILES", 100)
 MAX_BATCH_TOTAL_MB: int = getattr(_s, "MAX_BATCH_TOTAL_MB", 50)
 FILE_TICKET_TTL_SECONDS: int = getattr(_s, "FILE_TICKET_TTL_SECONDS", 300)
+PORTAL_FILE_TICKET_TTL_SECONDS: int = getattr(
+    _s, "PORTAL_FILE_TICKET_TTL_SECONDS", 7 * 24 * 3600
+)
 MINIO_ENDPOINT: str = getattr(_s, "MINIO_ENDPOINT", "")
 MINIO_ACCESS_KEY: str = getattr(_s, "MINIO_ACCESS_KEY", "")
 MINIO_SECRET_KEY: str = getattr(_s, "MINIO_SECRET_KEY", "")
