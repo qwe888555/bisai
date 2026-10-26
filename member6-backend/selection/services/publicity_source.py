@@ -26,7 +26,7 @@ class PublicitySourceRecord:
     """One raw registration record supplied by member 4's archive."""
 
     source_id: str
-    event_id: int
+    event_id: str
     group_type: str
     city: str
     publicity_type: str
@@ -38,7 +38,10 @@ class PublicitySourceClient(ABC):
 
     @abstractmethod
     def get_registration(
-        self, publicity_type: str, source_id: str
+        self,
+        publicity_type: str,
+        source_id: str,
+        event_id: Optional[str] = None,
     ) -> Optional[PublicitySourceRecord]:
         """Return one registration or None when it does not exist."""
 
@@ -47,6 +50,7 @@ class PublicitySourceClient(ABC):
         group_type: Optional[str] = None,
         city: Optional[str] = None,
         publicity_type: Optional[str] = None,
+        event_id: Optional[str] = None,
     ) -> List[PublicitySourceRecord]:
         """Return registrations matching the optional filters."""
         return []
@@ -141,7 +145,7 @@ class DemoPublicitySourceClient(PublicitySourceClient):
                 self._records[(PublicityType.TEAM, source_id)] = (
                     PublicitySourceRecord(
                         source_id=source_id,
-                        event_id=1,
+                        event_id="1",
                         group_type=group_type,
                         city=self.CITIES[index % len(self.CITIES)],
                         publicity_type=PublicityType.TEAM,
@@ -164,7 +168,7 @@ class DemoPublicitySourceClient(PublicitySourceClient):
                 self._records[(PublicityType.COACH, source_id)] = (
                     PublicitySourceRecord(
                         source_id=source_id,
-                        event_id=1,
+                        event_id="1",
                         group_type=group_type,
                         city=self.CITIES[index % len(self.CITIES)],
                         publicity_type=PublicityType.COACH,
@@ -183,24 +187,33 @@ class DemoPublicitySourceClient(PublicitySourceClient):
                 )
 
     def get_registration(
-        self, publicity_type: str, source_id: str
+        self,
+        publicity_type: str,
+        source_id: str,
+        event_id: Optional[str] = None,
     ) -> Optional[PublicitySourceRecord]:
         try:
             code = PublicityType.parse(publicity_type)
         except BusinessError:
             return None
-        return self._records.get((code, str(source_id)))
+        record = self._records.get((code, str(source_id)))
+        if record is not None and event_id is not None:
+            if record.event_id != str(event_id):
+                return None
+        return record
 
     def list_registrations(
         self,
         group_type: Optional[str] = None,
         city: Optional[str] = None,
         publicity_type: Optional[str] = None,
+        event_id: Optional[str] = None,
     ) -> List[PublicitySourceRecord]:
         type_code = None
         if publicity_type:
             type_code = PublicityType.parse(publicity_type)
         city_text = (city or "").strip()
+        event_text = str(event_id) if event_id is not None else None
 
         return [
             record
@@ -209,6 +222,7 @@ class DemoPublicitySourceClient(PublicitySourceClient):
                 (not group_type or record.group_type == group_type)
                 and (not city_text or record.city == city_text)
                 and (not type_code or record.publicity_type == type_code)
+                and (event_text is None or record.event_id == event_text)
             )
         ]
 
@@ -217,8 +231,12 @@ _SOURCE_CLIENT_CACHE = {}
 
 
 def get_publicity_source_client() -> PublicitySourceClient:
-    """Resolve the configured registration source, with instance caching."""
-    mode = getattr(settings, "SELECTION_PUBLICITY_SOURCE_MODE", "demo")
+    """Resolve the configured registration source, with instance caching.
+
+    ``auto`` uses the main project's member4 tables when they are installed,
+    and falls back to the deterministic demo source in standalone mode.
+    """
+    mode = getattr(settings, "SELECTION_PUBLICITY_SOURCE_MODE", "auto")
     path = getattr(settings, "SELECTION_PUBLICITY_SOURCE_CLIENT", "")
     key = (mode, path)
 
@@ -243,11 +261,25 @@ def get_publicity_source_client() -> PublicitySourceClient:
             )
     elif mode == "demo":
         client = DemoPublicitySourceClient()
+    elif mode in ("auto", "main"):
+        from .main_adapters import main_data_available
+        from .main_adapters import MainProjectPublicitySourceClient
+
+        if main_data_available():
+            client = MainProjectPublicitySourceClient()
+        elif mode == "auto":
+            client = DemoPublicitySourceClient()
+        else:
+            raise BusinessError(
+                500,
+                "SELECTION_PUBLICITY_SOURCE_MODE=main，但主程序 "
+                "apps.enrollments/apps.persons/apps.teams/apps.events 未安装",
+            )
     else:
         raise BusinessError(
             500,
             "未配置报名公示数据源，请设置 "
-            "SELECTION_PUBLICITY_SOURCE_MODE=demo 或提供 "
+            "SELECTION_PUBLICITY_SOURCE_MODE=auto/demo 或提供 "
             "SELECTION_PUBLICITY_SOURCE_CLIENT",
         )
 

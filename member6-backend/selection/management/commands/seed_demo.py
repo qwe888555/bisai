@@ -83,11 +83,21 @@ class Command(BaseCommand):
         )
 
     def handle(self, *args, **options):
-        if getattr(settings, "SELECTION_ARCHIVE_MODE", "demo") != "demo":
+        mode = getattr(settings, "SELECTION_ARCHIVE_MODE", "auto")
+        if mode not in ("demo", "auto"):
             raise CommandError(
                 "seed_demo 仅用于独立演示，请先把 "
                 "SELECTION_ARCHIVE_MODE 设置为 demo"
             )
+        if mode == "auto":
+            from selection.services.main_adapters import main_data_available
+
+            if main_data_available():
+                raise CommandError(
+                    "检测到主程序成员4数据表，拒绝向主库写入演示数据。"
+                    "如确需演示，请显式设置 SELECTION_ARCHIVE_MODE=demo "
+                    "并使用独立数据库。"
+                )
 
         if options["reset"]:
             self._reset()
@@ -143,7 +153,7 @@ class Command(BaseCommand):
                     group_type=group_type,
                     score_round=score_round,
                     status=1,
-                    created_by=1,
+                    created_by="1",
                 )
                 TemplateItem.objects.bulk_create(
                     [
@@ -210,8 +220,8 @@ class Command(BaseCommand):
                         player_position=candidate.position,
                         total_score=total,
                         version=0,
-                        created_by=1,
-                        updated_by=1,
+                        created_by="1",
+                        updated_by="1",
                     )
                     ScoreItem.objects.bulk_create(
                         [
@@ -235,20 +245,20 @@ class Command(BaseCommand):
         created = 0
         for group_type in GROUPS:
             if ResultBatch.objects.filter(
-                event_id=1, group_type=group_type, active=True
+                event_id="1", group_type=group_type, active=True
             ).exists():
                 continue
             try:
                 generate_result(
                     {
-                        "event_id": 1,
+                        "event_id": "1",
                         "group_type": group_type,
                         "result_round": RoundType.FINAL,
                         "quota": 11,
                         "initial_weight": "0.4",
                         "final_weight": "0.6",
                     },
-                    user_id=1,
+                    user_id="1",
                 )
                 created += 1
             except BusinessError as exc:
@@ -298,7 +308,7 @@ class Command(BaseCommand):
                             "publicity_type": source.publicity_type,
                             "source_id": source.source_id,
                         },
-                        user_id=1,
+                        user_id="1",
                     )
                     created += 1
                 except BusinessError as exc:
@@ -314,9 +324,13 @@ class Command(BaseCommand):
 
     @staticmethod
     def _dimension_values(candidate_id, score_round, items):
+        try:
+            numeric_id = int(str(candidate_id))
+        except (TypeError, ValueError):
+            numeric_id = sum(ord(char) for char in str(candidate_id))
         base = 60 + (
             (
-                candidate_id * 7
+                numeric_id * 7
                 + (0 if score_round == RoundType.INITIAL else 6)
             )
             % 30
@@ -332,7 +346,7 @@ class Command(BaseCommand):
             value = (
                 base
                 + offsets.get(item.dimension_code, 0)
-                + ((candidate_id + index) % 4)
+                + ((numeric_id + index) % 4)
             )
             value = max(0, min(100, value))
             values[item.dimension_code] = Decimal(value)

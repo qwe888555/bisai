@@ -25,7 +25,7 @@ from ..common import (
     BusinessError,
     get_field,
     paginated,
-    parse_int,
+    parse_event_id,
     to_datetime_str,
 )
 from ..enums import GroupType, PublicityStatus, PublicityType
@@ -199,10 +199,10 @@ def _build_snapshot(source):
 
 def _prepare_source(source, event_id, expected_type=None):
     """Validate one source record and build its public snapshot."""
-    source_event_id = parse_int(
-        source.event_id, "报名档案赛事ID", min_value=1
+    source_event_id = parse_event_id(
+        source.event_id, "报名档案赛事ID"
     )
-    if source_event_id != event_id:
+    if source_event_id != str(event_id):
         raise BusinessError(
             400, "报名档案不属于当前赛事，不能在本赛事公示"
         )
@@ -284,7 +284,7 @@ def _publish_source(
     record.status = PublicityStatus.PUBLISHED
     record.published_by = user_id
     record.published_at = now
-    record.cancelled_by = 0
+    record.cancelled_by = ""
     record.cancelled_at = None
     record.cancel_reason = ""
     record.save()
@@ -292,12 +292,11 @@ def _publish_source(
     return record, action
 
 
-def publish_registration(data, user_id=0):
+def publish_registration(data, user_id=""):
     """Publish one athlete/coach/team registration."""
-    event_id = parse_int(
+    event_id = parse_event_id(
         get_field(data, "event_id", "eventId", label="赛事ID"),
         "event_id",
-        min_value=1,
     )
     publicity_type = PublicityType.parse(
         get_field(
@@ -320,6 +319,9 @@ def publish_registration(data, user_id=0):
         )
     ).strip()
 
+    # Look the record up without an event filter so a record from another event
+    # produces the clearer "不属于本赛事" 400 from _prepare_source rather than a
+    # misleading 404.  Source IDs are globally unique in both demo and main data.
     source = get_publicity_source_client().get_registration(
         publicity_type, source_id
     )
@@ -337,16 +339,15 @@ def publish_registration(data, user_id=0):
     return payload
 
 
-def batch_publish(data, user_id=0):
+def batch_publish(data, user_id=""):
     """Publish all source records matching a filter.
 
     Already-published records are skipped rather than treated as failures, so
     the endpoint can be called repeatedly by a CMS "publish all" button.
     """
-    event_id = parse_int(
+    event_id = parse_event_id(
         get_field(data, "event_id", "eventId", label="赛事ID"),
         "event_id",
-        min_value=1,
     )
     group_raw = get_field(
         data, "group_type", "groupType", required=False
@@ -372,6 +373,7 @@ def batch_publish(data, user_id=0):
         group_type=group_type,
         city=city,
         publicity_type=publicity_type,
+        event_id=event_id,
     )
 
     published = 0
@@ -416,7 +418,7 @@ def batch_publish(data, user_id=0):
 
 
 @transaction.atomic
-def cancel_publicity(record_id, data=None, user_id=0):
+def cancel_publicity(record_id, data=None, user_id=""):
     """Cancel one publicity record.  Idempotent for repeated clicks."""
     reason = get_field(
         data or {},

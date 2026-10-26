@@ -1,25 +1,33 @@
 ### 遴选评分 + 公示接口示例（VS Code REST Client / JetBrains HTTP Client 均可）
-### 运行环境：Python > 3.10.9、Django 5.2 LTS、django-ninja 1.3
+### 运行环境：Python > 3.10.9、Django 5.2 LTS、django-ninja >=1.6,<2.0（与主程序一致）
 ### 启动前：
 ###   python -m pip install -r requirements.txt
 ###   python manage.py migrate
 ###   python manage.py seed_demo
-###   python manage.py runserver
+###   python manage.py runserver 8001
 ###
-### 自动文档：
-###   Swagger UI  http://127.0.0.1:8000/api/selection/docs
-###   OpenAPI     http://127.0.0.1:8000/api/selection/openapi.json
-### 完整参数/字段/错误码说明见同目录 API.md
+### 自动文档（独立运行）：
+###   Swagger UI  http://127.0.0.1:8001/api/selection/docs
+###   OpenAPI     http://127.0.0.1:8001/api/selection/openapi.json
+### 完整参数/字段/错误码说明见同目录 成员6-遴选评分与报名公示接口文档.md / API.md
 ###
-### 演示档案：高校组 10001-10015，中学组 20001-20015，小学组 30001-30015，event_id=1。
+### 演示档案（字符串 ID）：高校组 "10001"-"10015"，中学组 "20001"-"20015"，
+### 小学组 "30001"-"30015"；所有演示数据属于 event_id="1"。
 ### 演示数据下所有球员都已有初选/复选评分，直接执行“录入评分”会返回 409。
 ### 想手动测试录入：先执行
 ###   python manage.py seed_demo --reset --templates-only
 ### 再执行下面的“新建模板”，把返回的 id 填到“录入评分”的 template_id。
+###
+### 独立运行：写操作通过 X-User-Id 记录审计用户，管理接口不鉴权。
+### 并入主程序后：基础地址改为 http://127.0.0.1:8000/api/v1，
+###   管理接口必须携带 Authorization: Bearer <accessToken>；
+###   门户公示 GET（列表/详情/市州）仍然公开；event_id 用 evt_...，档案 ID 用 rst_...。
+###   此时把下面的 X-User-Id 换成 Authorization 头即可。
 
-@host = http://127.0.0.1:8000
+@host = http://127.0.0.1:8001
 @eventId = 1
 @userId = 1
+@token = 在这里粘贴主程序登录返回的 accessToken
 
 ### 1. 模板列表：高校组初选
 GET {{host}}/api/selection/templates/?group_type=HIGHER&round=INITIAL
@@ -65,11 +73,11 @@ Content-Type: application/json
 X-User-Id: {{userId}}
 
 {
-  "event_id": 1,
+  "event_id": "1",
   "group_type": "HIGHER",
   "round": "INITIAL",
   "template_id": 1,
-  "candidate_id": 10001,
+  "candidate_id": "10001",
   "scores": [
     {"dimension_code": "TECH", "score": 92},
     {"dimension_code": "MATCH", "score": 88},
@@ -84,11 +92,11 @@ Content-Type: application/json
 X-User-Id: {{userId}}
 
 {
-  "event_id": 1,
+  "event_id": "1",
   "group_type": "HIGHER",
   "round": "FINAL",
   "template_id": 2,
-  "candidate_id": 10001,
+  "candidate_id": "10001",
   "scores": [
     {"dimension_code": "TECH", "score": 95},
     {"dimension_code": "MATCH", "score": 90},
@@ -136,7 +144,7 @@ Content-Type: application/json
 X-User-Id: {{userId}}
 
 {
-  "event_id": 1,
+  "event_id": "1",
   "group_type": "HIGHER",
   "result_round": "FINAL",
   "quota": 11,
@@ -150,7 +158,7 @@ Content-Type: application/json
 X-User-Id: {{userId}}
 
 {
-  "event_id": 1,
+  "event_id": "1",
   "group_type": "HIGHER",
   "result_round": "INITIAL",
   "quota": 11
@@ -171,21 +179,21 @@ POST {{host}}/api/selection/results/generate/
 Content-Type: application/json
 X-User-Id: {{userId}}
 
-{"event_id": 1, "group_type": "HIGHER", "quota": 11}
+{"event_id": "1", "group_type": "HIGHER", "quota": 11}
 
 ###
 POST {{host}}/api/selection/results/generate/
 Content-Type: application/json
 X-User-Id: {{userId}}
 
-{"event_id": 1, "group_type": "MIDDLE", "quota": 11}
+{"event_id": "1", "group_type": "MIDDLE", "quota": 11}
 
 ###
 POST {{host}}/api/selection/results/generate/
 Content-Type: application/json
 X-User-Id: {{userId}}
 
-{"event_id": 1, "group_type": "PRIMARY", "quota": 11}
+{"event_id": "1", "group_type": "PRIMARY", "quota": 11}
 
 ### ==================================================================
 ### T6-04 公示（D6）
@@ -199,7 +207,7 @@ Content-Type: application/json
 X-User-Id: {{userId}}
 
 {
-  "event_id": 1,
+  "event_id": "1",
   "publicity_type": "ATHLETE",
   "source_id": "10004"
 }
@@ -210,7 +218,7 @@ Content-Type: application/json
 X-User-Id: {{userId}}
 
 {
-  "event_id": 1,
+  "event_id": "1",
   "publicity_type": "COACH",
   "source_id": "C1002"
 }
@@ -221,7 +229,7 @@ Content-Type: application/json
 X-User-Id: {{userId}}
 
 {
-  "event_id": 1,
+  "event_id": "1",
   "publicity_type": "TEAM",
   "source_id": "T1002"
 }
@@ -265,7 +273,7 @@ Content-Type: application/json
 X-User-Id: {{userId}}
 
 {
-  "event_id": 1,
+  "event_id": "1",
   "group_type": "MIDDLE",
   "publicity_type": "COACH"
 }
