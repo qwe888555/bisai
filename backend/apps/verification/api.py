@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Literal, Optional
 
 from ninja import Field, Router
 
@@ -62,6 +62,7 @@ def _identity_out(check: IdentityCheck) -> dict:
         "matchId": check.match_id,
         "enrollmentId": check.enrollment_id,
         "athleteId": check.athlete_id,
+        "capturedPhotoFileId": check.captured_photo_file_id,
         "mode": check.mode,
         "machineStatus": check.machine_status,
         "machineVerified": bool(check.machine_verified),
@@ -78,6 +79,16 @@ def _identity_out(check: IdentityCheck) -> dict:
     for key, value in optional.items():
         if value not in (None, ""):
             data[key] = value
+    if check.reviewer_account_id:
+        from apps.accounts.models import Account
+
+        reviewer = (
+            Account.objects.filter(pk=check.reviewer_account_id)
+            .values_list("display_name", "username")
+            .first()
+        )
+        if reviewer:
+            data["reviewerName"] = reviewer[0] or reviewer[1]
     return data
 
 
@@ -118,12 +129,22 @@ def identity_create(request, payload: IdentityCheckCreate):
     response=EnvelopeOut,
     summary="身份核验记录列表",
 )
-def identity_list(request):
+def identity_list(
+    request,
+    matchId: Optional[str] = None,
+    enrollmentId: Optional[str] = None,
+    athleteId: Optional[str] = None,
+    manualStatus: Optional[str] = None,
+    machineStatus: Optional[str] = None,
+):
     actor = require("identityList")
     queryset = services.list_checks(
         {
-            "enrollmentId": request.GET.get("enrollmentId"),
-            "athleteId": request.GET.get("athleteId"),
+            "matchId": matchId,
+            "enrollmentId": enrollmentId,
+            "athleteId": athleteId,
+            "manualStatus": manualStatus,
+            "machineStatus": machineStatus,
         }
     )
     return paginate(request, queryset, mapper=_identity_out)

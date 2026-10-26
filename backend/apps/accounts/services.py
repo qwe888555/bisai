@@ -12,6 +12,7 @@ from typing import Any, Optional
 
 from django.core.cache import cache
 from django.db import IntegrityError, transaction
+from django.db.models import Q
 from django.utils import timezone
 
 from apps.common import crypto
@@ -652,9 +653,30 @@ def list_audit_logs(actor: Account, filters: dict):
     log_type = filters.get("logType")
     if log_type:
         queryset = queryset.filter(log_type=log_type)
+    if filters.get("outcome"):
+        queryset = queryset.filter(outcome=filters["outcome"])
+    object_type = filters.get("objectType")
+    if object_type:
+        queryset = queryset.filter(object_type=object_type)
     object_id = filters.get("objectId")
     if object_id:
         queryset = queryset.filter(object_id=object_id)
+    operator_account_id = filters.get("operatorAccountId")
+    if operator_account_id:
+        queryset = queryset.filter(operator_account_id=operator_account_id)
+    keyword = filters.get("keyword")
+    if keyword:
+        # 关键词覆盖摘要/动作/对象与操作人账号名，避免只能按 ID 精确检索。
+        matched_accounts = Account.objects.filter(
+            Q(username__icontains=keyword) | Q(display_name__icontains=keyword)
+        ).values_list("id", flat=True)
+        queryset = queryset.filter(
+            Q(summary__icontains=keyword)
+            | Q(action__icontains=keyword)
+            | Q(object_type__icontains=keyword)
+            | Q(object_id__icontains=keyword)
+            | Q(operator_account_id__in=matched_accounts)
+        )
     if filters.get("from"):
         queryset = queryset.filter(created_at__gte=filters["from"])
     if filters.get("to"):
