@@ -450,6 +450,20 @@ def goal_ranking_row_out(rank: int, athlete_id: str, athlete_name: str,
 
 # ---------------------------------------------------------------- 门户公开只读(T5-07)
 
+def public_event_out(event) -> dict:
+    """PublicEvent 安全投影：不含 version/createdAt/updatedAt 内部字段；
+    status 保留（访客需据此判断报名/进行状态）。"""
+    return {
+        "id": event.pk,
+        "name": event.name,
+        "season": event.season,
+        "eventCategory": event.event_category,
+        "status": event.status,
+        "registrationOpensAt": event.registration_opens_at,
+        "registrationClosesAt": event.registration_closes_at,
+        "description": event.description or "",
+    }
+
 def public_match_out(match) -> dict:
     """PublicMatch 安全投影：仅已发布对阵；队名暂用队ID占位(名册由成员6提供)。"""
     return {

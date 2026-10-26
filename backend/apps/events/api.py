@@ -890,6 +890,15 @@ def goal_ranking(
 
 # ---------------------------------------------------------------- 门户公开读(T5-07，免登录)
 
+@router.get("/public/events", auth=None, response=EnvelopeOut, summary="门户公开赛事列表")
+def public_event_list(
+    request,
+    season: Optional[str] = None,
+    eventCategory: Optional[str] = None,
+):
+    qs = services.public_list_events({"season": season, "eventCategory": eventCategory})
+    return paginate(request, qs, mapper=s.public_event_out)
+
 @router.get("/public/matches", auth=None, response=EnvelopeOut, summary="门户对阵及赛果列表")
 def public_match_list(
     request,
