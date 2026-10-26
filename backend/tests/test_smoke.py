@@ -452,6 +452,38 @@ class ApiSmokeTests(TestCase):
 
         self.assertTrue(hasattr(MySQLdb, "connect"))
 
+    def test_policy_document_syncs_on_publish_and_offline(self):
+        from apps.events.models import Content
+        from apps.events.services import publish_content, unpublish_content
+        from apps.policyqa.models import PolicyDocument
+        from apps.policyqa.services import answer
+
+        Content.objects.create(
+            id="cnt_policy_sync_case",
+            content_type="POLICY",
+            title="省级足球赛事报名办法",
+            summary="报名条件与材料",
+            body_html="<p>参赛球员须为本校在籍学生。</p>",
+            body_text="参赛球员须为本校在籍学生，报名需提交学籍材料。",
+            status="DRAFT",
+        )
+
+        publish_content("cnt_policy_sync_case", 0)
+
+        document = PolicyDocument.objects.get(source_content_id="cnt_policy_sync_case")
+        self.assertTrue(document.enabled)
+        self.assertIsNotNone(document.published_at)
+
+        result = answer("报名需要什么条件")
+        self.assertEqual(result["status"], "DISABLED")
+        self.assertEqual(len(result["fallbackPolicies"]), 1)
+        self.assertEqual(result["fallbackPolicies"][0]["title"], "省级足球赛事报名办法")
+
+        unpublish_content("cnt_policy_sync_case", 1, "测试下线")
+        document.refresh_from_db()
+        self.assertFalse(document.enabled)
+        self.assertEqual(answer("报名需要什么条件")["fallbackPolicies"], [])
+
     def test_init_admin_command(self):
         from django.core.management import CommandError
 

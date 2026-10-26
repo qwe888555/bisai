@@ -786,6 +786,10 @@ def update_content(content_id: str, data: dict):
     content.revision = int(content.revision or 1) + 1
     bump(content)
     content.save()
+    if content.status == "PUBLISHED":
+        from apps.policyqa.services import sync_policy_document
+
+        sync_policy_document(content)
     _invalidate_public_cache()
     return content
 
@@ -796,6 +800,9 @@ def delete_content(content_id: str, version: int):
     content.deleted_at = timezone.now()
     bump(content)
     content.save()
+    from apps.policyqa.services import sync_policy_document
+
+    sync_policy_document(content)
     _invalidate_public_cache()
     return content
 
@@ -807,6 +814,9 @@ def publish_content(content_id: str, version: int):
     content.published_at = timezone.now()
     bump(content)
     content.save()
+    from apps.policyqa.services import sync_policy_document
+
+    sync_policy_document(content)
     _invalidate_public_cache()
     return content
 
@@ -817,6 +827,9 @@ def unpublish_content(content_id: str, version: int, reason: str):
     content.status = "OFFLINE"
     bump(content)
     content.save()
+    from apps.policyqa.services import sync_policy_document
+
+    sync_policy_document(content)
     _invalidate_public_cache()
     return content
 
