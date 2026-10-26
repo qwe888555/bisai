@@ -392,7 +392,24 @@ def content_out(content) -> dict:
     return data
 
 
-def public_content_out(content) -> dict:
+def _portal_image_url(file_id: str, base_url: str = "", variant: str = "content") -> str:
+    """为已发布门户内容签发图片地址；文件缺失时返回空串，不阻断列表。"""
+    if not file_id:
+        return ""
+    from apps.attachments import services as attachments
+
+    try:
+        url = attachments.portal_image_url(str(file_id), variant)
+    except Exception:  # noqa: BLE001 - 图片缺失不应阻断公开列表
+        return ""
+    if base_url:
+        from urllib.parse import urljoin
+
+        return urljoin(base_url, url.lstrip("/"))
+    return url
+
+
+def public_content_out(content, base_url: str = "") -> dict:
     """PublicContent 安全投影：不含 version/status/bodyText/pinned 等内部字段。"""
     return {
         "id": content.pk,
@@ -400,7 +417,7 @@ def public_content_out(content) -> dict:
         "title": content.title,
         "summary": content.summary or "",
         "bodyHtml": content.body_html,
-        "publicCoverUrl": "",
+        "publicCoverUrl": _portal_image_url(content.cover_file_id, base_url),
         "eventId": content.event_id or "",
         "groupId": content.group_id or "",
         "publishedAt": content.published_at,
@@ -424,13 +441,13 @@ def portal_resource_out(resource) -> dict:
     }
 
 
-def public_resource_out(resource) -> dict:
+def public_resource_out(resource, base_url: str = "") -> dict:
     """PublicResource 安全投影：不暴露 imageFileId 内部引用与 enabled。"""
     return {
         "id": resource.pk,
         "resourceType": resource.resource_type,
         "title": resource.title,
-        "imageUrl": "",
+        "imageUrl": _portal_image_url(resource.image_file_id, base_url),
         "targetContentId": resource.target_content_id or "",
         "targetUrl": resource.target_url or "",
         "sortOrder": int(resource.sort_order or 0),
@@ -515,12 +532,17 @@ def public_match_detail_out(match, events) -> dict:
     return data
 
 
-def public_live_post_out(post) -> dict:
-    """PublicLivePost 投影；imageUrls 待成员2文件服务解析真实公网URL。"""
+def public_live_post_out(post, base_url: str = "") -> dict:
+    """PublicLivePost 投影；图片按已发布内容签发短期地址。"""
+    image_urls = []
+    for file_id in post.image_file_ids or []:
+        url = _portal_image_url(str(file_id), base_url)
+        if url:
+            image_urls.append(url)
     return {
         "id": post.pk,
         "text": post.text,
-        "imageUrls": [],
+        "imageUrls": image_urls,
         "minute": post.minute,
         "updatedAt": post.updated_at,
     }

@@ -803,6 +803,11 @@ def portal_resource_delete(request, resource_id: str, version: Optional[int] = N
 
 # ---------------------------------------------------------------- 公开只读（7.1 / 7.2，免登录）
 
+def _public_base(request) -> str:
+    """门户图片签名地址的绝对前缀，避免前端把 /api 当成自身域名。"""
+    return request.build_absolute_uri("/")
+
+
 @router.get("/public/contents", auth=None, response=EnvelopeOut, summary="门户已发布内容列表")
 def public_content_list(
     request,
@@ -816,19 +821,21 @@ def public_content_list(
         "contentType": contentType, "eventId": eventId, "groupId": groupId,
         "keyword": keyword, "eventCategory": eventCategory,
     })
-    return paginate(request, qs, mapper=s.public_content_out)
+    base_url = _public_base(request)
+    return paginate(request, qs, mapper=lambda item: s.public_content_out(item, base_url))
 
 
 @router.get("/public/contents/{content_id}", auth=None, response=EnvelopeOut, summary="门户内容详情")
 def public_content_get(request, content_id: str):
     content = services.public_get_content(content_id)
-    return ok(s.public_content_out(content))
+    return ok(s.public_content_out(content, _public_base(request)))
 
 
 @router.get("/public/resources", auth=None, response=EnvelopeOut, summary="门户轮播/链接图/合作方展示")
 def public_resource_list(request, resourceType: Optional[str] = None):
     qs = services.public_list_resources(resourceType)
-    return paginate(request, qs, mapper=s.public_resource_out)
+    base_url = _public_base(request)
+    return paginate(request, qs, mapper=lambda item: s.public_resource_out(item, base_url))
 
 # ---------------------------------------------------------------- 赛果(5.5)：MATCH_RECORDER / ADMIN / PROVINCE_REVIEWER
 
@@ -923,9 +930,10 @@ def public_match_get(request, match_id: str):
 @router.get("/public/matches/{match_id}/live-feed", auth=None, response=EnvelopeOut, summary="短轮询图文直播")
 def public_live_feed(request, match_id: str, afterRevision: int = 0):
     feed = services.public_live_feed(match_id, afterRevision)
+    base_url = _public_base(request)
     return ok({
         "feedRevision": feed["feedRevision"],
-        "items": [s.public_live_post_out(p) for p in feed["items"]],
+        "items": [s.public_live_post_out(p, base_url) for p in feed["items"]],
         "deletedIds": feed["deletedIds"],
         "resetRequired": feed["resetRequired"],
     })
