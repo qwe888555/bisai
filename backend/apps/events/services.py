@@ -1067,6 +1067,15 @@ def goal_ranking(event_id: str, group_id: Optional[str], category: Optional[str]
 
 # ---------------------------------------------------------------- 门户公开读(T5-07，免登录)
 
+def public_list_events(filters: dict):
+    """门户公开赛事列表：排除 DRAFT 草稿；匿名访客据此选择赛事进入赛程/射手榜。"""
+    qs = Event.objects.exclude(status="DRAFT")
+    if filters.get("season"):
+        qs = qs.filter(season=filters["season"])
+    if filters.get("eventCategory"):
+        qs = qs.filter(event_category=filters["eventCategory"])
+    return qs.order_by("-created_at", "id")
+
 def public_list_matches(filters: dict):
     from .models import Match
 
