@@ -208,6 +208,161 @@ class ApiSmokeTests(TestCase):
         self.assertEqual(thumb["Content-Type"], "image/jpeg")
         self.assertEqual(thumb["Cache-Control"], "private, no-store")
 
+    def test_signed_url_serves_image_without_token(self):
+        from django.core.files.uploadedfile import SimpleUploadedFile
+        from urllib.parse import parse_qs, urlparse
+
+        token = self.login()
+        uploaded = self.client.post(
+            f"{BASE}/files",
+            data={
+                "ownerType": "MATCH",
+                "ownerId": "match_demo_signed",
+                "category": "CAPTURE_PHOTO",
+                "file": SimpleUploadedFile("photo.png", REAL_PNG, "image/png"),
+            },
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+        self.assertEqual(uploaded.status_code, 200, uploaded.content)
+        file_id = body(uploaded)["data"]["id"]
+
+        signed = self.get(f"/files/{file_id}/signed-url?variant=thumbnail", token)
+        self.assertEqual(signed.status_code, 200, signed.content)
+        data = body(signed)["data"]
+        self.assertEqual(data["variant"], "thumbnail")
+        self.assertTrue(
+            data["url"].startswith(f"/api/v1/public/files/{file_id}/thumbnail?")
+        )
+
+        # 不携带 Authorization 直连，等价于 <img src> 场景
+        direct = self.client.get(data["url"])
+        self.assertEqual(direct.status_code, 200)
+        self.assertEqual(direct["Content-Type"], "image/jpeg")
+        self.assertEqual(direct["Cache-Control"], "private, no-store")
+
+        # 篡改签名必须 403，不能靠猜 fileId 读取私有文件
+        parsed = urlparse(data["url"])
+        exp = parse_qs(parsed.query)["exp"][0]
+        tampered = f"{parsed.path}?exp={exp}&sign=not-a-valid-signature"
+        rejected = self.client.get(tampered)
+        self.assertEqual(rejected.status_code, 403)
+        self.assertEqual(body(rejected)["code"], "FORBIDDEN")
+
+    def test_signed_url_rejects_expired_ticket(self):
+        import time
+
+        from apps.attachments import services as attachment_services
+
+        token = self.login()
+        file_id = self.upload_capture_photo("match_demo_expired", token)
+        expired_at = int(time.time()) - 10
+        sign = attachment_services._signature(file_id, "content", expired_at)
+
+        response = self.client.get(
+            f"{BASE}/public/files/{file_id}/content?exp={expired_at}&sign={sign}"
+        )
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(body(response)["code"], "FORBIDDEN")
+
+    def test_portal_image_url_is_long_lived(self):
+        import time
+
+        from django.core.files.uploadedfile import SimpleUploadedFile
+        from urllib.parse import parse_qs, urlparse
+
+        from apps.attachments import services as attachment_services
+
+        token = self.login()
+        uploaded = self.client.post(
+            f"{BASE}/files",
+            data={
+                "ownerType": "RESOURCE",
+                "ownerId": "resource_demo_banner",
+                "category": "CMS_IMAGE",
+                "file": SimpleUploadedFile("banner.png", REAL_PNG, "image/png"),
+            },
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+        self.assertEqual(uploaded.status_code, 200, uploaded.content)
+        file_id = body(uploaded)["data"]["id"]
+
+        url = attachment_services.portal_image_url(file_id, "thumbnail")
+        exp = int(parse_qs(urlparse(url).query)["exp"][0])
+        # 门户地址默认 7 天，不能 5 分钟就失效
+        self.assertGreater(exp - int(time.time()), 6 * 24 * 3600)
+
+        direct = self.client.get(url)
+        self.assertEqual(direct.status_code, 200)
+        self.assertEqual(direct["Content-Type"], "image/jpeg")
+
+    # ---------------------------------------------------------------- 账号绑定约定
+    def test_account_role_must_match_org_type(self):
+        token = self.login()
+        wrong = {
+            "username": "team_wrong_org",
+            "displayName": "错绑学校节点",
+            "roles": ["TEAM"],
+            "orgId": "org_school_01",
+        }
+        response = self.post("/accounts", wrong, token)
+        self.assertEqual(response.status_code, 400, response.content)
+        self.assertEqual(body(response)["code"], "INVALID_ARGUMENT")
+
+        right = dict(wrong, username="team_right_org", orgId="org_team_01")
+        created = self.post("/accounts", right, token)
+        self.assertEqual(created.status_code, 200, created.content)
+
+        multi = {
+            "username": "team_university_mix",
+            "displayName": "多组织类型角色",
+            "roles": ["TEAM", "UNIVERSITY"],
+            "orgId": "org_team_01",
+        }
+        conflict = self.post("/accounts", multi, token)
+        self.assertEqual(conflict.status_code, 400, conflict.content)
+        self.assertEqual(body(conflict)["code"], "INVALID_ARGUMENT")
+
+    def test_person_can_bind_only_one_account(self):
+        token = self.login()
+        first = {
+            "username": "athlete_bound_a",
+            "displayName": "绑定人员A",
+            "roles": ["ATHLETE"],
+            "orgId": "org_school_01",
+            "personId": "person_bind_demo",
+        }
+        self.assertEqual(self.post("/accounts", first, token).status_code, 200)
+
+        second = dict(first, username="athlete_bound_b")
+        duplicated = self.post("/accounts", second, token)
+        self.assertEqual(duplicated.status_code, 409, duplicated.content)
+        self.assertEqual(body(duplicated)["code"], "DUPLICATE_RESOURCE")
+
+        # 邀请注册通道同样不能绕过"一个人员只能绑定一个账号"
+        invite = self.post(
+            "/accounts/registration-invitations",
+            {
+                "kind": "ATHLETE",
+                "orgId": "org_school_01",
+                "personId": "person_bind_demo",
+            },
+            token,
+        )
+        self.assertEqual(invite.status_code, 200, invite.content)
+        register_token = body(invite)["data"]["registrationToken"]
+        registered = self.post(
+            "/auth/registrations",
+            {
+                "registrationToken": register_token,
+                "username": "athlete_invited",
+                "password": "Invited@2026",
+                "realName": "受邀人员",
+                "idNumber": "110101200001010011",
+            },
+        )
+        self.assertEqual(registered.status_code, 409, registered.content)
+        self.assertEqual(body(registered)["code"], "DUPLICATE_RESOURCE")
+
     def test_bad_extension_is_415(self):
         from django.core.files.uploadedfile import SimpleUploadedFile
 
