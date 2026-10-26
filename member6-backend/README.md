@@ -47,7 +47,7 @@
 
 - Python > 3.10.9（本机验证：Python 3.12.7）
 - **Django 5.2 LTS**（本机验证：Django 5.2.18）
-- **django-ninja 1.3**（本机验证：1.3.0）
+- **django-ninja >=1.6,<2.0**（与主程序 `backend/requirements.txt` 保持一致；本机验证：1.7.1）
 - SQLite（默认，零配置演示）/ MySQL 8（正式环境）
 - openpyxl 3.1（Excel 导出）
 - HTTP 层使用 `NinjaAPI` + `Router`，**不依赖 DRF**；业务逻辑集中在 `selection/services/`，主程序即使使用 DRF 也可以直接复用
@@ -59,7 +59,7 @@
 ```
 football-systerm/
 ├── manage.py
-├── requirements.txt              # Django 5.2 + django-ninja 1.3 + openpyxl
+├── requirements.txt              # Django 5.2 + django-ninja >=1.6,<2.0 + openpyxl
 ├── requirements-mysql.txt        # 追加 PyMySQL
 ├── config/
 │   ├── settings.py               # 数据库、时区、SELECTION_* 集成配置
@@ -593,8 +593,9 @@ SELECTION_PUBLICITY_SOURCE_CLIENT = (
    会创建 7 张 `sel_*` 表（6 张遴选评分表 + `sel_publicity` 公示表）。
 5. 主程序需要安装 `django-ninja` 和 `openpyxl`（本模块的 `requirements.txt` 已固定版本范围）：
    ```bash
-   python -m pip install "django-ninja>=1.3,<1.4" "openpyxl>=3.1,<4"
+   python -m pip install "django-ninja>=1.6,<2.0" "openpyxl>=3.1,<4"
    ```
+   > 注意：主程序成员5的代码使用了 `from ninja import Status`，要求 django-ninja >= 1.6。不要把本模块依赖固定回 1.3，否则会降级同一环境中的 django-ninja，导致主程序启动时报 `ImportError: cannot import name 'Status' from 'ninja'`。
    如果主程序本身也提供 Ninja API，可以保留本模块独立的 `NinjaAPI` 实例，也可以把 `selection.api.router` 挂到主程序的 `NinjaAPI` 上。
 6. 如果主程序已有同名 `selection` App，请重命名本 App 并同步修改 import（或把本 App 作为子模块放入一个独立命名空间）。
 

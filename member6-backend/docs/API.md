@@ -3,7 +3,7 @@
 > 模块：T6-03 遴选评分（模块 6.2） + T6-04 报名公示（模块 7.3）  
 > 版本：1.0.0  
 > 更新时间：2026-10-23  
-> 技术基线：Python > 3.10.9、Django 5.2 LTS、django-ninja 1.3  
+> 技术基线：Python > 3.10.9、Django 5.2 LTS、django-ninja >=1.6,<2.0（与主程序一致）  
 > 代码目录：`football-systerm/`
 
 ---
@@ -1368,8 +1368,9 @@ python manage.py seed_demo --reset --templates-only
    ```
 4. 安装依赖：
    ```bash
-   python -m pip install "django-ninja>=1.3,<1.4" "openpyxl>=3.1,<4"
+   python -m pip install "django-ninja>=1.6,<2.0" "openpyxl>=3.1,<4"
    ```
+   > 注意：主程序成员5使用 `from ninja import Status`，要求 django-ninja >= 1.6；不要把版本固定回 1.3，否则会降级依赖并导致主程序启动失败。
 5. 执行迁移：
    ```bash
    python manage.py migrate
@@ -1428,4 +1429,5 @@ No changes detected
 | D4–D6 | 完成 T6-03 遴选评分：模板、评分、汇总、结果、Excel |
 | D6 | 完成 T6-04 报名公示：公示、取消、查询、脱敏、白名单 |
 | 2026-10-21 | 升级 Django 5.2 LTS + django-ninja 1.3，保留原接口契约 |
+| 2026-10-26 | django-ninja 约束调整为 >=1.6,<2.0，与主程序统一，修复依赖降级导致的启动失败 |
 | 2026-10-23 | 整理正式 API 文档 |
