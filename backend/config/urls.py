@@ -7,6 +7,7 @@
 from django.urls import path, re_path
 
 from apps.accounts.api import router as accounts_router
+from apps.events.api import router as events_router
 from apps.attachments.api import router as attachments_router
 from apps.common.api import api_not_found
 from apps.common.api import router as common_router
@@ -24,6 +25,7 @@ api.add_router("", attachments_router, tags=["files"])
 api.add_router("", verification_router, tags=["identity"])
 api.add_router("", policyqa_router, tags=["policy"])
 api.add_router("", enrollments_router, tags=["enrollments"])
+api.add_router("", events_router, tags=["events"])
 
 urlpatterns = [
     path("api/v1/", api.urls),

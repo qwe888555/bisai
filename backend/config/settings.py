@@ -79,6 +79,7 @@ INSTALLED_APPS = [
     "apps.attachments",
     "apps.verification",
     "apps.policyqa",
+    "apps.events",
     "apps.persons",
     "apps.teams",
     "apps.materials",
