@@ -15,6 +15,13 @@
 - 无冻结承载的前端字段（shortName/gender/campusName/coachName 输入值）：
   声明但不持久化不回显（同 persons education/coachCategory 先例）；
   coachName 输出仅由现役（CURRENT）主教练关系合成（list_own_teams 先例）。
+
+合并说明（2026-10-26 二轮收编 origin/main）：main 曾先行交付只读查询版
+（为对战、报名与门户接口提供球队名称解析，数据范围沿用一期仅 ADMIN 的
+冻结约定）。其独有检索行为已并入本文件：list_teams 的 keyword 同时命中
+队名与球队编号；get_team 的路径标识兼容主键 id 与 team_no 回退解析
+（team_no 形如 T+年份+8位id，与纯数字主键天然不混淆）。注解/范围门卫
+两版实现同构，以本文件完整版为准。
 """
 
 from __future__ import annotations
@@ -97,12 +104,18 @@ def verify_team_owner(account, owner_id: str) -> None:
 
 
 def list_teams(filters: dict, account) -> QuerySet[Team]:
-    """GET /teams：keyword/category/status 筛选 + 数据范围 + 分页。"""
+    """GET /teams：keyword/category/status 筛选 + 数据范围 + 分页。
+
+    keyword 并集（二轮收编，main 只读版行为）：同时命中队名与球队编号
+    （team_no icontains），供前端球队下拉/对阵名称按编号检索。
+    """
     _require_admin_scope(account)
     queryset = _team_queryset()
     keyword = filters.get("keyword")
     if keyword:
-        queryset = queryset.filter(name__icontains=keyword)
+        queryset = queryset.filter(
+            Q(name__icontains=keyword) | Q(team_no__icontains=keyword)
+        )
     if filters.get("category"):
         queryset = queryset.filter(category_code=filters["category"])
     if filters.get("status"):
@@ -111,11 +124,20 @@ def list_teams(filters: dict, account) -> QuerySet[Team]:
 
 
 def get_team(team_id: str, account) -> Team:
-    """GET /teams/{id}：详情（不存在/软删 → 404；非 ADMIN → 403 范围拒绝）。"""
-    from apps.persons.services import parse_path_id
+    """GET /teams/{id}：详情（不存在/软删 → 404；非 ADMIN → 403 范围拒绝）。
 
+    路径标识解析并集（二轮收编，main 只读版行为）：纯数字优先按主键 id，
+    未命中或非数字按 team_no 回退——供对战/报名/门户按编号解析球队名称；
+    两者均未命中 → 404（软删行被 queryset 排除，同样 404）。
+    """
     _require_admin_scope(account)
-    team = _annotate_team(_team_queryset()).filter(pk=parse_path_id(team_id)).first()
+    raw = str(team_id or "").strip()
+    queryset = _annotate_team(_team_queryset())
+    team = None
+    if raw.isdigit():
+        team = queryset.filter(pk=int(raw)).first()
+    if team is None:
+        team = queryset.filter(team_no=raw).first()
     if team is None:
         raise ApiError(NOT_FOUND)
     return team

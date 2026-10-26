@@ -13,6 +13,8 @@ from pydantic import Field
 
 from apps.common.schemas import StrictSchema
 
+from . import display
+
 EventStatus = Literal["DRAFT", "REGISTRATION_OPEN", "REGISTRATION_CLOSED", "RUNNING", "FINISHED"]
 GroupCategory = Literal["PRIMARY", "MIDDLE", "UNIVERSITY"]
 GroupGender = Literal["MALE", "FEMALE", "MIXED"]
@@ -146,7 +148,15 @@ def match_out(match) -> dict:
         "createdAt": match.created_at,
         "updatedAt": match.updated_at,
     }
-    # 球队名称由成员4球队服务维护，本库不冗余；未取到时不输出该可选字段
+    # 赛事/组别名称取成员5 本域；球队名称取成员4 Team 主档（只读解析）。
+    data["eventName"] = display.event_name(match.event_id, match.event_id)
+    data["groupName"] = display.group_name(match.group_id, match.group_id)
+    home_name = display.team_name(match.home_team_id)
+    away_name = display.team_name(match.away_team_id)
+    if home_name:
+        data["homeTeamName"] = home_name
+    if away_name:
+        data["awayTeamName"] = away_name
     if match.home_score is not None:
         data["homeScore"] = int(match.home_score)
     if match.away_score is not None:
@@ -202,18 +212,31 @@ def match_event_out(event) -> dict:
     }
     if event.stoppage_minute is not None:
         data["stoppageMinute"] = int(event.stoppage_minute)
+    team_name = display.team_name(event.team_id)
+    if team_name:
+        data["teamName"] = team_name
     if event.scorer_athlete_id:
         data["scorerAthleteId"] = event.scorer_athlete_id
+        data["scorerName"] = display.athlete_name(
+            event.scorer_athlete_id, event.scorer_athlete_id
+        )
     if event.athlete_id:
         data["athleteId"] = event.athlete_id
+        data["athleteName"] = display.athlete_name(event.athlete_id, event.athlete_id)
     if event.penalty_type:
         data["penaltyType"] = event.penalty_type
     if event.reason:
         data["reason"] = event.reason
     if event.out_athlete_id:
         data["outAthleteId"] = event.out_athlete_id
+        data["outAthleteName"] = display.athlete_name(
+            event.out_athlete_id, event.out_athlete_id
+        )
     if event.in_athlete_id:
         data["inAthleteId"] = event.in_athlete_id
+        data["inAthleteName"] = display.athlete_name(
+            event.in_athlete_id, event.in_athlete_id
+        )
     return data
 
 # ---------------------------------------------------------------- 赛事文件 / 图文直播 / 直播链接（5.3 / 5.4）
@@ -465,20 +488,31 @@ def public_event_out(event) -> dict:
     }
 
 def public_match_out(match) -> dict:
-    """PublicMatch 安全投影：仅已发布对阵；队名暂用队ID占位(名册由成员6提供)。"""
+    """PublicMatch 安全投影：仅已发布对阵；名称取赛事/球队主档，查不到回退 ID。"""
     return {
         "id": match.pk,
         "eventId": match.event_id,
+        "eventName": display.event_name(match.event_id, match.event_id),
         "groupId": match.group_id,
-        "homeTeamName": match.home_team_id,
-        "awayTeamName": match.away_team_id,
+        "groupName": display.group_name(match.group_id, match.group_id),
+        "homeTeamName": display.team_name(match.home_team_id, match.home_team_id),
+        "awayTeamName": display.team_name(match.away_team_id, match.away_team_id),
         "kickoffAt": match.kickoff_at,
         "venue": match.venue or "",
+        "stage": match.stage or "",
         "status": match.status,
+        "referees": list(match.referees or []),
         "homeScore": int(match.home_score or 0),
         "awayScore": int(match.away_score or 0),
         "scoreRevision": int(match.score_revision or 0),
     }
+
+
+def public_match_detail_out(match, events) -> dict:
+    """门户比赛详情：在对阵投影上补裁判组与已记录事件（含姓名投影）。"""
+    data = public_match_out(match)
+    data["events"] = [match_event_out(event) for event in events]
+    return data
 
 
 def public_live_post_out(post) -> dict:

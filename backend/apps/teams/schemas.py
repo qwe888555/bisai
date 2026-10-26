@@ -15,6 +15,11 @@
   派生自 updated_at UTC 微秒，B4 同款）；
 - team_out 输出键=前端 Team 类型实际消费集；flagUrl/emblemUrl/groupPhotoUrl
   属受控下载契约（无公开直链），不输出 url（list_own_teams 同款，联调待办）。
+
+合并说明（2026-10-26 二轮收编 origin/main）：main 侧只读投影版 team_out
+（供门户/管理端补全球队、学校与市州名称展示）与本文件 team_out 的输出键
+完全一致，合并后统一以本文件为准；本文件为完整请求/输出 Schema，不改变
+main 只读投影的展示契约。
 """
 
 from __future__ import annotations

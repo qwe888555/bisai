@@ -111,10 +111,16 @@ def create_check(account, data: dict[str, Any]) -> IdentityCheck:
 
 def list_checks(filters: dict):
     queryset = IdentityCheck.objects.all()
+    if filters.get("matchId"):
+        queryset = queryset.filter(match_id=filters["matchId"])
     if filters.get("enrollmentId"):
         queryset = queryset.filter(enrollment_id=filters["enrollmentId"])
     if filters.get("athleteId"):
         queryset = queryset.filter(athlete_id=filters["athleteId"])
+    if filters.get("manualStatus"):
+        queryset = queryset.filter(manual_status=filters["manualStatus"])
+    if filters.get("machineStatus"):
+        queryset = queryset.filter(machine_status=filters["machineStatus"])
     return queryset.order_by("-created_at", "id")
 
 

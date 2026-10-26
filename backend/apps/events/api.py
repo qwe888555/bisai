@@ -916,7 +916,8 @@ def public_match_list(
 
 @router.get("/public/matches/{match_id}", auth=None, response=EnvelopeOut, summary="已发布比赛对阵详情")
 def public_match_get(request, match_id: str):
-    return ok(s.public_match_out(services.public_get_match(match_id)))
+    match, events = services.public_match_detail(match_id)
+    return ok(s.public_match_detail_out(match, events))
 
 
 @router.get("/public/matches/{match_id}/live-feed", auth=None, response=EnvelopeOut, summary="短轮询图文直播")

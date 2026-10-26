@@ -12,6 +12,12 @@ coaches 属批次 C，matches 属比赛域，不在本轮。
 - 写操作统一 audit_state()（team.create/team.update/team.member.*）；
 - audit_status 字段保留（Q2 审核流程不启用），创建即默认 APPROVED；
 - 成员状态直出冻结枚举 CURRENT/EXITED（不虚构审核状态，用户裁定）。
+
+合并说明（2026-10-26 二轮收编 origin/main）：main 曾先行交付 /teams、
+/teams/{team_id} 只读子集（为前端球队下拉、对阵名称与报名学校名称提供
+稳定数据源）。本文件的完整实现覆盖该子集——路由与 teamList/teamGet 权限
+登记与 main 只读版一致，并保留其检索意图：list keyword 兼容队名/球队编号，
+get 路径标识兼容主键 id 与 team_no 回退解析（见 services.py）。
 """
 
 from __future__ import annotations

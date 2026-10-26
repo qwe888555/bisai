@@ -118,17 +118,80 @@ def to_review(record) -> dict:
     }
 
 
+def _event_display_names(enrollment: Enrollment) -> tuple[str, str]:
+    """赛事/组别名：优先取成员5 events 主档，联调期回退赛事配置客户端。"""
+    from apps.events import display as event_display
+
+    event = event_display.event_name(enrollment.event_id, "")
+    group = event_display.group_name(enrollment.group_id, "")
+    if event and group:
+        return event, group
+    from .clients import mock_enabled
+
+    if mock_enabled():
+        try:
+            event = event or event_config_client.get_event(enrollment.event_id).get("name") or ""
+        except Exception:  # noqa: BLE001 - 展示名缺失不应阻断报名列表
+            event = ""
+        try:
+            group = group or event_config_client.get_group(
+                enrollment.event_id, enrollment.group_id
+            ).get("name") or ""
+        except Exception:  # noqa: BLE001
+            group = ""
+    return event or enrollment.event_id, group or enrollment.group_id
+
+
+def _org_display_name(org_id: str) -> str:
+    if not org_id:
+        return ""
+    from apps.accounts.models import Organization
+
+    return Organization.objects.filter(pk=org_id).values_list("name", flat=True).first() or ""
+
+
+def _local_team_display(team_id: str) -> dict:
+    """成员4 的 Team 主档只补展示字段，不改变 mock 客户端返回的 orgId/城市范围。"""
+    from apps.teams.models import Team
+
+    raw = str(team_id or "")
+    if not raw:
+        return {}
+    queryset = Team.objects.filter(is_deleted=False).select_related("school", "region")
+    team = queryset.filter(pk=int(raw)).first() if raw.isdigit() else None
+    if team is None:
+        team = queryset.filter(team_no=raw).first()
+    if team is None:
+        return {}
+    return {
+        "name": team.name,
+        "schoolName": team.school.name if team.school_id else "",
+        "cityName": team.region.name if team.region_id else "",
+    }
+
+
 def to_summary(enrollment: Enrollment) -> dict:
     team = team_client.get_team(enrollment.team_id)
+    local_team = _local_team_display(enrollment.team_id)
+    event_name, group_name = _event_display_names(enrollment)
     snapshot = _latest_snapshot(enrollment)
+    city_org_id = team.get("cityOrgId") or enrollment.city_org_id or ""
     return {
         "id": enrollment.pk,
         "eventId": enrollment.event_id,
+        "eventName": event_name,
         "groupId": enrollment.group_id,
+        "groupName": group_name,
         "teamId": enrollment.team_id,
-        "teamName": team.get("name"),
+        "teamName": local_team.get("name") or team.get("name"),
         "subjectType": enrollment.subject_type,
-        "cityOrgId": enrollment.city_org_id or None,
+        "schoolOrgId": team.get("orgId") or None,
+        "schoolName": local_team.get("schoolName") or team.get("schoolName") or "",
+        "cityOrgId": city_org_id or None,
+        "cityName": _org_display_name(city_org_id)
+        or local_team.get("cityName")
+        or team.get("cityName")
+        or "",
         "status": enrollment.status,
         "submissionNo": int(enrollment.submission_no or 0),
         "contactName": enrollment.contact_name,
