@@ -1,4 +1,4 @@
-"""events 请求模型与响应 mapper（django-ninja / pydantic v2）。
+﻿"""events 请求模型与响应 mapper（django-ninja / pydantic v2）。
 
 请求模型继承 StrictSchema（多传未知字段直接 400 INVALID_ARGUMENT）；
 响应由 mapper 转契约 camelCase，禁止改名、禁止加字段。
@@ -12,6 +12,7 @@ from typing import Literal, Optional
 from pydantic import Field
 
 from apps.common.schemas import StrictSchema
+from .services import event_phase
 
 EventStatus = Literal["DRAFT", "REGISTRATION_OPEN", "REGISTRATION_CLOSED", "RUNNING", "FINISHED"]
 GroupCategory = Literal["PRIMARY", "MIDDLE", "UNIVERSITY"]
@@ -54,6 +55,7 @@ class EventGroupUpdate(EventGroupCreate):
 # ---------------------------------------------------------------- 响应 mapper
 
 def event_out(event) -> dict:
+    phase = event_phase(event)
     data = {
         "id": event.pk,
         "name": event.name,
@@ -62,6 +64,10 @@ def event_out(event) -> dict:
         "registrationOpensAt": event.registration_opens_at,
         "registrationClosesAt": event.registration_closes_at,
         "status": event.status,
+        "currentPhase": phase["currentPhase"],
+        "phaseStartedAt": phase["phaseStartedAt"],
+        "phaseEndsAt": phase["phaseEndsAt"],
+        "progressPercent": phase["progressPercent"],
         "description": event.description,
         "version": int(event.version or 0),
         "createdAt": event.created_at,
@@ -453,12 +459,17 @@ def goal_ranking_row_out(rank: int, athlete_id: str, athlete_name: str,
 def public_event_out(event) -> dict:
     """PublicEvent 安全投影：不含 version/createdAt/updatedAt 内部字段；
     status 保留（访客需据此判断报名/进行状态）。"""
+    phase = event_phase(event)
     return {
         "id": event.pk,
         "name": event.name,
         "season": event.season,
         "eventCategory": event.event_category,
         "status": event.status,
+        "currentPhase": phase["currentPhase"],
+        "phaseStartedAt": phase["phaseStartedAt"],
+        "phaseEndsAt": phase["phaseEndsAt"],
+        "progressPercent": phase["progressPercent"],
         "registrationOpensAt": event.registration_opens_at,
         "registrationClosesAt": event.registration_closes_at,
         "description": event.description or "",
