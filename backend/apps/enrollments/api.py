@@ -39,10 +39,12 @@ from .models import ENROLLMENT_STATUSES, SUBJECT_TYPES
 router = Router(tags=["enrollments"])
 _auth = JWTAuth()
 
-# 角色元组：R5 全业务角色（只读/名单/材料维护）；R1 仅学校端（报名单写操作）；
+# 角色元组：R5 全业务角色（只读/名单/材料维护）；R1 学校端+球队端（报名单写操作）；
 # R3 审核/统计（ADMIN 依口径可代审，但不代建代提）。
+# TODO(确认项#6): CITY/PROVINCE_REVIEWER/ADMIN 代报主体（subjectType=CITY/UNIVERSITY）未放开，
+# 留待产品确认代报流程后补齐 subject_type_allowed。
 R5 = (TEAM, UNIVERSITY, CITY, PROVINCE_REVIEWER, ADMIN)
-R1 = (UNIVERSITY,)
+R1 = (TEAM, UNIVERSITY)
 R3 = (CITY, PROVINCE_REVIEWER, ADMIN)
 
 # 权限点登记（导入期完成，漏登记 require() 会直接报错）
