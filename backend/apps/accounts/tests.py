@@ -19,6 +19,7 @@ from __future__ import annotations
 from django.test import TestCase, override_settings
 
 from apps.accounts.models import Account, AuditLog, Organization
+from apps.common import crypto
 from apps.common.authentication import issue_access_token, make_password
 from apps.common.ids import new_account_id, new_organization_id
 
@@ -288,7 +289,8 @@ class PermissionPointTests(AccountScopeTestBase):
     """角色 → 权限点第二层的现状（require）。"""
 
     def test_athlete_forbidden_on_account_list(self):
-        resp = self._get(f"{BASE}/accounts", token=self._login("scope-outsider"))
+        athlete = self._account("scope-athlete", ["ATHLETE"], self.S)
+        resp = self._get(f"{BASE}/accounts", token=issue_access_token(athlete)[0])
         self.assertEqual(resp.status_code, 403)
         body = resp.json()
         self.assertEqual(body["code"], "FORBIDDEN")
@@ -324,11 +326,14 @@ class DataScopeTests(AccountScopeTestBase):
         self.assertIn("scope-city-far", usernames)
         self.assertNotIn("scope-outsider", usernames)
 
-    def test_city_role_has_no_account_list_permission(self):
-        """现状锁定：accountList 权限点仅 ADMIN/PROVINCE_REVIEWER，市级 403。"""
+    def test_city_account_list_is_scoped_to_subtree(self):
+        """方案3：CITY 可查账号，但只看到本组织子树（不再全库 403）。"""
         resp = self._get(f"{BASE}/accounts", token=self._login("scope-city"))
-        self.assertEqual(resp.status_code, 403)
-        self.assertEqual(resp.json()["code"], "FORBIDDEN")
+        self.assertEqual(resp.status_code, 200)
+        usernames = {a["username"] for a in resp.json()["data"]["items"]}
+        self.assertIn("scope-school", usernames)
+        self.assertNotIn("scope-admin", usernames)
+        self.assertNotIn("scope-outsider", usernames)
 
     def test_city_scope_filters_accounts_at_service_layer(self):
         """服务层锁定：CITY 账号的可见账号集合=本组织子树（含本校，不含省/邻市/外省）。"""
@@ -364,8 +369,8 @@ class DataScopeTests(AccountScopeTestBase):
         self.assertEqual(resp.json()["code"], "DATA_SCOPE_DENIED")
         self.assertFalse(Account.objects.filter(username="invader-001").exists())
 
-    def test_city_role_cannot_create_account(self):
-        """现状锁定：CITY 无 accountCreate 权限点，角色层 403。"""
+    def test_city_can_create_account_within_subtree(self):
+        """方案3：CITY 可在本市子树内建号（不再全部集中省级管理员）。"""
         resp = self._post(
             f"{BASE}/accounts",
             {
@@ -376,8 +381,22 @@ class DataScopeTests(AccountScopeTestBase):
             },
             token=self._login("scope-city"),
         )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertTrue(Account.objects.filter(username="city-created").exists())
+
+    def test_city_cannot_create_account_out_of_scope(self):
+        resp = self._post(
+            f"{BASE}/accounts",
+            {
+                "username": "city-cross",
+                "displayName": "跨市建号",
+                "roles": ["UNIVERSITY"],
+                "orgId": self.Q1.pk,
+            },
+            token=self._login("scope-city"),
+        )
         self.assertEqual(resp.status_code, 403)
-        self.assertEqual(resp.json()["code"], "FORBIDDEN")
+        self.assertEqual(resp.json()["code"], "DATA_SCOPE_DENIED")
 
     def test_non_admin_cannot_grant_admin_role(self):
         """PROVINCE_REVIEWER 持有 accountCreate 点但不得授予 ADMIN 角色。"""
@@ -634,6 +653,7 @@ class OrganizationBehaviorTests(AccountScopeTestBase):
         )
         self.assertEqual(resp.status_code, 409)
         self.assertEqual(resp.json()["code"], "STATE_CONFLICT")
+
         other.refresh_from_db()
         self.assertEqual(other.parent_id, self.C.pk)  # 无部分写入
 
@@ -728,3 +748,173 @@ class OrganizationBehaviorTests(AccountScopeTestBase):
         self.assertIn("scope-school", school_visible)  # 本校自己
         self.assertNotIn("scope-admin", school_visible)  # 省级账号不可见
         self.assertNotIn("scope-city", school_visible)  # 上级市账号不可见
+
+
+class InvitationBatchTests(AccountScopeTestBase):
+    """账号批量发放（5.txt）：Excel 签发邀请 + CSV 导出 + 下级代发范围。
+
+    决策：方案1（Excel 批量邀请，导出 CSV）+ 方案3（CITY/UNIVERSITY 在
+    各自组织子树内建号/发邀请），不再把建号全部集中在省级管理员。
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        from apps.persons.models import Person, Region, School
+
+        super().setUpTestData()
+        cls.region = Region.objects.create(code="R000", name="测试区", level=3)
+        cls.school = School.objects.create(
+            code="S000", name="测试学校", school_type="SENIOR", region=cls.region
+        )
+        cls.other_school = School.objects.create(
+            code="QS00", name="外市学校", school_type="SENIOR", region=cls.region
+        )
+        cls.person = cls._person("张三", "110101199001011234", cls.school)
+        cls.outsider_person = cls._person("李四", "110101199001011242", cls.other_school)
+
+    @classmethod
+    def _person(cls, name: str, id_number: str, school):
+        from apps.persons.models import Person
+
+        return Person.objects.create(
+            person_no="P" + id_number[-8:],
+            full_name=name,
+            id_card_cipher=crypto.encrypt_text(id_number),
+            id_card_hash=crypto.lookup_hash(crypto.normalize_id_number(id_number)),
+            id_card_masked=crypto.mask_id_number(id_number),
+            person_category="ATHLETE",
+            school=school,
+        )
+
+    def _batch(self, token, rows, fmt="json"):
+        import io
+
+        from django.core.files.uploadedfile import SimpleUploadedFile
+        from openpyxl import Workbook
+
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.append(["姓名", "身份证号", "手机号", "角色", "组织编码"])
+        for row in rows:
+            sheet.append(row)
+        buffer = io.BytesIO()
+        workbook.save(buffer)
+        buffer.seek(0)
+        upload = SimpleUploadedFile(
+            "batch.xlsx",
+            buffer.read(),
+            content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        return self.client.post(
+            f"{BASE}/accounts/registration-invitations/batch?format={fmt}",
+            data={"orgId": "", "expiresInMinutes": "1440", "file": upload},
+            **self._auth(token),
+        )
+
+    def test_batch_issues_invitation_for_existing_person(self):
+        from apps.accounts.models import RegistrationInvitation
+
+        token = self._login("scope-admin")
+        resp = self._batch(token, [["张三", "110101199001011234", "", "ATHLETE", "S000"]])
+        self.assertEqual(resp.status_code, 200, resp.content)
+        data = resp.json()["data"]
+        self.assertEqual(data["successCount"], 1)
+        self.assertEqual(data["failureCount"], 0)
+        row = data["rows"][0]
+        self.assertEqual(row["status"], "OK")
+        self.assertEqual(len(row["registrationToken"]), 64)
+        self.assertEqual(row["maskedIdNumber"], "110101********1234")
+        self.assertTrue(
+            RegistrationInvitation.objects.filter(person_id=self.person.pk).exists()
+        )
+
+    def test_batch_reports_unknown_person_without_creating_invitation(self):
+        from apps.accounts.models import RegistrationInvitation
+
+        token = self._login("scope-admin")
+        resp = self._batch(token, [["王五", "110101199001011999", "", "ATHLETE", "S000"]])
+        self.assertEqual(resp.status_code, 200, resp.content)
+        data = resp.json()["data"]
+        self.assertEqual(data["successCount"], 0)
+        self.assertEqual(data["failureCount"], 1)
+        self.assertEqual(data["rows"][0]["code"], "INVALID_ARGUMENT")
+        self.assertIn("未找到人员档案", data["rows"][0]["error"])
+        self.assertFalse(RegistrationInvitation.objects.exists())
+
+    def test_batch_denies_person_outside_city_scope(self):
+        token = self._login("scope-city")
+        resp = self._batch(
+            token, [["李四", "110101199001011242", "", "ATHLETE", "S000"]]
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        row = resp.json()["data"]["rows"][0]
+        self.assertEqual(row["status"], "FAILED")
+        self.assertEqual(row["code"], "DATA_SCOPE_DENIED")
+
+    def test_batch_rejects_person_already_bound_to_account(self):
+        Account.objects.create(
+            id=new_account_id(),
+            username="bound-athlete",
+            display_name="张三",
+            roles=["ATHLETE"],
+            organization=self.S,
+            person_id=self.person.pk,
+            password=make_password(PASSWORD),
+            enabled=True,
+        )
+        token = self._login("scope-admin")
+        resp = self._batch(token, [["张三", "110101199001011234", "", "ATHLETE", "S000"]])
+        row = resp.json()["data"]["rows"][0]
+        self.assertEqual(row["status"], "FAILED")
+        self.assertEqual(row["code"], "DUPLICATE_RESOURCE")
+
+    def test_batch_csv_export_contains_token_and_bom(self):
+        token = self._login("scope-admin")
+        resp = self._batch(
+            token, [["张三", "110101199001011234", "", "ATHLETE", "S000"]], fmt="csv"
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertTrue(resp["Content-Type"].startswith("text/csv"))
+        self.assertIn("attachment; filename=", resp["Content-Disposition"])
+        text = resp.content.decode("utf-8-sig")
+        self.assertTrue(text.startswith("序号,姓名"))
+        self.assertIn("邀请凭证", text)
+        self.assertIn("张三", text)
+
+    def test_team_role_cannot_batch_issue(self):
+        team = self._account("batch-team", ["TEAM"], self.T)
+        token = issue_access_token(team)[0]
+        resp = self._batch(token, [["张三", "110101199001011234", "", "ATHLETE", "S000"]])
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json()["code"], "FORBIDDEN")
+
+    # ------------------------------------------------------ 方案3：下级代发
+    def test_school_account_can_create_athlete_account_in_own_org(self):
+        token = self._login("scope-school")
+        resp = self._post(
+            f"{BASE}/accounts",
+            {
+                "username": "school-created-athlete",
+                "displayName": "本校运动员",
+                "roles": ["ATHLETE"],
+                "orgId": self.S.pk,
+            },
+            token=token,
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertTrue(Account.objects.filter(username="school-created-athlete").exists())
+
+    def test_school_account_cannot_create_account_outside_scope(self):
+        token = self._login("scope-school")
+        resp = self._post(
+            f"{BASE}/accounts",
+            {
+                "username": "cross-scope-athlete",
+                "displayName": "外校运动员",
+                "roles": ["ATHLETE"],
+                "orgId": self.Q1.pk,
+            },
+            token=token,
+        )
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json()["code"], "DATA_SCOPE_DENIED")
