@@ -15,6 +15,7 @@ from django.db.models import Q
 
 from apps.common.errors import DATA_SCOPE_DENIED, FORBIDDEN, NOT_FOUND, ApiError
 from apps.common.permissions import (
+    MATCH_RECORDER,
     ORG_SCOPE_ROLES,
     TEAM,
     UNIVERSITY,
@@ -47,6 +48,9 @@ def team_scope_ids(account) -> list[str]:
 
 def scoped_queryset(account, queryset):
     """按数据范围过滤报名单 QuerySet。"""
+    # 记录员：赛前身份核验需跨队/跨市读取名册，授予全局只读（写权限由 R1/R3 拦截，不在 R5）。
+    if MATCH_RECORDER in role_set(account):
+        return queryset
     if is_org_scoped(account):
         org_ids = org_scope_ids(account)
         if not org_ids:
@@ -59,6 +63,8 @@ def scoped_queryset(account, queryset):
 
 
 def ensure_enrollment_access(account, enrollment: Enrollment) -> None:
+    if MATCH_RECORDER in role_set(account):
+        return
     if is_org_scoped(account):
         if enrollment.city_org_id not in set(org_scope_ids(account)):
             raise ApiError(
