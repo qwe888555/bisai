@@ -20,11 +20,11 @@ from django.db import IntegrityError
 from django.test import TestCase
 from django.utils import timezone
 
-from apps.accounts.models import Account, AuditLog
+from apps.accounts.models import Account, AuditLog, Organization
 from apps.attachments.models import FileRecord
 from apps.common import enums
 from apps.common.authentication import issue_access_token, make_password
-from apps.common.ids import new_account_id, new_file_id
+from apps.common.ids import new_account_id, new_file_id, new_organization_id
 from apps.materials.models import (
     MaterialAuditLog,
     MaterialFileVersion,
@@ -32,7 +32,7 @@ from apps.materials.models import (
     PersonMaterial,
     TeamMaterial,
 )
-from apps.persons.models import Person, Region
+from apps.persons.models import Person, Region, School
 from apps.teams.models import Team
 
 BASE = "/api/v1/materials"
@@ -76,15 +76,107 @@ class MaterialApiTests(TestCase):
             password=make_password("athlete-pass-123"),
             enabled=True,
         )
+        cls.coach = Account.objects.create(
+            id=new_account_id(),
+            username="materials-coach",
+            display_name="教练员",
+            roles=["COACH"],
+            password=make_password("coach-pass-123"),
+            enabled=True,
+        )
+        cls.team_acct = Account.objects.create(
+            id=new_account_id(),
+            username="materials-team",
+            display_name="球队端",
+            roles=["TEAM"],
+            password=make_password("team-pass-123"),
+            enabled=True,
+        )
+        cls.city_acct = Account.objects.create(
+            id=new_account_id(),
+            username="materials-city",
+            display_name="市州端",
+            roles=["CITY"],
+            password=make_password("city-pass-123"),
+            enabled=True,
+        )
+        cls.prov = Account.objects.create(
+            id=new_account_id(),
+            username="materials-province",
+            display_name="省级审核",
+            roles=["PROVINCE_REVIEWER"],
+            password=make_password("prov-pass-123"),
+            enabled=True,
+        )
         cls.admin_token = _token(cls.admin)
         cls.uni_token = _token(cls.uni)
         cls.athlete_token = _token(cls.athlete)
+        cls.coach_token = _token(cls.coach)
+        cls.team_token = _token(cls.team_acct)
+        cls.city_token = _token(cls.city_acct)
+        cls.prov_token = _token(cls.prov)
 
         # ---- 归属对象 ----
         province = Region.objects.create(name="丙省", code="900000", level=1)
         cls.city = Region.objects.create(name="丙州市", code="900100", level=2, parent=province)
+        cls.city_b = Region.objects.create(name="丙城市", code="900200", level=2, parent=province)
 
-        def _person(seq, name, deleted=False):
+        # ---- 学校与组织树（org.code = School.code；球队组织 code = team_no）----
+        cls.school_a = School.objects.create(
+            name="丙一小", code="SCH-900100-001", school_type="PRIMARY", region=cls.city
+        )
+        cls.school_b = School.objects.create(
+            name="丙二小", code="SCH-900100-002", school_type="PRIMARY", region=cls.city
+        )
+        cls.school_c = School.objects.create(
+            name="丁一小", code="SCH-900200-001", school_type="PRIMARY", region=cls.city_b
+        )
+        cls.org_prov = Organization.objects.create(
+            id=new_organization_id(), name="丙省组织", org_type="PROVINCE", code="ORG-PROV-MAT"
+        )
+        cls.org_city = Organization.objects.create(
+            id=new_organization_id(),
+            name="丙州市组织",
+            org_type="CITY",
+            code="ORG-CITY-MAT",
+            parent=cls.org_prov,
+        )
+        cls.org_city_b = Organization.objects.create(
+            id=new_organization_id(),
+            name="丙城市组织",
+            org_type="CITY",
+            code="ORG-CITY-B-MAT",
+            parent=cls.org_prov,
+        )
+        cls.org_school_a = Organization.objects.create(
+            id=new_organization_id(),
+            name="丙一小组织",
+            org_type="SCHOOL",
+            code=cls.school_a.code,
+            parent=cls.org_city,
+        )
+        cls.org_school_b = Organization.objects.create(
+            id=new_organization_id(),
+            name="丙二小组织",
+            org_type="SCHOOL",
+            code=cls.school_b.code,
+            parent=cls.org_city,
+        )
+        cls.org_school_c = Organization.objects.create(
+            id=new_organization_id(),
+            name="丁一小组织",
+            org_type="SCHOOL",
+            code=cls.school_c.code,
+            parent=cls.org_city_b,
+        )
+        cls.uni.organization = cls.org_school_a
+        cls.uni.save(update_fields=["organization"])
+        cls.city_acct.organization = cls.org_city
+        cls.city_acct.save(update_fields=["organization"])
+        cls.prov.organization = cls.org_prov
+        cls.prov.save(update_fields=["organization"])
+
+        def _person(seq, name, school=None, deleted=False):
             return Person.objects.create(
                 person_no=f"P2026{seq:08d}",
                 full_name=name,
@@ -93,23 +185,57 @@ class MaterialApiTests(TestCase):
                 id_card_masked=f"1101****{seq:04d}X",
                 person_category=enums.PersonCategory.ATHLETE,
                 audit_status=enums.AuditStatus.APPROVED,
+                school=school,
                 is_deleted=deleted,
                 deleted_at=timezone.now() if deleted else None,
             )
 
-        cls.person_a = _person(1, "材料甲")
-        cls.person_b = _person(2, "材料乙")
-        cls.person_c = _person(3, "材料丙")
-        cls.person_del = _person(4, "材料删", deleted=True)
+        cls.person_a = _person(1, "材料甲", cls.school_a)
+        cls.person_b = _person(2, "材料乙", cls.school_b)
+        cls.person_c = _person(3, "材料丙", cls.school_c)
+        cls.person_del = _person(4, "材料删", cls.school_a, deleted=True)
+        # 本人范围：ATHLETE 绑定 person_a，COACH 绑定 person_b
+        cls.athlete.person_id = str(cls.person_a.pk)
+        cls.athlete.save(update_fields=["person_id"])
+        cls.coach.person_id = str(cls.person_b.pk)
+        cls.coach.save(update_fields=["person_id"])
+
         cls.team_a = Team.objects.create(
-            team_no="T202600000101", name="丙一小男足队", category_code="PRIMARY", region=cls.city
+            team_no="T202600000101",
+            name="丙一小男足队",
+            category_code="PRIMARY",
+            school=cls.school_a,
+            region=cls.city,
+        )
+        cls.team_b = Team.objects.create(
+            team_no="T202600000102",
+            name="丙二小男足队",
+            category_code="PRIMARY",
+            school=cls.school_b,
+            region=cls.city,
+        )
+        cls.team_c = Team.objects.create(
+            team_no="T202600000103",
+            name="丁一小男足队",
+            category_code="PRIMARY",
+            school=cls.school_c,
+            region=cls.city_b,
         )
         cls.team_soft = Team.objects.create(
-            team_no="T202600000102",
+            team_no="T202600000199",
             name="已删球队",
             category_code="PRIMARY",
             is_deleted=True,
         )
+        cls.org_team_a = Organization.objects.create(
+            id=new_organization_id(),
+            name="丙一小男足队组织",
+            org_type="TEAM",
+            code=cls.team_a.team_no,
+            parent=cls.org_school_a,
+        )
+        cls.team_acct.organization = cls.org_team_a
+        cls.team_acct.save(update_fields=["organization"])
 
         # ---- 材料类型 ----
         cls.type_person = MaterialType.objects.create(
@@ -184,6 +310,23 @@ class MaterialApiTests(TestCase):
             remark="已删材料",
             is_deleted=True,
         )
+        cls.tm_other = TeamMaterial.objects.create(
+            pk=202,  # 同市他校球队材料（UNIVERSITY/CITY 范围用例）
+            team=cls.team_b,
+            type=cls.type_team_multi,
+            file_id=cls.file_wrong.pk,
+            file_name="球队文件误用.pdf",
+            status=enums.MaterialStatus.PENDING,
+            remark="二队报告",
+        )
+        cls.pm_city_b = PersonMaterial.objects.create(
+            person=cls.person_c,
+            type=cls.type_multi,
+            file_id=cls.file_bound_c.pk,
+            file_name="已绑丙.pdf",
+            status=enums.MaterialStatus.PENDING,
+            remark="丙的证书",
+        )
 
     # ------------------------------------------------------------ helpers
 
@@ -244,36 +387,190 @@ class MaterialApiTests(TestCase):
             401,
         )
 
-    def test_list_athlete_scope_denied(self):
-        """ATHLETE 在文档角色集内但数据范围一期仅 ADMIN（A′ 待决阻塞口径）。"""
+    # ---------------------------------------------- 数据范围（2026-10-27 交付）
+
+    def test_list_athlete_sees_only_own_materials(self):
+        """ATHLETE：列表仅本人材料；他人归属列表空态、详情 403。"""
         resp = self._get(BASE, token=self.athlete_token)
-        self.assertEqual(resp.status_code, 403)
-        self.assertEqual(resp.json()["code"], "DATA_SCOPE_DENIED")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()["data"]
+        self.assertEqual(body["total"], 1)
+        self.assertEqual(body["items"][0]["ownerName"], "材料甲")
+        other = self._get(
+            BASE,
+            token=self.athlete_token,
+            query={"ownerType": "PERSON", "ownerId": self.person_b.pk},
+        )
+        self.assertEqual(other.status_code, 200)
+        self.assertEqual(other.json()["data"]["total"], 0)
+        self.assertEqual(
+            self._get(f"{BASE}/{self.pm_pending.pk}", token=self.athlete_token).status_code, 200
+        )
+        denied = self._get(f"{BASE}/{self.pm_approved.pk}", token=self.athlete_token)
+        self.assertEqual(denied.status_code, 403)
+        self.assertEqual(denied.json()["code"], "DATA_SCOPE_DENIED")
 
-    def test_list_university_scope_denied(self):
-        """UNIVERSITY 依赖 A′ 映射：范围拒绝（待决阻塞，非最终规则）。"""
-        resp = self._get(BASE, token=self.uni_token, query={"ownerType": "PERSON", "ownerId": self.person_a.pk})
-        self.assertEqual(resp.status_code, 403)
-        self.assertEqual(resp.json()["code"], "DATA_SCOPE_DENIED")
+    def test_coach_sees_only_own_materials(self):
+        """COACH 与 ATHLETE 同口径：仅账号绑定的本人材料。"""
+        resp = self._get(BASE, token=self.coach_token)
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()["data"]
+        self.assertEqual(body["total"], 1)
+        self.assertEqual(body["items"][0]["ownerName"], "材料乙")
 
-    def test_create_university_scope_denied(self):
-        resp = self._post(BASE, self._create_payload(), token=self.uni_token)
-        self.assertEqual(resp.status_code, 403)
-        self.assertEqual(resp.json()["code"], "DATA_SCOPE_DENIED")
+    def test_list_university_sees_own_school_only(self):
+        """UNIVERSITY：仅本校人员/球队材料；同市他校材料被过滤。"""
+        resp = self._get(BASE, token=self.uni_token)
+        self.assertEqual(resp.status_code, 200)
+        owners = {item["ownerName"] for item in resp.json()["data"]["items"]}
+        self.assertEqual(owners, {"材料甲", "丙一小男足队"})
+        other = self._get(
+            BASE,
+            token=self.uni_token,
+            query={"ownerType": "PERSON", "ownerId": self.person_b.pk},
+        )
+        self.assertEqual(other.status_code, 200)
+        self.assertEqual(other.json()["data"]["total"], 0)
 
-    def test_review_university_scope_denied(self):
+    def test_create_university_in_scope_success_out_of_scope_denied(self):
+        """UNIVERSITY：本校归属可创建；他校归属 403 DATA_SCOPE_DENIED。"""
+        own = self._post(BASE, self._create_payload(), token=self.uni_token)
+        self.assertEqual(own.status_code, 200)
+        denied = self._post(
+            BASE, self._create_payload(ownerId=str(self.person_b.pk)), token=self.uni_token
+        )
+        self.assertEqual(denied.status_code, 403)
+        self.assertEqual(denied.json()["code"], "DATA_SCOPE_DENIED")
+
+    def test_review_university_forbidden_by_role(self):
+        """materialReview 契约角色不含 UNIVERSITY：角色拒绝（403 FORBIDDEN）。"""
         resp = self._post(
             f"{BASE}/{self.pm_pending.pk}/review",
             {"decision": "APPROVE", "version": self._mver(self.pm_pending)},
             token=self.uni_token,
         )
         self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json()["code"], "FORBIDDEN")
 
-    def test_remove_university_scope_denied(self):
-        resp = self._delete(
+    def test_remove_university_in_scope_success_out_of_scope_denied(self):
+        """UNIVERSITY：本校材料可软删；他校材料 403 DATA_SCOPE_DENIED。"""
+        denied = self._delete(
+            f"{BASE}/{self.pm_approved.pk}", token=self.uni_token, version=self._mver(self.pm_approved)
+        )
+        self.assertEqual(denied.status_code, 403)
+        self.assertEqual(denied.json()["code"], "DATA_SCOPE_DENIED")
+        self.pm_approved.refresh_from_db()
+        self.assertFalse(self.pm_approved.is_deleted)
+        own = self._delete(
             f"{BASE}/{self.pm_pending.pk}", token=self.uni_token, version=self._mver(self.pm_pending)
         )
-        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(own.status_code, 200)
+
+    def test_team_role_sees_only_own_team_materials(self):
+        """TEAM：仅本队材料；他队材料列表过滤、详情 403。"""
+        resp = self._get(BASE, token=self.team_token)
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()["data"]
+        self.assertEqual(body["total"], 1)
+        self.assertEqual(body["items"][0]["ownerName"], "丙一小男足队")
+        other = self._get(
+            BASE,
+            token=self.team_token,
+            query={"ownerType": "TEAM", "ownerId": self.team_b.pk},
+        )
+        self.assertEqual(other.status_code, 200)
+        self.assertEqual(other.json()["data"]["total"], 0)
+        denied = self._get(f"{BASE}/{self.tm_other.pk}", token=self.team_token)
+        self.assertEqual(denied.status_code, 403)
+        self.assertEqual(denied.json()["code"], "DATA_SCOPE_DENIED")
+        self.assertEqual(
+            self._get(f"{BASE}/{self.tm_pending.pk}", token=self.team_token).status_code, 200
+        )
+
+    def test_team_role_create_own_team_material_success(self):
+        resp = self._post(
+            BASE,
+            self._create_payload(
+                ownerType="TEAM",
+                ownerId=str(self.team_a.pk),
+                materialType="TEAM_REPORT",
+                fileIds=[self.file_free_t.pk],
+            ),
+            token=self.team_token,
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["data"]["ownerName"], "丙一小男足队")
+
+    def test_city_sees_schools_in_its_city_only(self):
+        """CITY：本市学校子树内人员/球队材料可见，外市材料过滤且详情 403。"""
+        resp = self._get(BASE, token=self.city_token)
+        self.assertEqual(resp.status_code, 200)
+        owners = {item["ownerName"] for item in resp.json()["data"]["items"]}
+        self.assertEqual(owners, {"材料甲", "材料乙", "丙一小男足队", "丙二小男足队"})
+        denied = self._get(f"{BASE}/{self.pm_city_b.pk}", token=self.city_token)
+        self.assertEqual(denied.status_code, 403)
+        self.assertEqual(denied.json()["code"], "DATA_SCOPE_DENIED")
+
+    def test_city_review_in_scope_success_out_of_scope_denied(self):
+        """materialReview 含 CITY：本市材料可审核；外市材料 403。"""
+        denied = self._post(
+            f"{BASE}/{self.pm_city_b.pk}/review",
+            {"decision": "APPROVE", "version": self._mver(self.pm_city_b)},
+            token=self.city_token,
+        )
+        self.assertEqual(denied.status_code, 403)
+        self.assertEqual(denied.json()["code"], "DATA_SCOPE_DENIED")
+        own = self._post(
+            f"{BASE}/{self.tm_other.pk}/review",
+            {"decision": "APPROVE", "version": self._mver(self.tm_other)},
+            token=self.city_token,
+        )
+        self.assertEqual(own.status_code, 200)
+        self.assertEqual(own.json()["data"]["reviewStatus"], "APPROVED")
+
+    def test_province_reviewer_sees_province_materials(self):
+        """PROVINCE_REVIEWER：省域组织子树内全部材料可见、可审核。"""
+        resp = self._get(BASE, token=self.prov_token)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["data"]["total"], 5)
+        self.assertEqual(
+            self._get(f"{BASE}/{self.pm_city_b.pk}", token=self.prov_token).status_code, 200
+        )
+        reviewed = self._post(
+            f"{BASE}/{self.pm_city_b.pk}/review",
+            {"decision": "APPROVE", "version": self._mver(self.pm_city_b)},
+            token=self.prov_token,
+        )
+        self.assertEqual(reviewed.status_code, 200)
+        self.assertEqual(reviewed.json()["data"]["reviewStatus"], "APPROVED")
+
+    def test_empty_scope_lists_return_empty_not_403(self):
+        """角色范围为空（未绑定组织的 UNIVERSITY/ATHLETE）：列表空态而非 403。"""
+        for roles in (["UNIVERSITY"], ["ATHLETE"], ["TEAM"]):
+            account = Account.objects.create(
+                id=new_account_id(),
+                username=f"unbound-{roles[0].lower()}",
+                roles=roles,
+                password=make_password("unbound-pass-123"),
+                enabled=True,
+            )
+            resp = self._get(BASE, token=_token(account))
+            self.assertEqual(resp.status_code, 200, roles)
+            self.assertEqual(resp.json()["data"]["total"], 0, roles)
+
+    def test_get_detail_owner_soft_deleted_returns_404(self):
+        """归属对象软删：材料行仍在也按归属不存在处理（404）。"""
+        material = PersonMaterial.objects.create(
+            person=self.person_del,
+            type=self.type_multi,
+            file_id=self.file_free_p.pk,
+            file_name="无主人员文件.pdf",
+            status=enums.MaterialStatus.PENDING,
+            remark="已删归属材料",
+        )
+        resp = self._get(f"{BASE}/{material.pk}", token=self.admin_token)
+        self.assertEqual(resp.status_code, 404)
+        self.assertEqual(resp.json()["code"], "NOT_FOUND")
 
     # ------------------------------------------------------------ 列表
 
@@ -309,9 +606,9 @@ class MaterialApiTests(TestCase):
         self.assertEqual(items[0]["ownerName"], "丙一小男足队")
 
     def test_list_global_merges_both_kinds(self):
-        """Dashboard 调用：无 ownerType → 跨两表合并（夹具 3 条有效材料）。"""
-        resp = self._get(BASE, token=self.admin_token, query={"page": 1, "pageSize": 6})
-        self.assertEqual(resp.json()["data"]["total"], 3)
+        """Dashboard 调用：无 ownerType → 跨两表合并（夹具 5 条有效材料）。"""
+        resp = self._get(BASE, token=self.admin_token, query={"page": 1, "pageSize": 10})
+        self.assertEqual(resp.json()["data"]["total"], 5)
 
     def test_list_owner_type_invalid(self):
         resp = self._get(BASE, token=self.admin_token, query={"ownerType": "CITY"})
@@ -779,8 +1076,12 @@ class MaterialApiTests(TestCase):
             ),
         )
 
-    def test_get_university_scope_denied(self):
-        resp = self._get(f"{BASE}/{self.pm_pending.pk}", token=self.uni_token)
+    def test_get_university_scope_own_success_other_denied(self):
+        """UNIVERSITY：本校材料详情放行；他校材料 403 DATA_SCOPE_DENIED。"""
+        self.assertEqual(
+            self._get(f"{BASE}/{self.pm_pending.pk}", token=self.uni_token).status_code, 200
+        )
+        resp = self._get(f"{BASE}/{self.pm_approved.pk}", token=self.uni_token)
         self.assertEqual(resp.status_code, 403)
         self.assertEqual(resp.json()["code"], "DATA_SCOPE_DENIED")
 
@@ -874,9 +1175,14 @@ class MaterialApiTests(TestCase):
             ),
         )
 
-    def test_update_university_scope_denied(self):
-        resp = self._update(
+    def test_update_university_own_success_other_denied(self):
+        """UNIVERSITY：本校材料可更新；他校材料 403 DATA_SCOPE_DENIED。"""
+        own = self._update(
             self.pm_pending.pk, self._update_payload(self.pm_pending), self.uni_token
+        )
+        self.assertEqual(own.status_code, 200)
+        resp = self._update(
+            self.tm_other.pk, self._update_payload(self.tm_other), self.uni_token
         )
         self.assertEqual(resp.status_code, 403)
         self.assertEqual(resp.json()["code"], "DATA_SCOPE_DENIED")

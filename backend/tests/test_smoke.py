@@ -647,6 +647,9 @@ class ApiSmokeTests(TestCase):
         self.assertTrue(hasattr(MySQLdb, "connect"))
 
     def test_policy_document_syncs_on_publish_and_offline(self):
+        from unittest import mock
+
+        from apps.common import conf
         from apps.events.models import Content
         from apps.events.services import publish_content, unpublish_content
         from apps.policyqa.models import PolicyDocument
@@ -668,7 +671,8 @@ class ApiSmokeTests(TestCase):
         self.assertTrue(document.enabled)
         self.assertIsNotNone(document.published_at)
 
-        result = answer("报名需要什么条件")
+        with mock.patch.object(conf, "AI_ENABLED", False):
+            result = answer("报名需要什么条件")
         self.assertEqual(result["status"], "DISABLED")
         self.assertEqual(len(result["fallbackPolicies"]), 1)
         self.assertEqual(result["fallbackPolicies"][0]["title"], "省级足球赛事报名办法")

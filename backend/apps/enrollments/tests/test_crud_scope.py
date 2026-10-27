@@ -65,7 +65,7 @@ def test_cross_school_access_denied(client, auth):
     assert listing.json()["data"]["items"] == []
 
 
-def test_team_cannot_create_enrollment(client, auth):
+def test_team_role_cannot_create_enrollment(client, auth):
     """球队不能报送（R1 仅 UNIVERSITY 可建报名单），任何主体类型均 403。"""
     headers = auth("team")
     payload = {
@@ -90,7 +90,7 @@ def test_team_cannot_create_enrollment(client, auth):
     assert wrong_type.status_code == 403
 
 
-def test_non_university_cannot_create_or_operate(client, auth):
+def test_non_team_or_university_cannot_create_or_operate(client, auth):
     """CITY/PROVINCE_REVIEWER/ADMIN/TEAM 均不能代报或操作他人报名单
     （R1 仅 UNIVERSITY 可建，数据范围层再拦跨校操作）。"""
     school_headers = auth("university")

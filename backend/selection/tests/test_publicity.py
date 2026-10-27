@@ -2,8 +2,8 @@ import json
 
 from django.test import Client, TestCase, override_settings
 
-from selection.enums import PublicityType
-from selection.models import PublicityRecord
+from selection.enums import GroupType, PublicityType, RoundType
+from selection.models import PublicityRecord, ResultBatch, ResultItem
 from selection.services.publicity import mask_id_card
 from selection.services.publicity_source import get_publicity_source_client
 
@@ -304,6 +304,74 @@ class PublicityApiTests(TestCase):
             )["total"],
             15,
         )
+
+    # ------------------------------------------------------------------
+    # Shortlist -> publicity bridge
+    # ------------------------------------------------------------------
+    def _result_batch(self, candidate_ids, active=True, stale=False):
+        batch = ResultBatch.objects.create(
+            event_id="1",
+            group_type=GroupType.HIGHER,
+            result_round=RoundType.INITIAL,
+            quota=len(candidate_ids),
+            initial_weight=1,
+            final_weight=0,
+            formula_snapshot="测试",
+            version_no=99,
+            active=active,
+            stale=stale,
+            generated_by="99",
+        )
+        for rank, candidate_id in enumerate(candidate_ids, start=1):
+            ResultItem.objects.create(
+                batch=batch,
+                rank_no=rank,
+                candidate_id=candidate_id,
+                candidate_name=f"候选{candidate_id}",
+                composite_score=90,
+            )
+        return batch
+
+    def test_publish_result_batch_only_publishes_shortlisted_athletes(self):
+        batch = self._result_batch(["10001", "10002", "10003"])
+
+        response = self.post_json(
+            f"{PUBLICITY_PATH}result-batch/",
+            {"result_batch_id": batch.id},
+        )
+        self.assertEqual(response.status_code, 200, response.content)
+        data = self.body(response)["data"]
+        self.assertEqual(data["candidate_count"], 3)
+        self.assertEqual(data["published"], 3)
+        self.assertEqual(data["skipped"], 0)
+        self.assertEqual(data["failed"], 0)
+        self.assertEqual(
+            set(
+                PublicityRecord.objects.values_list(
+                    "source_id", flat=True
+                )
+            ),
+            {"10001", "10002", "10003"},
+        )
+
+        # Repeated calls must skip, not duplicate.
+        response = self.post_json(
+            f"{PUBLICITY_PATH}result-batch/",
+            {"result_batch_id": batch.id},
+        )
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(self.body(response)["data"]["skipped"], 3)
+        self.assertEqual(PublicityRecord.objects.count(), 3)
+
+    def test_publish_result_batch_rejects_stale_batch(self):
+        batch = self._result_batch(["10001"], stale=True)
+
+        response = self.post_json(
+            f"{PUBLICITY_PATH}result-batch/",
+            {"result_batch_id": batch.id},
+        )
+        self.assertEqual(response.status_code, 409, response.content)
+        self.assertEqual(PublicityRecord.objects.count(), 0)
 
     # ------------------------------------------------------------------
     # Validation

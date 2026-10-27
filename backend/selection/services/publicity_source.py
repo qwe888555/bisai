@@ -31,6 +31,9 @@ class PublicitySourceRecord:
     city: str
     publicity_type: str
     data: Dict[str, object]
+    # 运动员记录额外携带评分/结果使用的人员档案 ID，用于“入围名单→公示”
+    # 的精确映射；教练、球队记录为空。
+    candidate_id: str = ""
 
 
 class PublicitySourceClient(ABC):
@@ -122,6 +125,7 @@ class DemoPublicitySourceClient(PublicitySourceClient):
                         group_type=group_type,
                         city=city,
                         publicity_type=PublicityType.ATHLETE,
+                        candidate_id=str(candidate.candidate_id),
                         data={
                             "name": candidate.name,
                             "gender": "男" if index % 2 == 0 else "女",
