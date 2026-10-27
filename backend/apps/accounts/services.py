@@ -12,6 +12,7 @@ from typing import Any, Optional
 
 from django.core.cache import cache
 from django.db import IntegrityError, transaction
+from django.db.models import Q
 from django.utils import timezone
 
 from apps.common import crypto
@@ -109,6 +110,12 @@ def register(data: dict) -> Account:
 
     if Account.objects.filter(username=data["username"]).exists():
         raise ApiError(DUPLICATE_RESOURCE, "登录账号已存在", [{"field": "username", "reason": "已被占用"}])
+    if invitation.person_id and Account.objects.filter(person_id=invitation.person_id).exists():
+        raise ApiError(
+            DUPLICATE_RESOURCE,
+            "该人员已绑定其他账号",
+            [{"field": "personId", "reason": "一个人员只能绑定一个账号"}],
+        )
 
     with transaction.atomic():
         account = Account.objects.create(
@@ -176,16 +183,57 @@ def list_accounts(actor: Account, filters: dict):
     return queryset.order_by("-created_at", "id")
 
 
-def _validate_account_refs(org_id: str, person_id: Optional[str]) -> Organization:
+ROLE_ORG_TYPES: dict[str, set[str]] = {
+    "TEAM": {"TEAM"},
+    "UNIVERSITY": {"UNIVERSITY"},
+    "CITY": {"CITY"},
+    "PROVINCE_REVIEWER": {"PROVINCE"},
+}
+
+
+def _validate_account_refs(
+    org_id: str,
+    person_id: Optional[str],
+    roles: list[str],
+    exclude_account_id: Optional[str] = None,
+) -> Organization:
     organization = Organization.objects.filter(pk=org_id).first()
     if organization is None:
         raise ApiError(INVALID_ARGUMENT, "组织不存在", [{"field": "orgId", "reason": "不存在"}])
+    required: set[str] = set()
+    for role in roles or []:
+        required |= ROLE_ORG_TYPES.get(role, set())
+    allowed = required
+    if len(required) > 1:
+        raise ApiError(
+            INVALID_ARGUMENT,
+            "一个账号只能绑定一个组织节点，多角色请分设账号",
+            [{"field": "roles", "reason": "角色要求的组织类型互相冲突"}],
+        )
+    if allowed and organization.org_type not in allowed:
+        raise ApiError(
+            INVALID_ARGUMENT,
+            f"该角色必须绑定 {'/'.join(sorted(allowed))} 类型的组织节点",
+            [{"field": "orgId", "reason": f"当前为 {organization.org_type}"}],
+        )
+    if person_id:
+        duplicated = Account.objects.filter(person_id=person_id)
+        if exclude_account_id:
+            duplicated = duplicated.exclude(pk=exclude_account_id)
+        if duplicated.exists():
+            raise ApiError(
+                DUPLICATE_RESOURCE,
+                "该人员已绑定其他账号",
+                [{"field": "personId", "reason": "一个人员只能绑定一个账号"}],
+            )
     return organization
 
 
 def create_account(actor: Account, data: dict) -> Account:
     ensure_grantable_roles(actor, data["roles"], data.get("orgId"))
-    organization = _validate_account_refs(data["orgId"], data.get("personId"))
+    organization = _validate_account_refs(
+        data["orgId"], data.get("personId"), list(data["roles"])
+    )
     if Account.objects.filter(username=data["username"]).exists():
         raise ApiError(DUPLICATE_RESOURCE, "登录账号已存在", [{"field": "username", "reason": "已被占用"}])
     return Account.objects.create(
@@ -223,7 +271,9 @@ def update_account(actor: Account, account_id: str, data: dict) -> Account:
     account.username = data["username"]
     account.display_name = data.get("displayName", "")
     account.roles = list(data["roles"])
-    account.organization = _validate_account_refs(data["orgId"], data.get("personId"))
+    account.organization = _validate_account_refs(
+        data["orgId"], data.get("personId"), list(data["roles"]), exclude_account_id=account.pk
+    )
     # PUT 为整份替换：未提交的可选字段清空
     account.team_ids = list(data.get("teamIds") or [])
     account.person_id = data.get("personId") or ""
@@ -652,9 +702,30 @@ def list_audit_logs(actor: Account, filters: dict):
     log_type = filters.get("logType")
     if log_type:
         queryset = queryset.filter(log_type=log_type)
+    if filters.get("outcome"):
+        queryset = queryset.filter(outcome=filters["outcome"])
+    object_type = filters.get("objectType")
+    if object_type:
+        queryset = queryset.filter(object_type=object_type)
     object_id = filters.get("objectId")
     if object_id:
         queryset = queryset.filter(object_id=object_id)
+    operator_account_id = filters.get("operatorAccountId")
+    if operator_account_id:
+        queryset = queryset.filter(operator_account_id=operator_account_id)
+    keyword = filters.get("keyword")
+    if keyword:
+        # 关键词覆盖摘要/动作/对象与操作人账号名，避免只能按 ID 精确检索。
+        matched_accounts = Account.objects.filter(
+            Q(username__icontains=keyword) | Q(display_name__icontains=keyword)
+        ).values_list("id", flat=True)
+        queryset = queryset.filter(
+            Q(summary__icontains=keyword)
+            | Q(action__icontains=keyword)
+            | Q(object_type__icontains=keyword)
+            | Q(object_id__icontains=keyword)
+            | Q(operator_account_id__in=matched_accounts)
+        )
     if filters.get("from"):
         queryset = queryset.filter(created_at__gte=filters["from"])
     if filters.get("to"):

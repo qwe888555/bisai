@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -64,6 +64,13 @@ def env_list(key: str, default: str = "") -> list[str]:
 SECRET_KEY = env("DJANGO_SECRET_KEY", "dev-only-change-me-please-32bytes-min")
 DEBUG = env_bool("DJANGO_DEBUG", True)
 ALLOWED_HOSTS = env_list("ALLOWED_HOSTS", "*")
+
+# 运行环境档位：dev（默认，零校验零影响）/ test / prod（触发生产安全启动校验，见 apps/common/production.py）。
+# 未知值显式报错拒绝启动，不静默回退 dev（报错不回显输入内容）。
+DJANGO_ENV = env("DJANGO_ENV", "dev").strip().lower()
+from apps.common.production import assert_valid_env as _assert_valid_env  # noqa: E402
+
+_assert_valid_env(DJANGO_ENV)
 ROOT_URLCONF = "config.urls"
 WSGI_APPLICATION = "config.wsgi.application"
 ASGI_APPLICATION = "config.asgi.application"
@@ -85,6 +92,7 @@ INSTALLED_APPS = [
     "apps.materials",
     "apps.infra",
     "apps.enrollments",
+    "selection",
 ]
 
 # 中间件顺序不可随意调整：requestId 必须最外层，审计/限流在其内。
@@ -121,10 +129,11 @@ def _database_config(url: str) -> dict:
     parsed = urlparse(url)
     return {
         "ENGINE": "django.db.backends.mysql",
-        "NAME": parsed.path.lstrip("/"),
-        "USER": parsed.username or "",
-        "PASSWORD": parsed.password or "",
-        "HOST": parsed.hostname or "127.0.0.1",
+        # URL 里的百分号编码必须还原，否则密码含 @ 等字符时认证失败
+        "NAME": unquote(parsed.path.lstrip("/")),
+        "USER": unquote(parsed.username or ""),
+        "PASSWORD": unquote(parsed.password or ""),
+        "HOST": unquote(parsed.hostname or "127.0.0.1"),
         "PORT": parsed.port or 3306,
         "OPTIONS": {"charset": "utf8mb4"},
     }
@@ -187,6 +196,8 @@ MAX_FILE_SIZE_MB = env_int("MAX_FILE_SIZE_MB", 10)
 MAX_BATCH_FILES = env_int("MAX_BATCH_FILES", 100)
 MAX_BATCH_TOTAL_MB = env_int("MAX_BATCH_TOTAL_MB", 50)
 FILE_TICKET_TTL_SECONDS = env_int("FILE_TICKET_TTL_SECONDS", 300)
+# 门户公开投影图片地址有效期：默认 7 天，允许公开页面缓存
+PORTAL_FILE_TICKET_TTL_SECONDS = env_int("PORTAL_FILE_TICKET_TTL_SECONDS", 7 * 24 * 3600)
 MINIO_ENDPOINT = env("MINIO_ENDPOINT", "127.0.0.1:9000")
 MINIO_ACCESS_KEY = env("MINIO_ACCESS_KEY", "minioadmin")
 MINIO_SECRET_KEY = env("MINIO_SECRET_KEY", "minioadmin")

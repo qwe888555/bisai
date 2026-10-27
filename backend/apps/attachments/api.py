@@ -29,13 +29,19 @@ register_operation("fileBatchUpload", ALL_ROLES)
 register_operation("fileGet", ALL_ROLES)
 register_operation("fileDownload", ALL_ROLES)
 register_operation("fileDelete", ALL_ROLES)
+register_operation("fileSignedUrl", ALL_ROLES)
 
 
 class FileUploadIn(StrictSchema):
-    """单文件上传表单字段，字段名与 FileUploadRequest 一致。"""
+    """单文件上传表单字段，字段名与 FileUploadRequest 一致。
+
+    ownerId 允许空串（前端新建人员先传头像：PeopleManageView.uploadAvatar
+    传 editingId || ''，人员落库前无法预知 ID）——空归属走角色兜底校验，
+    人员创建/更新成功后由写链回填 owner_id（先传后绑，不绕过归属校验）。
+    """
 
     ownerType: str
-    ownerId: str = Field(..., min_length=1, max_length=64)
+    ownerId: str = Field(default="", max_length=64)
     category: str
 
 
@@ -140,6 +146,69 @@ def file_delete(request, file_id: str):
         summary="删除文件",
     )
     return action_result(True, record.pk, record.version)
+
+
+@router.get(
+    "/files/{file_id}/signed-url",
+    operation_id="fileSignedUrl",
+    auth=_auth,
+    response=EnvelopeOut,
+    summary="获取短期展示地址（供 img/预览使用）",
+)
+def file_signed_url(request, file_id: str, variant: str = "content"):
+    actor = require("fileSignedUrl")
+    record = services.get_record(actor, file_id)
+    audit_state(
+        request,
+        "file.signedUrl",
+        object_type="FileRecord",
+        object_id=record.pk,
+        summary=f"签发展示地址 {variant}",
+    )
+    return ok(services.signed_url(record, variant))
+
+
+@router.get(
+    "/public/files/{file_id}/content",
+    operation_id="publicFileContent",
+    auth=None,
+    response=None,
+    summary="按短期签名地址读取文件内容",
+)
+def public_file_content(request, file_id: str, exp: int, sign: str = ""):
+    from .storage import get_storage
+
+    services.verify_signature(file_id, "content", exp, sign)
+    record = services.get_public_record(file_id)
+    stream = get_storage().open(record.storage_key)
+    response = FileResponse(
+        stream,
+        content_type=record.content_type or "application/octet-stream",
+    )
+    response["Cache-Control"] = "private, no-store"
+    response["Content-Disposition"] = "inline"
+    response["Content-Length"] = str(record.size_bytes)
+    return response
+
+
+@router.get(
+    "/public/files/{file_id}/thumbnail",
+    operation_id="publicFileThumbnail",
+    auth=None,
+    response=None,
+    summary="按短期签名地址读取缩略图",
+)
+def public_file_thumbnail(request, file_id: str, exp: int, sign: str = ""):
+    from .storage import get_storage
+
+    services.verify_signature(file_id, "thumbnail", exp, sign)
+    record = services.get_public_record(file_id)
+    if not record.thumbnail_key:
+        raise ApiError(NOT_FOUND, "该文件没有缩略图")
+    stream = get_storage().open(record.thumbnail_key)
+    response = FileResponse(stream, content_type="image/jpeg")
+    response["Cache-Control"] = "private, no-store"
+    return response
 
 
 @router.get(

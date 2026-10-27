@@ -41,7 +41,7 @@ ALL_ROLES: tuple[str, ...] = (
 
 ROLE_NAMES: dict[str, str] = {
     TEAM: "中小学球队端",
-    UNIVERSITY: "高校端",
+    UNIVERSITY: "学校端",
     CITY: "市州端",
     PROVINCE_REVIEWER: "省级审核",
     ATHLETE: "运动员",

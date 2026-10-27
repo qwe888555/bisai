@@ -78,6 +78,42 @@ def org_scope_ids(account) -> list[str]:
     return _subtree_ids(org_id)
 
 
+def visible_school_codes(account) -> Optional[set[str]]:
+    """账号可见的学校类组织 code（SCHOOL/UNIVERSITY）。
+
+    返回 None 表示全量（无组织的全局管理员）；返回空集表示无学校范围。
+    按 A′-min 约定组织节点 code 与 School.code 一一对应，调用方用
+    `school__code__in` 过滤即可，不需要逻辑外键。
+    """
+    if is_global_admin(account):
+        return None
+    ids = set(org_scope_ids(account))
+    if not ids:
+        return set()
+    from apps.accounts.models import Organization
+
+    return set(
+        Organization.objects.filter(
+            pk__in=ids, org_type__in=("SCHOOL", "UNIVERSITY")
+        ).values_list("code", flat=True)
+    )
+
+
+def account_org_code(account) -> str:
+    """账号绑定组织节点的 code（TEAM 账号即 team_no）；无组织返回空串。"""
+    org_id = account_org_id(account)
+    if not org_id:
+        return ""
+    from apps.accounts.models import Organization
+
+    return (
+        Organization.objects.filter(pk=org_id)
+        .values_list("code", flat=True)
+        .first()
+        or ""
+    )
+
+
 def ensure_org_in_scope(account, org_id: Optional[str]) -> None:
     if is_global_admin(account):
         return

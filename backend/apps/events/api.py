@@ -1,4 +1,4 @@
-﻿"""events 接口：赛事配置（/events）与报名可见（/available-events）。
+"""events 接口：赛事配置（/events）与报名可见（/available-events）。
 
 受保护接口用 register_operation + require 完成角色与权限点校验；
 公开报名可见接口对全角色开放；响应统一走信封，分页 data 为 {items,page,pageSize,total}。
@@ -19,8 +19,11 @@ from apps.common.pagination import paginate
 from apps.common.permissions import (
     ADMIN,
     ALL_ROLES,
+    CITY,
     MATCH_RECORDER,
     PROVINCE_REVIEWER,
+    TEAM,
+    UNIVERSITY,
     register_operation,
     require,
 )
@@ -32,18 +35,32 @@ from . import services
 router = Router(tags=["events"])
 _auth = JWTAuth()
 
-# 管理端：ADMIN / PROVINCE_REVIEWER
-register_operation("eventList", (ADMIN, PROVINCE_REVIEWER))
+# 管理端写操作：ADMIN / PROVINCE_REVIEWER
 register_operation("eventCreate", (ADMIN, PROVINCE_REVIEWER))
+<<<<<<< HEAD
 register_operation("eventGet", ALL_ROLES)
+=======
+>>>>>>> origin/main
 register_operation("eventUpdate", (ADMIN, PROVINCE_REVIEWER))
 register_operation("eventDelete", (ADMIN, PROVINCE_REVIEWER))
+# 只读查询：比赛页/报名页筛选依赖，学校端、市州、球队都需读取
+_REFERENCE_READ_ROLES = (
+    ADMIN,
+    PROVINCE_REVIEWER,
+    MATCH_RECORDER,
+    CITY,
+    UNIVERSITY,
+    TEAM,
+)
+register_operation("eventList", _REFERENCE_READ_ROLES)
+register_operation("eventGet", _REFERENCE_READ_ROLES)
 # 报名可见：全角色
 register_operation("availableEvents", ALL_ROLES)
-# 组别管理端
-register_operation("eventGroupList", (ADMIN, PROVINCE_REVIEWER))
+# 组别只读：同赛事读取范围
+register_operation("eventGroupList", _REFERENCE_READ_ROLES)
+register_operation("eventGroupGet", _REFERENCE_READ_ROLES)
+# 组别管理端写操作
 register_operation("eventGroupCreate", (ADMIN, PROVINCE_REVIEWER))
-register_operation("eventGroupGet", (ADMIN, PROVINCE_REVIEWER))
 register_operation("eventGroupUpdate", (ADMIN, PROVINCE_REVIEWER))
 register_operation("eventGroupDelete", (ADMIN, PROVINCE_REVIEWER))
 # 报名可选组别：全角色
@@ -239,9 +256,11 @@ def available_groups(request, event_id: str):
 # ---------------------------------------------------------------- 比赛对阵管理（5.1）
 
 _MATCH_ROLES = (MATCH_RECORDER, ADMIN, PROVINCE_REVIEWER)
-register_operation("matchList", _MATCH_ROLES)
+# 对阵只读：比赛页需要学校端、市州、球队也能查看，写操作仍限制在 _MATCH_ROLES
+_MATCH_READ_ROLES = _MATCH_ROLES + (CITY, UNIVERSITY, TEAM)
+register_operation("matchList", _MATCH_READ_ROLES)
+register_operation("matchGet", _MATCH_READ_ROLES)
 register_operation("matchCreate", _MATCH_ROLES)
-register_operation("matchGet", _MATCH_ROLES)
 register_operation("matchUpdate", _MATCH_ROLES)
 register_operation("matchDelete", _MATCH_ROLES)
 register_operation("matchPublish", _MATCH_ROLES)
@@ -803,6 +822,11 @@ def portal_resource_delete(request, resource_id: str, version: Optional[int] = N
 
 # ---------------------------------------------------------------- 公开只读（7.1 / 7.2，免登录）
 
+def _public_base(request) -> str:
+    """门户图片签名地址的绝对前缀，避免前端把 /api 当成自身域名。"""
+    return request.build_absolute_uri("/")
+
+
 @router.get("/public/contents", auth=None, response=EnvelopeOut, summary="门户已发布内容列表")
 def public_content_list(
     request,
@@ -816,19 +840,21 @@ def public_content_list(
         "contentType": contentType, "eventId": eventId, "groupId": groupId,
         "keyword": keyword, "eventCategory": eventCategory,
     })
-    return paginate(request, qs, mapper=s.public_content_out)
+    base_url = _public_base(request)
+    return paginate(request, qs, mapper=lambda item: s.public_content_out(item, base_url))
 
 
 @router.get("/public/contents/{content_id}", auth=None, response=EnvelopeOut, summary="门户内容详情")
 def public_content_get(request, content_id: str):
     content = services.public_get_content(content_id)
-    return ok(s.public_content_out(content))
+    return ok(s.public_content_out(content, _public_base(request)))
 
 
 @router.get("/public/resources", auth=None, response=EnvelopeOut, summary="门户轮播/链接图/合作方展示")
 def public_resource_list(request, resourceType: Optional[str] = None):
     qs = services.public_list_resources(resourceType)
-    return paginate(request, qs, mapper=s.public_resource_out)
+    base_url = _public_base(request)
+    return paginate(request, qs, mapper=lambda item: s.public_resource_out(item, base_url))
 
 # ---------------------------------------------------------------- 赛果(5.5)：MATCH_RECORDER / ADMIN / PROVINCE_REVIEWER
 
@@ -916,15 +942,17 @@ def public_match_list(
 
 @router.get("/public/matches/{match_id}", auth=None, response=EnvelopeOut, summary="已发布比赛对阵详情")
 def public_match_get(request, match_id: str):
-    return ok(s.public_match_out(services.public_get_match(match_id)))
+    match, events = services.public_match_detail(match_id)
+    return ok(s.public_match_detail_out(match, events))
 
 
 @router.get("/public/matches/{match_id}/live-feed", auth=None, response=EnvelopeOut, summary="短轮询图文直播")
 def public_live_feed(request, match_id: str, afterRevision: int = 0):
     feed = services.public_live_feed(match_id, afterRevision)
+    base_url = _public_base(request)
     return ok({
         "feedRevision": feed["feedRevision"],
-        "items": [s.public_live_post_out(p) for p in feed["items"]],
+        "items": [s.public_live_post_out(p, base_url) for p in feed["items"]],
         "deletedIds": feed["deletedIds"],
         "resetRequired": feed["resetRequired"],
     })

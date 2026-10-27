@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
 from typing import Callable, Iterable, Optional
 
 from django.core.files.uploadedfile import UploadedFile
@@ -61,6 +62,16 @@ def _check_owner(account, owner_type: str, owner_id: str) -> None:
             "未知的文件归属类型",
             [{"field": "ownerType", "reason": "不在枚举范围内"}],
         )
+    if not (owner_id or "").strip():
+        # 先传后绑（前端新建人员先传头像）：文件暂无归属对象，仍按角色兜底校验
+        # ——只有管理/录入类角色可上传无主文件，普通账号不得借空归属绕过校验
+        roles = set(getattr(account, "roles", ()) or ())
+        if not roles & {ADMIN, PROVINCE_REVIEWER, MATCH_RECORDER}:
+            raise ApiError(
+                FORBIDDEN,
+                "文件归属对象尚未创建，暂无法受理该上传",
+            )
+        return
     verifier = OWNER_VERIFIERS.get(owner_type)
     if verifier is not None:
         verifier(account, owner_id)
@@ -238,20 +249,28 @@ def upload_batch(
 
 
 def can_access(record: FileRecord, account) -> bool:
-    """第四层校验：对象归属。业务模块注册校验器后由校验器裁决。"""
+    """第四层校验：对象归属。三条独立通道分别核对，不互相替代：
+    1) 上传者本人——文件所有者通道（谁上传谁可读，与业务归属无关）；
+    2) ADMIN 全局——A′ 一期数据范围仅 ADMIN 全量（已确认决策）；
+    3) 业务归属校验器——业务资源所有权通道，由各业务域注册（见
+       register_owner_verifier）；PROVINCE_REVIEWER/MATCH_RECORDER 等
+       特权角色不再凭角色放行，PERSON/TEAM 私有附件必须通过归属裁决
+       （T4-04 安全缺口修复）。
+    未注册校验器或归属无法确认 → 一律拒绝（deny-by-default，不默认放行）。
+    """
     if record.uploaded_by == account.pk:
         return True
     roles = set(getattr(account, "roles", ()) or ())
-    if roles & {ADMIN, PROVINCE_REVIEWER, MATCH_RECORDER}:
+    if ADMIN in roles:
         return True
     verifier = OWNER_VERIFIERS.get(record.owner_type)
-    if verifier is not None:
-        try:
-            verifier(account, record.owner_id)
-            return True
-        except ApiError:
-            return False
-    return False
+    if verifier is None:
+        return False
+    try:
+        verifier(account, record.owner_id)
+        return True
+    except ApiError:
+        return False
 
 
 def get_record(account, file_id: str, *, require_access: bool = True) -> FileRecord:
@@ -273,4 +292,76 @@ def delete_record(account, file_id: str, version: Optional[int]) -> FileRecord:
     record.deleted_at = timezone.now()
     bump(record)
     record.save()
+    return record
+
+
+def _signing_key() -> bytes:
+    return (conf.CRYPTO_KEY or conf.JWT_SECRET).encode("utf-8")
+
+
+def _signature(file_id: str, variant: str, expires_at: int) -> str:
+    import base64
+    import hashlib
+    import hmac
+
+    message = f"{file_id}:{variant}:{expires_at}".encode("utf-8")
+    digest = hmac.new(_signing_key(), message, hashlib.sha256).digest()
+    return base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+
+
+def signed_url(record: FileRecord, variant: str = "content", ttl_seconds: Optional[int] = None) -> dict:
+    """生成短期可直连的展示地址，供 <img> 等无法带 Authorization 头的场景使用。
+
+    签名绑定 fileId + variant + 过期时间，泄露的旧地址到期自动失效；
+    文件本身仍是私有对象，不属于公开资源。
+    """
+    import time
+
+    if variant not in {"content", "thumbnail"}:
+        raise ApiError(
+            INVALID_ARGUMENT,
+            "未知的展示类型",
+            [{"field": "variant", "reason": "仅支持 content / thumbnail"}],
+        )
+    if variant == "thumbnail" and not record.thumbnail_key:
+        raise ApiError(NOT_FOUND, "该文件没有缩略图")
+    default_ttl = int(conf.FILE_TICKET_TTL_SECONDS)
+    ttl = max(30, min(int(ttl_seconds or default_ttl), 30 * 24 * 3600))
+    expires_at = int(time.time()) + ttl
+    signature = _signature(record.pk, variant, expires_at)
+    return {
+        "url": f"/api/v1/public/files/{record.pk}/{variant}?exp={expires_at}&sign={signature}",
+        "expiresAt": timezone.now() + timedelta(seconds=ttl),
+        "variant": variant,
+    }
+
+
+def portal_image_url(file_id: str, variant: str = "content") -> str:
+    """门户公开投影专用：为已发布内容的图片签发长期地址（默认 7 天）。
+
+    调用方是公开读接口（如 `/public/portal-resources`）在组装 PublicResource.imageUrl
+    时使用；业务方必须先确认该资源已发布，不要把草稿内容投影出去。
+    """
+    record = get_public_record(file_id)
+    return signed_url(record, variant, conf.PORTAL_FILE_TICKET_TTL_SECONDS)["url"]
+
+
+
+def verify_signature(file_id: str, variant: str, expires_at: int, signature: str) -> None:
+    import hmac
+    import time
+
+    if variant not in {"content", "thumbnail"}:
+        raise ApiError(FORBIDDEN, "展示地址无效")
+    if expires_at < int(time.time()):
+        raise ApiError(FORBIDDEN, "展示地址已过期，请重新获取")
+    expected = _signature(file_id, variant, expires_at)
+    if not hmac.compare_digest(expected, signature or ""):
+        raise ApiError(FORBIDDEN, "展示地址签名无效")
+
+
+def get_public_record(file_id: str) -> FileRecord:
+    record = FileRecord.objects.filter(pk=file_id).first()
+    if record is None:
+        raise ApiError(NOT_FOUND)
     return record

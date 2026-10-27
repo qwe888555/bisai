@@ -20,6 +20,7 @@ from apps.common.errors import (
 from apps.common.ids import new_id
 from apps.common.versioning import bump, check_version
 
+from . import display
 from .models import Event, EventGroup
 
 
@@ -197,7 +198,22 @@ def list_matches(filters: dict):
     if filters.get("teamId"):
         tid = filters["teamId"]
         queryset = queryset.filter(Q(home_team_id=tid) | Q(away_team_id=tid))
-    # teamName 依赖成员4球队维度，本库不冗余球队名；待球队服务接入后在此补名称模糊匹配
+    if filters.get("teamName"):
+        # 本库只存球队 ID；先按成员4 Team 主档模糊匹配出 ID，再过滤对阵。
+        from apps.teams.models import Team
+
+        team_ids = [
+            str(pk)
+            for pk in Team.objects.filter(
+                is_deleted=False, name__icontains=filters["teamName"]
+            ).values_list("pk", flat=True)
+        ]
+        if team_ids:
+            queryset = queryset.filter(
+                Q(home_team_id__in=team_ids) | Q(away_team_id__in=team_ids)
+            )
+        else:
+            queryset = queryset.none()
     return queryset.order_by("kickoff_at", "id")
 
 
@@ -786,6 +802,10 @@ def update_content(content_id: str, data: dict):
     content.revision = int(content.revision or 1) + 1
     bump(content)
     content.save()
+    if content.status == "PUBLISHED":
+        from apps.policyqa.services import sync_policy_document
+
+        sync_policy_document(content)
     _invalidate_public_cache()
     return content
 
@@ -796,6 +816,9 @@ def delete_content(content_id: str, version: int):
     content.deleted_at = timezone.now()
     bump(content)
     content.save()
+    from apps.policyqa.services import sync_policy_document
+
+    sync_policy_document(content)
     _invalidate_public_cache()
     return content
 
@@ -807,6 +830,9 @@ def publish_content(content_id: str, version: int):
     content.published_at = timezone.now()
     bump(content)
     content.save()
+    from apps.policyqa.services import sync_policy_document
+
+    sync_policy_document(content)
     _invalidate_public_cache()
     return content
 
@@ -817,6 +843,9 @@ def unpublish_content(content_id: str, version: int, reason: str):
     content.status = "OFFLINE"
     bump(content)
     content.save()
+    from apps.policyqa.services import sync_policy_document
+
+    sync_policy_document(content)
     _invalidate_public_cache()
     return content
 
@@ -1053,10 +1082,10 @@ def goal_ranking(event_id: str, group_id: Optional[str], category: Optional[str]
         ranked.append({
             "rank": rank,
             "athleteId": athlete_id,
-            # 名册/公示由成员6提供，本库无姓名来源，不伪造：先用占位，teamName 留空
-            "athleteName": athlete_id,
+            # 姓名取报名名单快照、球队名取成员4 Team 主档；查不到回退 ID。
+            "athleteName": display.athlete_name(athlete_id, athlete_id),
             "teamId": info["teamId"],
-            "teamName": "",
+            "teamName": display.team_name(info["teamId"], info["teamId"]),
             "goals": info["goals"],
         })
 
@@ -1158,6 +1187,15 @@ def public_get_match(match_id: str):
     if match is None:
         raise ApiError(NOT_FOUND)
     return match
+
+
+def public_match_detail(match_id: str):
+    """门户详情一次性返回对阵、裁判组与事件流，避免访客再走需登录的事件接口。"""
+    from .models import MatchEvent
+
+    match = public_get_match(match_id)
+    events = MatchEvent.objects.filter(match_id=match_id).order_by("minute", "id")
+    return match, list(events)
 
 
 def public_live_feed(match_id: str, after_revision: int) -> dict:

@@ -450,7 +450,11 @@ def dictionary_options(request, dict_type: str):
 def audit_list(
     request,
     logType: Optional[str] = None,
+    keyword: Optional[str] = None,
+    outcome: Optional[str] = None,
+    objectType: Optional[str] = None,
     objectId: Optional[str] = None,
+    operatorAccountId: Optional[str] = None,
     time_from: Optional[str] = Query(None, alias="from"),
     time_to: Optional[str] = Query(None, alias="to"),
 ):
@@ -468,6 +472,14 @@ def audit_list(
             parsed[key] = value
     queryset = services.list_audit_logs(
         actor,
-        {"logType": logType, "objectId": objectId, **parsed},
+        {
+            "logType": logType,
+            "keyword": keyword,
+            "outcome": outcome,
+            "objectType": objectType,
+            "objectId": objectId,
+            "operatorAccountId": operatorAccountId,
+            **parsed,
+        },
     )
     return paginate(request, queryset, mapper=s.audit_log_out)

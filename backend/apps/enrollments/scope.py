@@ -15,7 +15,9 @@ from django.db.models import Q
 
 from apps.common.errors import DATA_SCOPE_DENIED, FORBIDDEN, NOT_FOUND, ApiError
 from apps.common.permissions import (
+    MATCH_RECORDER,
     ORG_SCOPE_ROLES,
+    TEAM,
     UNIVERSITY,
 )
 from apps.common.scopes import org_scope_ids
@@ -46,6 +48,9 @@ def team_scope_ids(account) -> list[str]:
 
 def scoped_queryset(account, queryset):
     """按数据范围过滤报名单 QuerySet。"""
+    # 记录员：赛前身份核验需跨队/跨市读取名册，授予全局只读（写权限由 R1/R3 拦截，不在 R5）。
+    if MATCH_RECORDER in role_set(account):
+        return queryset
     if is_org_scoped(account):
         org_ids = org_scope_ids(account)
         if not org_ids:
@@ -58,6 +63,8 @@ def scoped_queryset(account, queryset):
 
 
 def ensure_enrollment_access(account, enrollment: Enrollment) -> None:
+    if MATCH_RECORDER in role_set(account):
+        return
     if is_org_scoped(account):
         if enrollment.city_org_id not in set(org_scope_ids(account)):
             raise ApiError(
@@ -83,38 +90,45 @@ def get_enrollment(account, enrollment_id: str) -> Enrollment:
 
 
 def subject_type_allowed(account, subject_type: str) -> None:
-    """学校端（UNIVERSITY）是唯一报送主体：新建/编辑/提交/撤回只能由它做。
+    """谁能以什么主体类型报单。
 
-    TEAM 只读看进度+维护名单材料；CITY 不代填报；省级只终审；
-    ADMIN 依口径不代替学校新建或提交报名。
+    规则（已确认口径：仅学校端可报送，不设任何代报）：
+    - UNIVERSITY 角色：SCHOOL_TEAM（本校球队）或 UNIVERSITY（自己作为主体）
+    - TEAM/CITY/PROVINCE_REVIEWER/ADMIN：不可报送（不代建代提，含市州代报）
+    另外还要由 ensure_team_in_scope 确认球队在数据范围内。
     """
     roles = role_set(account)
-    if UNIVERSITY not in roles:
+    allowed: set[str] = set()
+    if UNIVERSITY in roles:
+        allowed.add("SCHOOL_TEAM")
+        allowed.add("UNIVERSITY")
+    if not allowed:
         raise ApiError(
             FORBIDDEN,
-            "仅学校端可报送报名",
-            [{"field": "subjectType", "reason": "当前角色无报送权限"}],
+            "当前角色无报送权限",
+            [{"field": "subjectType", "reason": "仅学校端可报送"}],
         )
-    if subject_type not in {"SCHOOL_TEAM", "UNIVERSITY"}:
+    if subject_type not in allowed:
         raise ApiError(
             FORBIDDEN,
-            "报送主体类型非法",
-            [{"field": "subjectType", "reason": "仅支持中小学球队/高校"}],
+            "报送主体类型与当前角色不匹配",
+            [{"field": "subjectType", "reason": f"当前角色可选：{sorted(allowed)}"}],
         )
 
 
 def ensure_enrollment_creator(account, enrollment: Enrollment) -> None:
-    """报名单的编辑/提交/撤回：仅创建该报名的学校端账号本人可操作。"""
-    if UNIVERSITY not in role_set(account):
+    """报名单的编辑/提交/撤回：仅学校端账号可操作（已确认不设代报）。"""
+    roles = role_set(account)
+    if UNIVERSITY not in roles:
         raise ApiError(
             FORBIDDEN,
-            "仅学校端可操作该报名单",
-            [{"field": "enrollmentId", "reason": "当前角色无报送权限"}],
+            "当前角色不能操作报名单",
+            [{"field": "enrollmentId", "reason": "仅学校端可操作"}],
         )
     if account.pk != enrollment.created_by:
         raise ApiError(
             FORBIDDEN,
-            "仅创建该报名的学校账号可操作",
+            "仅创建该报名的账号可操作",
             [{"field": "enrollmentId", "reason": "非报名的创建者"}],
         )
 

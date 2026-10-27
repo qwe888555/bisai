@@ -1,0 +1,7 @@
+type_code,value,label,sort_order,is_active,ext_json
+coach_category,HEAD,主教练,10,1,
+coach_category,ASSISTANT,助理教练,20,1,
+coach_category,GOALKEEPER,守门员教练,30,1,
+coach_category,FITNESS,体能教练,40,1,
+coach_category,MANAGER,领队,50,1,
+coach_category,OTHER,其他,90,1,

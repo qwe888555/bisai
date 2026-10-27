@@ -10,6 +10,7 @@ status 语义（契约 4.6）：
 from __future__ import annotations
 
 import re
+from datetime import datetime, time
 from typing import Any, Optional
 
 from django.utils import timezone
@@ -17,6 +18,7 @@ from django.utils import timezone
 from apps.common import conf
 from apps.common.context import get_request_id
 from apps.common.errors import BUSINESS_VALIDATION_FAILED, ApiError
+from apps.common.ids import new_policy_id
 
 from .models import PolicyDocument
 
@@ -95,6 +97,48 @@ def _fallback(documents: list[PolicyDocument]) -> list[dict[str, Any]]:
     return [_citation(doc, _excerpt(doc)) for doc in documents[:MAX_CITATIONS]]
 
 
+def _to_datetime(value) -> Optional[datetime]:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value if timezone.is_aware(value) else timezone.make_aware(value)
+    return timezone.make_aware(datetime.combine(value, time.min))
+
+
+def sync_policy_document(content) -> Optional[PolicyDocument]:
+    """把 CMS 的 POLICY 内容同步为问答可检索的政策快照。
+
+    CMS 发布/修改/下线/删除内容时由 events 服务调用；只有 PUBLISHED 状态可检索。
+    非 POLICY 类型直接忽略，返回值仅用于调试。
+    """
+    if getattr(content, "content_type", "") != "POLICY":
+        return None
+    document = PolicyDocument.objects.filter(source_content_id=content.pk).first()
+    if content.status != "PUBLISHED" or getattr(content, "deleted_at", None):
+        if document is not None and document.enabled:
+            document.enabled = False
+            document.save(update_fields=["enabled", "updated_at"])
+        return document
+
+    body = (getattr(content, "body_text", "") or getattr(content, "body_html", "") or "").strip()
+    if not body:
+        return document  # 空正文不建快照，避免问答引用空文本
+
+    if document is None:
+        document = PolicyDocument(id=new_policy_id(), source_content_id=content.pk)
+    document.title = content.title
+    document.summary = content.summary or ""
+    document.body = body
+    document.event_id = content.event_id or ""
+    document.revision = int(content.revision or 1)
+    document.enabled = True
+    document.published_at = content.published_at or timezone.now()
+    document.valid_from = _to_datetime(content.policy_effective_from)
+    document.valid_to = _to_datetime(content.policy_effective_to)
+    document.save()
+    return document
+
+
 def _reject_personal_info(question: str) -> None:
     if _ID.search(question) or _PHONE.search(question):
         # 含身份证/手机号：拒绝外发，不送模型
@@ -162,11 +206,12 @@ def answer(question: str, event_id: Optional[str] = None, season: Optional[str] 
         }
 
     if not ranked:
+        # 零命中通常是与政策/报名无关的问题：明确边界，不给无关政策卡片
         return {
             "status": "NO_EVIDENCE",
-            "answer": "未在已发布的政策中找到相关依据，请查阅相关政策原文或咨询组织方。",
+            "answer": "本问答仅支持校园足球政策与报名相关问题，未找到相关依据。请改问政策条款或报名流程。",
             "citations": [],
-            "fallbackPolicies": fallback,
+            "fallbackPolicies": [],
             "aiGenerated": False,
             "requestId": get_request_id(),
         }
