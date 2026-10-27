@@ -762,8 +762,10 @@ class PeopleApiTests(TestCase):
         from apps.persons.schemas import person_version
 
         self.assertEqual(coach_row["version"], person_version(self.coach))
-        # coachCategory 语义映射未确认（coach_level≠教练类别，字典清单未交付），不输出
-        self.assertNotIn("coachCategory", coach_row)
+        # education/coachCategory 由扩展档案 ext_json 承载（2026-10-27 修订）：
+        # 无值 → None；不映射冻结列 coach_level
+        self.assertIsNone(coach_row["coachCategory"])
+        self.assertIsNone(coach_row["education"])
 
         self.assertEqual(athlete_row["realName"], "张小明")
         self.assertEqual(athlete_row["kinds"], ["ATHLETE"])
@@ -775,7 +777,7 @@ class PeopleApiTests(TestCase):
         self.assertEqual(athlete_row["schoolName"], "甲一小")
         self.assertEqual(athlete_row["teamName"], "甲一队")
         self.assertIsNone(athlete_row["maskedPhone"])
-        self.assertNotIn("education", athlete_row)
+        self.assertIsNone(athlete_row["education"])
         self.assertNotIn("avatarUrl", athlete_row)
 
     def test_list_filters_kind_keyword_review_status(self):
@@ -856,10 +858,15 @@ class PersonVersionMechanismTests(TestCase):
         return person_version(person or Person.objects.get(pk=self.person.pk))
 
     def test_consecutive_saves_produce_distinct_versions(self):
+        import time
+
         v0 = self._derived()
         self.person.save()
         v1 = self._derived()
         self.person.full_name = "版本员二"
+        # Windows 系统时钟粒度约 15.6ms，两次 save 落在同一 tick 会派生同版本号；
+        # 睡眠一 tick 让"连续保存版本递增"的断言可稳定验证（Linux 上无副作用）
+        time.sleep(0.03)
         self.person.save()
         v2 = self._derived()
         self.assertGreater(v1, v0)
@@ -1174,7 +1181,8 @@ class PeopleWriteApiTests(TestCase):
         person.refresh_from_db()
         self.assertEqual(person.full_name, "并发先写")  # 未被覆盖
 
-    def test_update_education_coach_category_accepted_not_persisted(self):
+    def test_update_education_coach_category_persisted_and_readable(self):
+        """education/coachCategory 落扩展档案 ext_json，写后可读回（5.txt 问题一）。"""
         _, person = self._create()
         from apps.persons.schemas import person_version
 
@@ -1188,9 +1196,18 @@ class PeopleWriteApiTests(TestCase):
                 "version": person_version(person),
             },
         )
-        self.assertEqual(resp.status_code, 200)  # 声明但不持久化，不阻断保存
-        self.assertNotIn("education", resp.json()["data"])
-        self.assertNotIn("coachCategory", resp.json()["data"])
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()["data"]
+        self.assertEqual(data["education"], "本科")
+        self.assertEqual(data["coachCategory"], "A")
+        self.assertEqual(
+            AthleteProfile.objects.get(person=person).ext_json,
+            {"education": "本科", "coachCategory": "A"},
+        )
+        # 详情链同样读得回（未持久化缺陷已闭环）
+        detail = self._get_detail(person.pk).json()["data"]
+        self.assertEqual(detail["education"], "本科")
+        self.assertEqual(detail["coachCategory"], "A")
 
     # ------------------------------------------------------------ 删除（软删+乐观锁）
 
@@ -1664,7 +1681,7 @@ class MyProfileApiTests(TestCase):
                 "realName": "张小改",
                 "gender": "MALE",
                 "birthDate": "2013-05-01",
-                "schoolName": "乙一小",
+                "schoolName": "甲一小",
                 "education": "本科",
                 "coachCategory": "主教练",
                 "version": current,
@@ -1703,11 +1720,59 @@ class MyProfileApiTests(TestCase):
         self.assertEqual(fields["realName"]["new"], "张小改")
         self.assertEqual(log.reason, "本人更新档案")
 
-        # 冻结模型无持久列的字段不伪造回显：education/coachCategory 不输出；
-        # schoolName 为派生展示字段（来自 school 关系），提交值"乙一小"未生效
-        self.assertNotIn("education", data)
-        self.assertNotIn("coachCategory", data)
+        # education/coachCategory 落扩展档案 ext_json（预留扩展列）→ 提交后读得回；
+        # schoolName 为派生只读字段，回传原值放行
+        self.assertEqual(data["education"], "本科")
+        self.assertEqual(data["coachCategory"], "主教练")
         self.assertEqual(data["schoolName"], "甲一小")
+        self.assertEqual(get_data["education"], "本科")
+        self.assertEqual(get_data["coachCategory"], "主教练")
+        self.assertEqual(
+            AthleteProfile.objects.get(person=self.athlete).ext_json,
+            {"education": "本科", "coachCategory": "主教练"},
+        )
+        # 落库字段进入变更留痕
+        self.assertEqual(fields["education"]["new"], "本科")
+        self.assertEqual(fields["coachCategory"]["new"], "主教练")
+
+    def test_put_changed_school_name_returns_422(self):
+        """schoolName 派生只读：改成别值 → 422 明确业务错误（不再 200 OK 但未保存）。"""
+        from apps.persons.schemas import person_version
+
+        version_before = person_version(self.athlete)
+        resp = self._put(
+            {
+                "realName": "张小改",
+                "schoolName": "乙一小",
+                "version": version_before,
+            }
+        )
+        self.assertEqual(resp.status_code, 422, resp.content)
+        body = resp.json()
+        self.assertEqual(body["code"], "BUSINESS_VALIDATION_FAILED")
+        self.assertEqual([item["field"] for item in body["data"]], ["schoolName"])
+        self.assertTrue(body["data"][0]["reason"])
+        self.athlete.refresh_from_db()
+        self.assertEqual(self.athlete.full_name, "张小明")
+        self.assertEqual(person_version(self.athlete), version_before)
+
+    def test_put_education_omitted_keeps_previous_value(self):
+        """education/coachCategory 未传=保留原值（不清空，与 /people 可选字段同口径）。"""
+        from apps.persons.schemas import person_version
+
+        coach_ext = CoachProfile.objects.get(person=self.coach)
+        coach_ext.ext_json = {"education": "硕士"}
+        coach_ext.save(update_fields=["ext_json"])
+
+        resp = self._put(
+            {"realName": "李大改", "version": person_version(self.coach)},
+            token=self.coach_token,
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertEqual(resp.json()["data"]["education"], "硕士")
+        self.assertEqual(
+            CoachProfile.objects.get(person=self.coach).ext_json, {"education": "硕士"}
+        )
 
     def test_put_missing_version_rejected_no_update(self):
         from apps.persons.schemas import person_version
