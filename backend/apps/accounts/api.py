@@ -8,8 +8,10 @@ from __future__ import annotations
 
 from typing import Optional
 
+from django.http import HttpResponse
 from django.utils.dateparse import parse_datetime
-from ninja import Query, Router
+from ninja import File, Form, Query, Router
+from ninja.files import UploadedFile
 
 from apps.common.authentication import JWTAuth
 from apps.common.envelope import action_result, ok
@@ -19,7 +21,9 @@ from apps.common.pagination import paginate
 from apps.common.permissions import (
     ADMIN,
     ALL_ROLES,
+    CITY,
     PROVINCE_REVIEWER,
+    UNIVERSITY,
     menus_for,
     permissions_for,
     register_operation,
@@ -34,14 +38,15 @@ router = Router(tags=["accounts"])
 _auth = JWTAuth()
 
 # 权限点登记：与本应用路由一一对应，导入期完成，漏登记 require() 会直接报错
-register_operation("createInvite", (ADMIN,))
+register_operation("createInvite", (ADMIN, PROVINCE_REVIEWER, CITY, UNIVERSITY))
+register_operation("inviteBatchCreate", (ADMIN, PROVINCE_REVIEWER, CITY, UNIVERSITY))
 register_operation("logout", ALL_ROLES)
 register_operation("currentUser", ALL_ROLES)
 register_operation("changePassword", ALL_ROLES)
-register_operation("accountList", (ADMIN, PROVINCE_REVIEWER))
-register_operation("accountCreate", (ADMIN, PROVINCE_REVIEWER))
-register_operation("accountGet", (ADMIN, PROVINCE_REVIEWER))
-register_operation("accountUpdate", (ADMIN, PROVINCE_REVIEWER))
+register_operation("accountList", (ADMIN, PROVINCE_REVIEWER, CITY, UNIVERSITY))
+register_operation("accountCreate", (ADMIN, PROVINCE_REVIEWER, CITY, UNIVERSITY))
+register_operation("accountGet", (ADMIN, PROVINCE_REVIEWER, CITY, UNIVERSITY))
+register_operation("accountUpdate", (ADMIN, PROVINCE_REVIEWER, CITY, UNIVERSITY))
 register_operation("accountDelete", (ADMIN, PROVINCE_REVIEWER))
 register_operation("resetPassword", (ADMIN, PROVINCE_REVIEWER))
 register_operation("organizationList", (ADMIN,))
@@ -165,7 +170,49 @@ def create_invite(request, body: s.InviteRequest):
     return ok(result)
 
 
-# ---------------------------------------------------------------- 账号
+@router.post(
+    "/accounts/registration-invitations/batch",
+    operation_id="inviteBatchCreate",
+    auth=_auth,
+    response=EnvelopeOut,
+    summary="批量签发注册邀请（Excel）",
+)
+def invite_batch(
+    request,
+    data: s.InviteBatchIn = Form(...),
+    file: UploadedFile = File(...),
+    format: str = Query("json"),
+):
+    """上传 xlsx（姓名/身份证号/手机号/角色/组织编码）批量签发邀请。
+
+    `format=csv` 时同一次请求直接返回 CSV（含明文凭证，仅此一次）。
+    """
+    actor = require("inviteBatchCreate")
+    if format not in ("json", "csv"):
+        raise ApiError(
+            INVALID_ARGUMENT,
+            "format 只支持 json / csv",
+            [{"field": "format", "reason": "json 或 csv"}],
+        )
+    result = services.create_invitation_batch(
+        actor,
+        (data.orgId or "").strip() or None,
+        data.expiresInMinutes,
+        file,
+    )
+    audit_state(
+        request,
+        "account.inviteBatch",
+        object_type="RegistrationInvitation",
+        summary=f"批量签发注册邀请 {result['successCount']}/{result['total']} 条",
+    )
+    if format == "csv":
+        payload, filename = services.invitation_batch_csv(result)
+        response = HttpResponse(payload, content_type="text/csv; charset=utf-8")
+        response["Content-Disposition"] = f'attachment; filename="{filename}"'
+        return response
+    return ok(result)
+
 
 @router.get("/accounts", operation_id="accountList", auth=_auth, response=EnvelopeOut, summary="账号列表")
 def account_list(

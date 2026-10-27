@@ -196,8 +196,8 @@ class PersonCreate(StrictSchema):
 
     - kinds：方案A 一期单类别（2026-10-24 用户决策）——schema 限项数=1，
       多类别/空值直接 400，不静默取首值或丢弃；
-    - education / coachCategory：前端表单会提交（PeopleManageView L130-131），
-      为避免 extra=forbid 拦截 400 阻断保存而**声明但不持久化**（承载方案待定）；
+    - education / coachCategory：**持久化**（2026-10-27 修订）——落扩展档案
+      ext_json 预留扩展列（冻结 DDL 无独立列，不动 DDL）；回显见 person_out；
     - idNumber/phone 只写不回显，服务端加密+查重索引；一期创建服务层强制
       要求 idNumber（冻结 id_card_hash 无 NULL 且全局唯一含软删行，无证件
       档案最多只能存在一条空串行，与文档"可选"冲突，已列待确认）。
@@ -224,7 +224,9 @@ class PersonUpdate(StrictSchema):
     - 必填字段（kinds/realName/gender/birthDate）全量替换；可选字段
       （phone/schoolOrgId/avatarFileId）未传=保留原值——编辑表单无手机号输入，
       缺省清空会造成静默数据丢失（实现口径在案，非全量清空）；
-    - idNumber 不接受：身份证变更走更正流程（文档 §9 待确认），一期不开放。
+    - idNumber 不接受：身份证变更走更正流程（文档 §9 待确认），一期不开放；
+    - education/coachCategory：**持久化**（2026-10-27 修订）——落扩展档案
+      ext_json 预留扩展列，未传=保留原值。
     """
 
     kinds: list[str] = Field(min_length=1, max_length=2)
@@ -247,8 +249,10 @@ class MyProfileUpdate(StrictSchema):
       缺失/非法 → 400 INVALID_ARGUMENT 统一校验错误；不匹配 → 409 VERSION_CONFLICT）；
     - kinds/schoolOrgId/phone/idNumber/avatarFileId 不接受：身份、归属、联系方式与
       证件属管理员/更正链路（页面声明"身份证号与手机号需通过管理员复核后变更"）；
-    - schoolName/education/coachCategory：前端提交但冻结模型无对应持久列
-      （D2 在案）——接受不持久化不回显，不虚构成功（回显为空=预期非缺陷）；
+    - schoolName：派生只读（=person.school.name）。前端回传原值放行；改成别值 →
+      422 BUSINESS_VALIDATION_FAILED（不再"200 OK 但字段未保存"）；
+    - education/coachCategory：**持久化**（2026-10-27 修订）——落扩展档案
+      ext_json 预留扩展列，未传=保留原值，回显见 person_out；
     - birthDate 与 /people 写链同为全量替换语义（缺省=清空）。
     """
 
@@ -323,6 +327,30 @@ def _school_org_id_out(person):
     return Organization.objects.filter(code=code).values_list("pk", flat=True).first()
 
 
+def _ext_out(person, key: str) -> Optional[str]:
+    """扩展档案 ext_json 输出（people_queryset 注解，免 N+1）。
+
+    注解缺失（如 create_person 刚返回的裸对象）时按档案行回查兜底，
+    保证创建/更新/详情三条链回显一致。
+    """
+    annotated = False
+    for attr in ("athlete_ext_val", "coach_ext_val"):
+        if hasattr(person, attr):
+            annotated = True
+        data = getattr(person, attr, None)
+        if isinstance(data, dict) and data.get(key) not in (None, ""):
+            return data[key]
+    if not annotated:
+        from .models import AthleteProfile, CoachProfile
+
+        for model in (AthleteProfile, CoachProfile):
+            row = model.objects.filter(person=person).first()
+            data = row.ext_json if row is not None and isinstance(row.ext_json, dict) else {}
+            if data.get(key) not in (None, ""):
+                return data[key]
+    return None
+
+
 def person_out(person) -> dict:
     """冻结 Person(+扩展档案注解列) → zuqiu Person 字段映射。
 
@@ -335,11 +363,12 @@ def person_out(person) -> dict:
       ID；输出经 people_queryset 的 school_org_id_val 注解（School.code →
       Organization 主键，免 N+1），注解缺失时按 school.code 反查兜底；
       学校无 code 或无对应组织节点 → None（不虚构）；
-    - coachCategory：**不输出**（用户 2026-10-24 决策）——冻结列 coach_level 语义为
-      "教练等级"，与前端 coachCategory"教练类别"无法确认同一，字典清单（成员5）
-      未交付前停止输出该映射，避免错误值进入前端表单；前端字段为可选，读取侧
-      取不到即 undefined（编辑表单该项显示为空），无解析错误；
-    - education：冻结无承载列，不输出（承载方案待决策，见核查报告）；
+    - coachCategory：**输出**（2026-10-27 修订）——冻结列 coach_level 语义为
+      "教练等级"，与前端 coachCategory"教练类别"无法确认同一，故不映射 coach_level；
+      改由扩展档案的 ext_json 承载（预留扩展列，读写同一 key），
+      原"不输出"决策作废（5.txt 问题一：提交后刷新不回显）；
+    - education：**输出**（2026-10-27 修订）——同上，由扩展档案 ext_json 承载
+      （AthleteProfile.ext_json / CoachProfile.ext_json，无档案行 → None）；
     - avatarUrl：mock 发明的公开直链，违反"附件禁止公开直链"基线，不输出；
       头像正式字段=avatarFileId ← photo_file_id，展示走受控下载 /files/{id}/content；
     - reviewStatus 直出 audit_status（冻结含 DRAFT，前端类型未定义该值）。
@@ -360,6 +389,8 @@ def person_out(person) -> dict:
         "schoolOrgId": _school_org_id_out(person),
         "schoolName": person.school.name if person.school_id else None,
         "teamName": getattr(person, "team_name_val", None),
+        "education": _ext_out(person, "education"),
+        "coachCategory": _ext_out(person, "coachCategory"),
         "avatarFileId": person.photo_file_id,
         "reviewStatus": person.audit_status,
         "version": person_version(person),

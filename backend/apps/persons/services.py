@@ -18,12 +18,13 @@ from datetime import datetime
 from typing import Optional
 
 from django.db import transaction
-from django.db.models import Count, Exists, OuterRef, Q, QuerySet, Subquery
+from django.db.models import Count, Exists, JSONField, OuterRef, Q, QuerySet, Subquery
 from django.utils import timezone
 
 from apps.common import crypto, enums
 from apps.common.enums import RegionLevel
 from apps.common.errors import (
+    BUSINESS_VALIDATION_FAILED,
     DATA_SCOPE_DENIED,
     DUPLICATE_RESOURCE,
     INVALID_ARGUMENT,
@@ -435,6 +436,16 @@ def people_queryset() -> QuerySet:
             # Organization.code 唯一，至多一命中）
             school_org_id_val=Subquery(
                 Organization.objects.filter(code=OuterRef("school__code")).values("pk")[:1]
+            ),
+            # education/coachCategory 输出：承载在扩展档案 ext_json（预留扩展列），
+            # 免 N+1 一次取回（无档案行 → NULL → 输出 None）
+            athlete_ext_val=Subquery(
+                AthleteProfile.objects.filter(person=OuterRef("pk")).values("ext_json")[:1],
+                output_field=JSONField(),
+            ),
+            coach_ext_val=Subquery(
+                CoachProfile.objects.filter(person=OuterRef("pk")).values("ext_json")[:1],
+                output_field=JSONField(),
             ),
         )
     )
@@ -948,6 +959,14 @@ def create_person(payload: dict, account):
             AthleteProfile.objects.create(person=person, grade_level="")
         if "COACH" in kind_list:
             CoachProfile.objects.create(person=person)
+        # education/coachCategory 落扩展档案 ext_json（须在档案行建好之后）
+        save_profile_ext_values(
+            person,
+            {
+                EDUCATION_EXT_KEY: _ext_text(payload.get("education")),
+                COACH_CATEGORY_EXT_KEY: _ext_text(payload.get("coachCategory")),
+            },
+        )
         if avatar:
             _bind_avatar(avatar, person)
         _log_change(person, enums.ChangeType.CREATE, None)
@@ -958,12 +977,13 @@ def update_person(person_id: str, payload: dict, account):
     """PUT /people/{id}：版本校验 → 必填字段全量替换 + 可选字段缺省保留 → diff 留痕。
 
     idNumber 不接受（身份证变更走更正流程，一期不开放）；
-    education/coachCategory 声明但不持久化（承载待定）。
+    education/coachCategory 落扩展档案 ext_json（预留扩展列，未传=保留原值）。
     """
     person = _get_person_for_write(person_id, account)
     ensure_version(person, payload["version"])
     kind_list = _kind_list(payload.get("kinds"))
     old_kinds = _current_kinds(person)
+    old_ext = read_profile_ext_values(person)
     gender_value = _gender_in(payload.get("gender"), "gender")
     primary_category = kind_list[0]
 
@@ -1009,6 +1029,14 @@ def update_person(person_id: str, payload: dict, account):
 
         person.save()
         _apply_kinds(person, kind_list, old_kinds)
+        ext_updates = {
+            EDUCATION_EXT_KEY: _ext_text(payload.get("education")),
+            COACH_CATEGORY_EXT_KEY: _ext_text(payload.get("coachCategory")),
+        }
+        for key, value in ext_updates.items():
+            if value is not None:
+                track(key, old_ext.get(key), value)
+        save_profile_ext_values(person, ext_updates)
         if avatar:
             _bind_avatar(avatar, person)
         _log_change(
@@ -1032,6 +1060,81 @@ def _change_entry(field: str, old, new) -> Optional[dict]:
     return {"field": field, "old": old_out, "new": new_out}
 
 
+# ---- education / coachCategory 承载（扩展档案 ext_json 预留扩展列）----------
+# 冻结 DDL 无独立列；person_athlete_profile / person_coach_profile 的 ext_json
+# 列注释即"预留扩展"，按 person 已有档案行读写，不新增列、不动 DDL
+# （5.txt 问题一：前端提交后刷新不回显）。
+EDUCATION_EXT_KEY = "education"
+COACH_CATEGORY_EXT_KEY = "coachCategory"
+EXT_TEXT_KEYS: tuple[str, ...] = (EDUCATION_EXT_KEY, COACH_CATEGORY_EXT_KEY)
+
+
+def _ext_text(value) -> Optional[str]:
+    """扩展文本归一：None/空白 → None（未传=保留原值，与 /people 可选字段同口径）。"""
+    if value is None:
+        return None
+    return str(value).strip() or None
+
+
+def _profile_rows(person) -> list:
+    """person 已存在的扩展档案行（方案C：行存在性=类别事实源，各 0..1 行）。"""
+    return [
+        row
+        for row in (
+            AthleteProfile.objects.filter(person=person).first(),
+            CoachProfile.objects.filter(person=person).first(),
+        )
+        if row is not None
+    ]
+
+
+def read_profile_ext_values(person) -> dict:
+    """读 education/coachCategory（先运动员档案后教练档案，取首个非空）。"""
+    values: dict = {}
+    for row in _profile_rows(person):
+        data = row.ext_json if isinstance(row.ext_json, dict) else {}
+        for key in EXT_TEXT_KEYS:
+            if key not in values and data.get(key) not in (None, ""):
+                values[key] = data[key]
+    return values
+
+
+def save_profile_ext_values(person, updates: dict) -> None:
+    """把 education/coachCategory 落到扩展档案 ext_json。
+
+    - 只写请求明确给出的键（None=未传→保留原值，不清空）；
+    - 无对应档案行的键无处承载则跳过（不新建行：grade_level 为冻结 NOT NULL 占位列）；
+    - 一人两类别时两个档案行都写，保证任一档案链读回一致。
+    """
+    pending = {k: v for k, v in updates.items() if v is not None}
+    if not pending:
+        return
+    for row in _profile_rows(person):
+        data = dict(row.ext_json) if isinstance(row.ext_json, dict) else {}
+        if any(data.get(k) != v for k, v in pending.items()):
+            data.update(pending)
+            row.ext_json = data
+            row.save(update_fields=["ext_json", "updated_at"])
+
+
+def _ensure_own_school_name(person, submitted) -> None:
+    """本人档案 schoolName 为派生只读字段（=person.school.name）。
+
+    前端表单会原样回传 → 放行；试图改成别的值 → 422 明确业务错误。
+    修复"200 OK 但字段未保存"（5.txt 问题一）。
+    """
+    if submitted is None:
+        return
+    current = person.school.name if person.school_id else ""
+    if str(submitted).strip() == current:
+        return
+    raise ApiError(
+        BUSINESS_VALIDATION_FAILED,
+        "学校归属由档案所属学校派生，本人不可直接修改",
+        field_errors([("schoolName", "不可编辑：需变更学校归属请联系管理员调整档案所属学校")]),
+    )
+
+
 def update_own_person(person_id: str, payload: dict):
     """PUT /me/profile：本人档案更新（字段集=MyProfileUpdate，前端实际提交集）。
 
@@ -1039,7 +1142,10 @@ def update_own_person(person_id: str, payload: dict):
     - version 必填乐观锁（与 /people 写链同规则：缺失/非法=400 统一校验错误，不匹配=409）；
     - 身份字段边界：kinds/schoolOrgId/phone/idNumber/avatarFileId 不在本人可改集
       （身份与归属变更走管理员链路；手机号/身份证按页面声明走复核更正）；
-    - schoolName/education/coachCategory：接受不持久化（D2 在案），不虚构回显；
+    - schoolName：派生只读（=person.school.name）。原值回传放行；改成别值 → 422
+      业务错误（不再"200 OK 但字段未保存"，5.txt 问题一）；
+    - education/coachCategory：落扩展档案 ext_json（预留扩展列，不动 DDL），
+      未传=保留原值；读回见 person_out；
     - 留痕复用 _log_change；审计走 API 层 audit_state。
     """
     person = people_queryset().filter(pk=parse_path_id(person_id)).first()
@@ -1047,6 +1153,12 @@ def update_own_person(person_id: str, payload: dict):
         raise ApiError(NOT_FOUND)
     ensure_version(person, payload["version"])
     gender_value = _gender_in(payload.get("gender"), "gender")
+    _ensure_own_school_name(person, payload.get("schoolName"))
+    ext_updates = {
+        EDUCATION_EXT_KEY: _ext_text(payload.get("education")),
+        COACH_CATEGORY_EXT_KEY: _ext_text(payload.get("coachCategory")),
+    }
+    old_ext = read_profile_ext_values(person)
 
     changes: list[dict] = []
     with transaction.atomic():
@@ -1067,6 +1179,11 @@ def update_own_person(person_id: str, payload: dict):
         person.birth_date = payload.get("birthDate")
 
         person.save()
+        for key, value in ext_updates.items():
+            entry = _change_entry(key, old_ext.get(key), value if value is not None else old_ext.get(key))
+            if entry:
+                changes.append(entry)
+        save_profile_ext_values(person, ext_updates)
         _log_change(
             person,
             enums.ChangeType.UPDATE,

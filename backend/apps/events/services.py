@@ -1,4 +1,4 @@
-"""events 业务逻辑：赛事与赛事组别的查询、创建、更新、软删除。
+﻿"""events 业务逻辑：赛事与赛事组别的查询、创建、更新、软删除。
 
 规则集中在本层，视图只做权限校验与信封包装；写操作带乐观锁 version，
 删除为软删除，存在受保护历史关联时返回 409 STATE_CONFLICT，不级联破坏。
@@ -1104,6 +1104,66 @@ def public_list_events(filters: dict):
     if filters.get("eventCategory"):
         qs = qs.filter(event_category=filters["eventCategory"])
     return qs.order_by("-created_at", "id")
+
+def event_phase(event):
+    """赛季进度派生（教练端赛季进度卡片数据源）。
+
+    阶段与进度定义（对齐赛事状态机；events 域不含初审/终审审核流程）：
+      NOT_STARTED  - DRAFT：筹备中，进度 0
+      REGISTRATION - REGISTRATION_OPEN / REGISTRATION_CLOSED：报名阶段，
+                     progressPercent = 报名窗口已过时间占比（CLOSED 恒 100）
+      COMPETITION  - RUNNING：比赛阶段，
+                     progressPercent = 已结束场次 / 总场次（无比赛场次时 0）
+      FINISHED     - FINISHED：已结束，进度 100
+
+    返回 {currentPhase, phaseStartedAt, phaseEndsAt, progressPercent}。
+    """
+    from django.db.models import Count, Max, Min, Q
+    from django.utils import timezone
+
+    from .models import Match
+
+    now = timezone.now()
+
+    def _aware(dt):
+        if dt is not None and dt.tzinfo is None:
+            return timezone.make_aware(dt)
+        return dt
+
+    status = event.status
+    if status == "DRAFT":
+        return {"currentPhase": "NOT_STARTED", "phaseStartedAt": None,
+                "phaseEndsAt": None, "progressPercent": 0}
+
+    if status in ("REGISTRATION_OPEN", "REGISTRATION_CLOSED"):
+        start = _aware(event.registration_opens_at)
+        end = _aware(event.registration_closes_at)
+        if status == "REGISTRATION_CLOSED":
+            pct = 100
+        else:
+            total = max((end - start).total_seconds(), 1)
+            pct = int(max(0.0, min(100.0, (now - start).total_seconds() / total * 100)))
+        return {"currentPhase": "REGISTRATION", "phaseStartedAt": start,
+                "phaseEndsAt": end, "progressPercent": pct}
+
+    agg = Match.objects.filter(event_id=event.pk).aggregate(
+        first=Min("kickoff_at"), last=Max("kickoff_at"),
+        total=Count("id"), done=Count("id", filter=Q(status="FINISHED")),
+    )
+    first, last = _aware(agg["first"]), _aware(agg["last"])
+    if status == "RUNNING":
+        pct = int(agg["done"] / agg["total"] * 100) if agg["total"] else 0
+        return {"currentPhase": "COMPETITION", "phaseStartedAt": first,
+                "phaseEndsAt": last, "progressPercent": pct}
+
+    # FINISHED
+    if first is None:
+        first = _aware(event.registration_opens_at)
+    if last is None:
+        last = _aware(event.registration_closes_at)
+    return {"currentPhase": "FINISHED", "phaseStartedAt": first,
+            "phaseEndsAt": last, "progressPercent": 100}
+
 
 def public_list_matches(filters: dict):
     from .models import Match

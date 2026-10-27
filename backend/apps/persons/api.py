@@ -515,8 +515,8 @@ def people_delete(request, person_id: str, version: Optional[int] = Query(None, 
 # GET：自读对象=服务端账号 person_id 绑定档案，无客户端传入 id，无数据范围歧义。
 # PUT（2026-10-24 用户裁定）：version 必填乐观锁（缺失/非法=400 统一校验错误，
 # 不匹配=409 VERSION_CONFLICT）；字段集=MyProfileUpdate（前端实际提交集），
-# 身份/归属/联系方式/证件不在本人可改集；schoolName/education/coachCategory
-# 接受不持久化（D2 在案，遗留问题清单在档）。
+# 身份/归属/联系方式/证件不在本人可改集；education/coachCategory 落扩展档案
+# ext_json 回显，schoolName 派生只读（改成别值→422）——5.txt 问题一已闭环。
 register_operation("myProfileGet", (ATHLETE, COACH))
 register_operation("myProfileUpdate", (ATHLETE, COACH))
 

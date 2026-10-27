@@ -37,6 +37,7 @@ _auth = JWTAuth()
 
 # 管理端写操作：ADMIN / PROVINCE_REVIEWER
 register_operation("eventCreate", (ADMIN, PROVINCE_REVIEWER))
+register_operation("eventGet", ALL_ROLES)
 register_operation("eventUpdate", (ADMIN, PROVINCE_REVIEWER))
 register_operation("eventDelete", (ADMIN, PROVINCE_REVIEWER))
 # 只读查询：比赛页/报名页筛选依赖，学校端、市州、球队都需读取
@@ -49,7 +50,6 @@ _REFERENCE_READ_ROLES = (
     TEAM,
 )
 register_operation("eventList", _REFERENCE_READ_ROLES)
-register_operation("eventGet", _REFERENCE_READ_ROLES)
 # 报名可见：全角色
 register_operation("availableEvents", ALL_ROLES)
 # 组别只读：同赛事读取范围
