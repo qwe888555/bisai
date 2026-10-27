@@ -15,6 +15,26 @@ from django.core.management.base import BaseCommand
 
 from apps.accounts.models import Account, DictionaryItem, Organization
 from apps.common.ids import new_dictionary_id
+from apps.persons.models import Region, School
+from apps.teams.models import Team
+
+REGIONS: tuple[tuple[str, str, int, str], ...] = (
+    ("510000", "示例省", 1, ""),
+    ("510100", "示例市州", 2, "510000"),
+    ("510101", "示例市州县", 3, "510100"),
+    ("510200", "示例市州二", 2, "510000"),
+    ("510201", "示例市州二县", 3, "510200"),
+)
+
+SCHOOLS: tuple[tuple[str, str, str, str], ...] = (
+    ("SCH001", "示例第一中学", "SENIOR", "510101"),
+    ("SCH002", "示例第二中学", "SENIOR", "510201"),
+)
+
+TEAMS: tuple[tuple[str, str, str, str, str], ...] = (
+    ("TEAM001", "示例第一中学男子队", "U15_MALE", "SCH001", "510101"),
+    ("TEAM002", "示例第二中学女子队", "U15_FEMALE", "SCH002", "510201"),
+)
 
 ORGANIZATIONS: tuple[tuple[str, str, str, str, str], ...] = (
     ("org_prov", "", "省教育厅", "PROVINCE", "PROV"),
@@ -85,6 +105,42 @@ class Command(BaseCommand):
                 },
             )
         self.stdout.write(f"组织：{len(ORGANIZATIONS)} 个")
+
+        region_by_code: dict[str, Region] = {}
+        for code, name, level, _parent_code in REGIONS:
+            region_by_code[code], _ = Region.objects.update_or_create(
+                code=code, defaults={"name": name, "level": level}
+            )
+        for code, _name, _level, parent_code in REGIONS:
+            if parent_code:
+                Region.objects.filter(code=code).update(
+                    parent=region_by_code[parent_code]
+                )
+        self.stdout.write(f"行政区划：{len(REGIONS)} 个")
+
+        school_by_code: dict[str, School] = {}
+        for code, name, school_type, region_code in SCHOOLS:
+            school_by_code[code], _ = School.objects.update_or_create(
+                code=code,
+                defaults={
+                    "name": name,
+                    "school_type": school_type,
+                    "region": region_by_code[region_code],
+                },
+            )
+        self.stdout.write(f"学校：{len(SCHOOLS)} 所")
+
+        for team_no, name, category_code, school_code, region_code in TEAMS:
+            Team.objects.update_or_create(
+                team_no=team_no,
+                defaults={
+                    "name": name,
+                    "category_code": category_code,
+                    "school": school_by_code[school_code],
+                    "region": region_by_code[region_code],
+                },
+            )
+        self.stdout.write(f"球队：{len(TEAMS)} 支（team_no 与 TEAM 组织 code 对齐）")
 
         for account_id, username, display_name, roles, org_id in ACCOUNTS:
             defaults = {

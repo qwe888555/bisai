@@ -606,8 +606,10 @@ def my_profile_confirm(request, body: s.ProfileConfirmation):
 #   personId → 空数组（个人中心空态，不拒绝）。
 # - UNIVERSITY：本校组织子树内球队（services.list_university_teams，复用
 #   teams.services.visible_teams），响应字段与本人视图完全一致。
+# - TEAM：只返回组织节点 code 匹配 team_no 的本队（services.list_team_account_teams）；
+#   绑定缺失/数据未对齐返回空数组，保证球队工作台可正常进入。
 # 读接口不留审计（同前两个 GET）。
-register_operation("myTeams", (ATHLETE, COACH, UNIVERSITY))
+register_operation("myTeams", (ATHLETE, COACH, UNIVERSITY, TEAM))
 
 
 @router.get("/me/teams", auth=_auth, response=EnvelopeOut, summary="本人所属球队")
@@ -619,6 +621,8 @@ def my_teams(request):
             return ok([])
         # dict 直出（EnvelopeOut.data=Any），字段口径见 services._team_brief_out
         return ok(services.list_own_teams(person_id))
+    if TEAM in set(account.roles or ()):
+        return ok(services.list_team_account_teams(account))
     return ok(services.list_university_teams(account))
 
 

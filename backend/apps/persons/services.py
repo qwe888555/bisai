@@ -1171,6 +1171,22 @@ def list_university_teams(account) -> list[dict]:
     return _team_brief_rows(visible_teams(account))
 
 
+def list_team_account_teams(account) -> list[dict]:
+    """GET /me/teams（TEAM）：球队端只看自己绑定的那支队。
+
+    按 A′-min 约定，TEAM 账号组织节点 code == Team.team_no；不做组织子树，
+    避免球队端看到同校其他队伍。绑定缺失或数据未对齐时返回空列表，
+    让球队工作台能正常进入而不是 403。
+    """
+    from apps.common.scopes import account_org_code
+    from apps.teams.models import Team
+
+    team_no = account_org_code(account)
+    if not team_no:
+        return []
+    return _team_brief_rows(Team.objects.filter(team_no=team_no, is_deleted=False))
+
+
 def _team_brief_rows(queryset: QuerySet) -> list[dict]:
     """球队行 → /me/teams 输出（memberCount 与现役主教练姓名一次取齐）。"""
     head_coach_subq = TeamCoach.objects.filter(

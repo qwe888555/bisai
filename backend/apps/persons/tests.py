@@ -2771,6 +2771,37 @@ class PersonDataScopeTests(TestCase):
         self.assertEqual(out_of_scope.status_code, 404)
         self.assertEqual(out_of_scope.json()["code"], "NOT_FOUND")
 
+    def test_my_teams_team_role_returns_bound_team(self):
+        """TEAM：/me/teams 只返回组织 code 与 team_no 对齐的本队（不再 403）。"""
+        resp = self._get("/api/v1/me/teams", token=self.team_token)
+        self.assertEqual(resp.status_code, 200, resp.content)
+        teams = resp.json()["data"]
+        self.assertEqual([t["id"] for t in teams], [str(self.team_a.pk)])
+        self.assertEqual(teams[0]["name"], "丁甲一队")
+
+    def test_my_teams_team_role_unaligned_org_returns_empty(self):
+        """TEAM：组织 code 与任何 team_no 不匹配 → 空数组 200（工作台可进入）。"""
+        org = Organization.objects.create(
+            id=new_organization_id(),
+            name="未对齐球队组织",
+            org_type="TEAM",
+            code="TEAM-NOT-ALIGNED",
+            parent=self.org_school_a,
+        )
+        account = Account.objects.create(
+            id=new_account_id(),
+            username="scope-ds-team-unaligned",
+            display_name="scope-ds-team-unaligned",
+            roles=["TEAM"],
+            organization=org,
+            password=make_password("scope-pass-123"),
+            enabled=True,
+        )
+        token = issue_access_token(account)[0]
+        resp = self._get("/api/v1/me/teams", token=token)
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertEqual(resp.json()["data"], [])
+
     def test_athlete_scope_returns_only_self(self):
         """ATHLETE：只返回账号绑定本人；未绑定 → 空集（不 403）。"""
         from apps.persons.services import apply_person_scope, people_queryset
