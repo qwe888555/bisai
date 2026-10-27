@@ -19,8 +19,11 @@ from apps.common.pagination import paginate
 from apps.common.permissions import (
     ADMIN,
     ALL_ROLES,
+    CITY,
     MATCH_RECORDER,
     PROVINCE_REVIEWER,
+    TEAM,
+    UNIVERSITY,
     register_operation,
     require,
 )
@@ -32,18 +35,28 @@ from . import services
 router = Router(tags=["events"])
 _auth = JWTAuth()
 
-# 管理端：ADMIN / PROVINCE_REVIEWER
-register_operation("eventList", (ADMIN, PROVINCE_REVIEWER))
+# 管理端写操作：ADMIN / PROVINCE_REVIEWER
 register_operation("eventCreate", (ADMIN, PROVINCE_REVIEWER))
-register_operation("eventGet", (ADMIN, PROVINCE_REVIEWER))
 register_operation("eventUpdate", (ADMIN, PROVINCE_REVIEWER))
 register_operation("eventDelete", (ADMIN, PROVINCE_REVIEWER))
+# 只读查询：比赛页/报名页筛选依赖，学校端、市州、球队都需读取
+_REFERENCE_READ_ROLES = (
+    ADMIN,
+    PROVINCE_REVIEWER,
+    MATCH_RECORDER,
+    CITY,
+    UNIVERSITY,
+    TEAM,
+)
+register_operation("eventList", _REFERENCE_READ_ROLES)
+register_operation("eventGet", _REFERENCE_READ_ROLES)
 # 报名可见：全角色
 register_operation("availableEvents", ALL_ROLES)
-# 组别管理端
-register_operation("eventGroupList", (ADMIN, PROVINCE_REVIEWER))
+# 组别只读：同赛事读取范围
+register_operation("eventGroupList", _REFERENCE_READ_ROLES)
+register_operation("eventGroupGet", _REFERENCE_READ_ROLES)
+# 组别管理端写操作
 register_operation("eventGroupCreate", (ADMIN, PROVINCE_REVIEWER))
-register_operation("eventGroupGet", (ADMIN, PROVINCE_REVIEWER))
 register_operation("eventGroupUpdate", (ADMIN, PROVINCE_REVIEWER))
 register_operation("eventGroupDelete", (ADMIN, PROVINCE_REVIEWER))
 # 报名可选组别：全角色
@@ -239,9 +252,11 @@ def available_groups(request, event_id: str):
 # ---------------------------------------------------------------- 比赛对阵管理（5.1）
 
 _MATCH_ROLES = (MATCH_RECORDER, ADMIN, PROVINCE_REVIEWER)
-register_operation("matchList", _MATCH_ROLES)
+# 对阵只读：比赛页需要学校端、市州、球队也能查看，写操作仍限制在 _MATCH_ROLES
+_MATCH_READ_ROLES = _MATCH_ROLES + (CITY, UNIVERSITY, TEAM)
+register_operation("matchList", _MATCH_READ_ROLES)
+register_operation("matchGet", _MATCH_READ_ROLES)
 register_operation("matchCreate", _MATCH_ROLES)
-register_operation("matchGet", _MATCH_ROLES)
 register_operation("matchUpdate", _MATCH_ROLES)
 register_operation("matchDelete", _MATCH_ROLES)
 register_operation("matchPublish", _MATCH_ROLES)
