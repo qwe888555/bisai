@@ -1,4 +1,4 @@
-"""events 接口：赛事配置（/events）与报名可见（/available-events）。
+﻿"""events 接口：赛事配置（/events）与报名可见（/available-events）。
 
 受保护接口用 register_operation + require 完成角色与权限点校验；
 公开报名可见接口对全角色开放；响应统一走信封，分页 data 为 {items,page,pageSize,total}。
@@ -35,7 +35,7 @@ _auth = JWTAuth()
 # 管理端：ADMIN / PROVINCE_REVIEWER
 register_operation("eventList", (ADMIN, PROVINCE_REVIEWER))
 register_operation("eventCreate", (ADMIN, PROVINCE_REVIEWER))
-register_operation("eventGet", (ADMIN, PROVINCE_REVIEWER))
+register_operation("eventGet", ALL_ROLES)
 register_operation("eventUpdate", (ADMIN, PROVINCE_REVIEWER))
 register_operation("eventDelete", (ADMIN, PROVINCE_REVIEWER))
 # 报名可见：全角色
