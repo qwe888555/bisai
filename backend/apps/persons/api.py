@@ -395,13 +395,13 @@ def dict_item_disable(request, dict_item_id: str):
 
 
 # ---------------------------------------------------------------- 人员主档（/people）
-# 契约对齐 zuqiu 前端 personApi（src/api/index.ts L118-125）；写链（create/update/
-# remove）依赖 B1/B4 等待确认项，未实施。
+# 契约对齐 zuqiu 前端 personApi（src/api/index.ts L118-125）；读链与写链
+# 均按契约角色登记，数据范围由服务层统一裁决。
 
 # 前端实际调用方角色：PeopleManageView(ADMIN) / EnrollmentDetailView(UNIVERSITY) /
 # TeamCoachesView、TeamMembersView(TEAM)；CITY / PROVINCE_REVIEWER 按文档审核
-# 场景预留。ATHLETE/COACH/MATCH_RECORDER 前端无调用且范围规则未定义，不登记。
-# 非管理员的数据范围过滤集中在 services.apply_person_scope（方案A′ 待确认）。
+# 场景预留。ATHLETE/COACH 的自服务走 /me/profile，不登记本组接口。
+# 数据范围过滤集中在 services.apply_person_scope（按角色/组织子树收敛）。
 _PERSON_QUERY_ROLES = (ADMIN, UNIVERSITY, CITY, PROVINCE_REVIEWER, TEAM)
 
 register_operation("personList", _PERSON_QUERY_ROLES)
@@ -448,10 +448,13 @@ def people_get(request, person_id: str):
     return ok(s.person_out(services.get_person(person_id, account)))
 
 
-# 写操作仅 ADMIN（PeopleManageView 为管理端页面；学校端可否创建人员待确认④）
-register_operation("personCreate", (ADMIN,))
-register_operation("personUpdate", (ADMIN,))
-register_operation("personDelete", (ADMIN,))
+# 写操作权限点按契约文档登记（personCreate/personUpdate/personDelete：
+# TEAM/UNIVERSITY/CITY/PROVINCE_REVIEWER/ADMIN）；数据范围在服务层
+# （_get_person_for_write / _ensure_school_in_scope）二次校验，接口层放行
+# 不等于可写越界对象。
+register_operation("personCreate", (TEAM, UNIVERSITY, CITY, PROVINCE_REVIEWER, ADMIN))
+register_operation("personUpdate", (TEAM, UNIVERSITY, CITY, PROVINCE_REVIEWER, ADMIN))
+register_operation("personDelete", (TEAM, UNIVERSITY, CITY, PROVINCE_REVIEWER, ADMIN))
 
 
 @router.post("/people", auth=_auth, response=EnvelopeOut, summary="创建人员档案")
@@ -597,26 +600,31 @@ def my_profile_confirm(request, body: s.ProfileConfirmation):
 
 # GET /me/teams（契约清单 B4）：前端 meApi.teams() 无参数、Team[] 直出
 # （zuqiu src/api/index.ts:69；权威文档原写分页 TeamPage+active 参数，按前端
-# 实码实现数组）。范围=本人 CURRENT 球员/教练正式关系（EXITED 历史与 mock
-# "自报归属 VERIFIED 合并"均不采用，见 services.list_own_teams）；
-# UNIVERSITY 全校分支依赖 D1 组织映射（A′ 未批）暂缓，权限点仅 ATHLETE/COACH。
-# 未绑定档案 → 404（对齐 myProfileGet 口径）；读接口不留审计（同前两个 GET）。
-register_operation("myTeams", (ATHLETE, COACH))
+# 实码实现数组）。
+# - ATHLETE/COACH：本人 CURRENT 球员/教练正式关系（EXITED 历史与 mock
+#   "自报归属 VERIFIED 合并"均不采用，见 services.list_own_teams）；未绑定
+#   personId → 空数组（个人中心空态，不拒绝）。
+# - UNIVERSITY：本校组织子树内球队（services.list_university_teams，复用
+#   teams.services.visible_teams），响应字段与本人视图完全一致。
+# 读接口不留审计（同前两个 GET）。
+register_operation("myTeams", (ATHLETE, COACH, UNIVERSITY))
 
 
 @router.get("/me/teams", auth=_auth, response=EnvelopeOut, summary="本人所属球队")
 def my_teams(request):
     account = require("myTeams")
-    person_id = _own_person_id(account)
-    if not person_id:
-        raise ApiError(NOT_FOUND, "当前账号未绑定人员档案")
-    # dict 直出（EnvelopeOut.data=Any），字段口径见 services._team_brief_out
-    return ok(services.list_own_teams(person_id))
+    if set(account.roles or ()) & {ATHLETE, COACH}:
+        person_id = _own_person_id(account)
+        if not person_id:
+            return ok([])
+        # dict 直出（EnvelopeOut.data=Any），字段口径见 services._team_brief_out
+        return ok(services.list_own_teams(person_id))
+    return ok(services.list_university_teams(account))
 
 
 # §6.8 档案聚合（批次 D-1）：文档角色 ADMIN/PROVINCE_REVIEWER（接口文档
-# L1740/L1762）；数据范围复用 apply_person_scope（非 ADMIN → 403
-# DATA_SCOPE_DENIED，D5 同口径，PROVINCE_REVIEWER 权限点通过但范围拒绝）。
+# L1740/L1762）；数据范围复用 apply_person_scope（按角色/组织子树收敛，
+# 无可见学校范围的账号 403 DATA_SCOPE_DENIED）。
 # 读接口不留审计（同 GET /people）；检索正文不入审计（同 POST /people/search）。
 register_operation("dossierSearch", (ADMIN, PROVINCE_REVIEWER))
 register_operation("dossierGet", (ADMIN, PROVINCE_REVIEWER))

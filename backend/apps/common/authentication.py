@@ -49,7 +49,7 @@ def issue_access_token(account) -> Tuple[str, int]:
     payload = {
         "sub": account.pk,
         "sid": uuid.uuid4().hex,
-        "iat": int(now.timestamp()),
+        "iat": now.timestamp(),
         "exp": int((now + timedelta(minutes=ttl)).timestamp()),
     }
     token = jwt.encode(payload, conf.JWT_SECRET, algorithm=conf.JWT_ALGORITHM)
@@ -80,8 +80,11 @@ def revoke_token(payload: dict) -> None:
 
 
 def revoke_account_tokens(account_id: str) -> None:
-    """改密/重置/停用：撤销该账号此前签发的全部令牌。"""
-    now_ts = int(datetime.now(dt_timezone.utc).timestamp())
+    """改密/重置/停用：撤销该账号此前签发的全部令牌。
+
+    revoked_at 精确到微秒，避免"登录与改密同一秒"时旧令牌仍被判有效。
+    """
+    now_ts = datetime.now(dt_timezone.utc).timestamp()
     ttl = max(int(conf.ACCESS_TOKEN_TTL_MINUTES), 1) * 60
     cache.set(
         _ACCOUNT_REVOKED_AT_KEY.format(account_id=account_id),
@@ -94,7 +97,7 @@ def _ensure_token_active(payload: dict) -> None:
     if cache.get(_REVOKED_TOKEN_KEY.format(sid=payload["sid"])):
         raise ApiError(TOKEN_REVOKED)
     revoked_at = cache.get(_ACCOUNT_REVOKED_AT_KEY.format(account_id=payload["sub"]))
-    if revoked_at and int(payload.get("iat", 0)) < int(revoked_at):
+    if revoked_at and float(payload.get("iat", 0)) < float(revoked_at):
         raise ApiError(TOKEN_REVOKED)
 
 

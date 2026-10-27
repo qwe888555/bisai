@@ -657,13 +657,15 @@ class PeopleApiTests(TestCase):
         cls.school = School.objects.create(
             name="甲一小", code="SCH-800100-101", school_type="PRIMARY", region=region
         )
-        # A′-min 映射夹具：org.code = School.code（schoolOrgId 按组织节点 ID）
+        # schoolOrgId 映射夹具：org.code = School.code（schoolOrgId 按组织节点 ID）
         cls.org_school = Organization.objects.create(
             id=new_organization_id(),
             name="甲一小组织",
             org_type="SCHOOL",
             code="SCH-800100-101",
         )
+        cls.uni.organization = cls.org_school
+        cls.uni.save(update_fields=["organization"])
         team = Team.objects.create(
             team_no="T202600000001",
             name="甲一队",
@@ -724,15 +726,23 @@ class PeopleApiTests(TestCase):
         self.assertEqual(resp.status_code, 401)
         self.assertEqual(resp.json()["code"], "UNAUTHENTICATED")
 
-    def test_non_admin_denied_by_data_scope(self):
-        # 学校端角色已登记权限点，但数据范围过滤（方案A′）未落地 → 明确拒绝不放行
+    def test_university_sees_only_own_school_people(self):
+        # UNIVERSITY 已按契约登记：范围=本校组织子树内的学校（org.code=School.code）
         resp = self._get(PEOPLE, token=self.uni_token)
-        self.assertEqual(resp.status_code, 403)
-        self.assertEqual(resp.json()["code"], "DATA_SCOPE_DENIED")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()["data"]
+        self.assertEqual(body["total"], 1)
+        self.assertEqual(body["items"][0]["realName"], "张小明")
 
-        resp = self._post(PEOPLE + "/search", {"keyword": "张"}, token=self.uni_token)
-        self.assertEqual(resp.status_code, 403)
-        self.assertEqual(resp.json()["code"], "DATA_SCOPE_DENIED")
+        # 检索同样按范围过滤：他校/无学校归属人员不命中
+        resp = self._post(PEOPLE + "/search", {"keyword": "李"}, token=self.uni_token)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["data"], [])
+
+        # 范围外详情 → 404（不泄露存在性）
+        resp = self._get(f"{PEOPLE}/{self.coach.pk}", token=self.uni_token)
+        self.assertEqual(resp.status_code, 404)
+        self.assertEqual(resp.json()["code"], "NOT_FOUND")
 
     # ------------------------------------------------------------ 列表
 
@@ -909,7 +919,7 @@ class PeopleWriteApiTests(TestCase):
         cls.school = School.objects.create(
             name="乙一小", code="SCH-810100-201", school_type="PRIMARY", region=region
         )
-        # A′-min 映射夹具：org.code = School.code（schoolOrgId 按组织节点 ID）
+        # schoolOrgId 映射夹具：org.code = School.code（schoolOrgId 按组织节点 ID）
         cls.org_school = Organization.objects.create(
             id=new_organization_id(),
             name="乙一小组织",
@@ -1085,13 +1095,14 @@ class PeopleWriteApiTests(TestCase):
         self.assertEqual(resp.status_code, 400)
         self.assertEqual(resp.json()["code"], "INVALID_ARGUMENT")
 
-    def test_create_forbidden_for_university(self):
+    def test_create_denied_for_university_without_school_scope(self):
+        """UNIVERSITY 已按契约登记写权限点；账号未绑定学校组织 → 无可见范围 403。"""
         resp = self._post(
             {"kinds": ["ATHLETE"], "realName": "越权", "idNumber": self.ID_CARD},
             token=self.uni_token,
         )
         self.assertEqual(resp.status_code, 403)
-        self.assertEqual(resp.json()["code"], "FORBIDDEN")
+        self.assertEqual(resp.json()["code"], "DATA_SCOPE_DENIED")
 
     # ------------------------------------------------------------ 更新（乐观锁）
 
@@ -1392,7 +1403,7 @@ class MyProfileApiTests(TestCase):
         cls.school = School.objects.create(
             name="甲一小", code="SCH-800100-301", school_type="PRIMARY", region=region
         )
-        # A′-min 映射夹具：org.code = School.code（schoolOrgId 输出按组织节点 ID）
+        # 映射夹具：org.code = School.code（schoolOrgId 输出按组织节点 ID）
         cls.org_school = Organization.objects.create(
             id=new_organization_id(),
             name="甲一小组织",
@@ -1475,6 +1486,7 @@ class MyProfileApiTests(TestCase):
             username="me-uni",
             display_name="学校端",
             roles=["UNIVERSITY"],
+            organization=cls.org_school,
             password=make_password("me-pass-123"),
             enabled=True,
         )
@@ -2090,16 +2102,29 @@ class MyProfileApiTests(TestCase):
         self.assertEqual(resp.status_code, 401)
         self.assertEqual(resp.json()["code"], "UNAUTHENTICATED")
 
-    def test_my_teams_unbound_account_returns_404(self):
+    def test_my_teams_unbound_account_returns_empty_list(self):
+        """未绑定 personId 的 ATHLETE/COACH → 空列表（个人中心空态，不拒绝）。"""
         resp = self.client.get(self.ME_TEAMS, **self._auth(self.unbound_token))
-        self.assertEqual(resp.status_code, 404)
-        self.assertEqual(resp.json()["code"], "NOT_FOUND")
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertEqual(resp.json()["data"], [])
 
-    def test_my_teams_university_role_forbidden(self):
-        """UNIVERSITY 全校分支依赖 D1 组织映射（A′ 未批），暂缓→未登记 403。"""
+    def test_my_teams_university_returns_own_school_teams(self):
+        """UNIVERSITY 返回本校组织子树内球队，响应字段与 ATHLETE 路径一致。"""
         resp = self.client.get(self.ME_TEAMS, **self._auth(self.uni_token))
-        self.assertEqual(resp.status_code, 403)
-        self.assertEqual(resp.json()["code"], "FORBIDDEN")
+        self.assertEqual(resp.status_code, 200, resp.content)
+        teams = resp.json()["data"]
+        # 本校两支队（软删队不在范围）；按 created_at,id 排序
+        self.assertEqual(
+            [t["id"] for t in teams],
+            [str(self.team_main.pk), str(self.team_exited.pk)],
+        )
+        self.assertEqual(teams[0]["schoolName"], "甲一小")
+        self.assertEqual(teams[0]["status"], "APPROVED")
+        # 字段集合必须与本人视图完全一致
+        athlete_teams = self.client.get(
+            self.ME_TEAMS, **self._auth(self.athlete_token)
+        ).json()["data"]
+        self.assertEqual(set(teams[0].keys()), set(athlete_teams[0].keys()))
 
     def test_my_teams_athlete_current_team_brief(self):
         from apps.persons.schemas import person_version
@@ -2163,8 +2188,8 @@ class DossierApiTests(TestCase):
     GET /selection-dossiers/{athleteId}。
 
     契约依据：接口文档 L1736-1773 + §7 CandidateDossier/DossierSearch（L4692-4718）。
-    - 角色 ADMIN/PROVINCE_REVIEWER（文档 L1740/L1762）；数据范围一期仅 ADMIN
-      （D5 同 persons apply_person_scope 口径 → PROVINCE_REVIEWER 403）；
+    - 角色 ADMIN/PROVINCE_REVIEWER（文档 L1740/L1762）；数据范围由
+      apply_person_scope 按角色/组织范围裁决（未绑定组织 → 无可见学校范围）；
     - 检索资格：文档 L4708 仅运动员档案（AthleteProfile 行存在）；
     - athlete 复用 person_out（脱敏同源）、teams 复用 list_own_teams 现役
       正式关系（EXITED 不并入）、materials 复用 material_list/material_out
@@ -2355,9 +2380,9 @@ class DossierApiTests(TestCase):
         self.assertEqual(resp.status_code, 403)
         self.assertEqual(resp.json()["code"], "FORBIDDEN")
 
-    def test_search_data_scope_denied_for_province_reviewer(self):
-        """PROVINCE_REVIEWER 权限点通过、数据范围一期仅 ADMIN（D5）→ 403
-        DATA_SCOPE_DENIED（复用 persons apply_person_scope 同口径）。"""
+    def test_search_data_scope_denied_without_org_scope(self):
+        """PROVINCE_REVIEWER 未绑定组织节点 → 无可见学校范围 → 403
+        DATA_SCOPE_DENIED（复用 apply_person_scope 同口径）。"""
         resp = self._post(self.SEARCH, {}, token=self.prov_token)
         self.assertEqual(resp.status_code, 403)
         self.assertEqual(resp.json()["code"], "DATA_SCOPE_DENIED")
@@ -2542,3 +2567,281 @@ class DossierApiTests(TestCase):
         )
         self.assertEqual(resp.status_code, 400)
         self.assertEqual(resp.json()["code"], "INVALID_ARGUMENT")
+
+
+class PersonDataScopeTests(TestCase):
+    """人员数据范围关键用例（2026-10-27）。
+
+    CITY 本市 / UNIVERSITY 本校 / TEAM 本队（含历史关系）/ ATHLETE 本人 /
+    PROVINCE_REVIEWER 省域；越界详情 404，列表按范围过滤，写链越界 403。
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        province = Region.objects.create(name="丁省", code="720000", level=1)
+        cls.city_a = Region.objects.create(
+            name="丁市甲", code="720100", level=2, parent=province
+        )
+        cls.city_b = Region.objects.create(
+            name="丁市乙", code="720200", level=2, parent=province
+        )
+        cls.school_a = School.objects.create(
+            name="丁甲一小", code="SCH-720100-001", school_type="PRIMARY", region=cls.city_a
+        )
+        cls.school_b = School.objects.create(
+            name="丁甲二小", code="SCH-720100-002", school_type="PRIMARY", region=cls.city_a
+        )
+        cls.school_c = School.objects.create(
+            name="丁乙一小", code="SCH-720200-001", school_type="PRIMARY", region=cls.city_b
+        )
+
+        cls.org_prov = Organization.objects.create(
+            id=new_organization_id(), name="丁省组织", org_type="PROVINCE", code="ORG-PROV-DS"
+        )
+        cls.org_city_a = Organization.objects.create(
+            id=new_organization_id(),
+            name="丁甲市组织",
+            org_type="CITY",
+            code="ORG-CITY-DS-A",
+            parent=cls.org_prov,
+        )
+        cls.org_city_b = Organization.objects.create(
+            id=new_organization_id(),
+            name="丁乙市组织",
+            org_type="CITY",
+            code="ORG-CITY-DS-B",
+            parent=cls.org_prov,
+        )
+        # org.code = School.code（人员数据范围按组织子树内学校 code 过滤）
+        cls.org_school_a = Organization.objects.create(
+            id=new_organization_id(),
+            name="丁甲一小组织",
+            org_type="SCHOOL",
+            code=cls.school_a.code,
+            parent=cls.org_city_a,
+        )
+        cls.org_school_b = Organization.objects.create(
+            id=new_organization_id(),
+            name="丁甲二小组织",
+            org_type="SCHOOL",
+            code=cls.school_b.code,
+            parent=cls.org_city_a,
+        )
+        cls.org_school_c = Organization.objects.create(
+            id=new_organization_id(),
+            name="丁乙一小组织",
+            org_type="SCHOOL",
+            code=cls.school_c.code,
+            parent=cls.org_city_b,
+        )
+
+        cls.team_a = Team.objects.create(
+            team_no="T202600000301",
+            name="丁甲一队",
+            category_code="PRIMARY",
+            school=cls.school_a,
+            region=cls.city_a,
+        )
+        cls.org_team_a = Organization.objects.create(
+            id=new_organization_id(),
+            name="丁甲一队组织",
+            org_type="TEAM",
+            code=cls.team_a.team_no,
+            parent=cls.org_school_a,
+        )
+
+        def _person(no, name, school, id_no, category=enums.PersonCategory.ATHLETE):
+            return Person.objects.create(
+                person_no=no,
+                full_name=name,
+                school=school,
+                id_card_cipher=encrypt_text(id_no),
+                id_card_hash=lookup_hash(id_no),
+                id_card_masked=mask_id_number(id_no),
+                person_category=category,
+                audit_status=enums.AuditStatus.APPROVED,
+            )
+
+        cls.p_a = _person("P202600000301", "丁甲一", cls.school_a, "110101201001010011")
+        cls.p_b = _person("P202600000302", "丁甲二", cls.school_b, "110101201002020022")
+        cls.p_c = _person("P202600000303", "丁乙一", cls.school_c, "110101201003030033")
+        cls.p_extra = _person(
+            "P202600000304",
+            "丁甲教",
+            cls.school_a,
+            "110101198001010044",
+            enums.PersonCategory.COACH,
+        )
+        # 本队关系：现役 + 历史（EXITED 同属本队可见范围）
+        TeamMember.objects.create(
+            team=cls.team_a, person=cls.p_a, joined_at=date(2026, 3, 1)
+        )
+        TeamMember.objects.create(
+            team=cls.team_a,
+            person=cls.p_b,
+            joined_at=date(2025, 3, 1),
+            status=enums.RelationStatus.EXITED,
+            left_at=timezone.now(),
+        )
+
+        def _account(username, roles, org=None, person_id=""):
+            return Account.objects.create(
+                id=new_account_id(),
+                username=username,
+                display_name=username,
+                roles=roles,
+                organization=org,
+                person_id=person_id,
+                password=make_password("scope-pass-123"),
+                enabled=True,
+            )
+
+        cls.city_user = _account("scope-ds-city-a", ["CITY"], cls.org_city_a)
+        cls.uni_user = _account("scope-ds-uni-a", ["UNIVERSITY"], cls.org_school_a)
+        cls.team_user = _account("scope-ds-team-a", ["TEAM"], cls.org_team_a)
+        cls.prov_user = _account("scope-ds-prov", ["PROVINCE_REVIEWER"], cls.org_prov)
+        cls.athlete_user = _account(
+            "scope-ds-athlete", ["ATHLETE"], person_id=str(cls.p_c.pk)
+        )
+        cls.athlete_unbound = _account("scope-ds-athlete-unbound", ["ATHLETE"])
+
+        cls.city_token = issue_access_token(cls.city_user)[0]
+        cls.uni_token = issue_access_token(cls.uni_user)[0]
+        cls.team_token = issue_access_token(cls.team_user)[0]
+        cls.prov_token = issue_access_token(cls.prov_user)[0]
+        cls.athlete_token = issue_access_token(cls.athlete_user)[0]
+
+    # ------------------------------------------------------------ 请求工具
+
+    @staticmethod
+    def _auth(token):
+        return {"HTTP_AUTHORIZATION": f"Bearer {token}"} if token else {}
+
+    def _get(self, path, token=None, query=None):
+        return self.client.get(path, data=query or {}, **self._auth(token))
+
+    def _post(self, path, payload, token=None):
+        return self.client.post(
+            path,
+            data=json.dumps(payload),
+            content_type="application/json",
+            **self._auth(token),
+        )
+
+    def _put(self, path, payload, token=None):
+        return self.client.put(
+            path,
+            data=json.dumps(payload),
+            content_type="application/json",
+            **self._auth(token),
+        )
+
+    def _names(self, token) -> set:
+        resp = self._get(PEOPLE, token=token)
+        self.assertEqual(resp.status_code, 200, resp.content)
+        return {item["realName"] for item in resp.json()["data"]["items"]}
+
+    # ------------------------------------------------------------ 各角色范围
+
+    def test_city_sees_only_schools_in_its_city(self):
+        """CITY：本市两所学校下人员可见，外市人员过滤且详情 404。"""
+        self.assertEqual(self._names(self.city_token), {"丁甲一", "丁甲二", "丁甲教"})
+        out_of_scope = self._get(f"{PEOPLE}/{self.p_c.pk}", token=self.city_token)
+        self.assertEqual(out_of_scope.status_code, 404)
+        self.assertEqual(out_of_scope.json()["code"], "NOT_FOUND")
+        # 检索同样收敛到本市范围
+        resp = self._post(PEOPLE + "/search", {"keyword": "丁"}, token=self.city_token)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(
+            {item["realName"] for item in resp.json()["data"]},
+            {"丁甲一", "丁甲二", "丁甲教"},
+        )
+
+    def test_university_sees_only_own_school(self):
+        """UNIVERSITY：仅本校人员；同市他校人员过滤且详情 404。"""
+        self.assertEqual(self._names(self.uni_token), {"丁甲一", "丁甲教"})
+        out_of_scope = self._get(f"{PEOPLE}/{self.p_b.pk}", token=self.uni_token)
+        self.assertEqual(out_of_scope.status_code, 404)
+        self.assertEqual(out_of_scope.json()["code"], "NOT_FOUND")
+
+    def test_team_sees_only_own_team_members_including_history(self):
+        """TEAM：仅本队成员关系（CURRENT 与 EXITED 均为历史可见）。"""
+        self.assertEqual(self._names(self.team_token), {"丁甲一", "丁甲二"})
+        out_of_scope = self._get(f"{PEOPLE}/{self.p_extra.pk}", token=self.team_token)
+        self.assertEqual(out_of_scope.status_code, 404)
+        self.assertEqual(out_of_scope.json()["code"], "NOT_FOUND")
+
+    def test_athlete_scope_returns_only_self(self):
+        """ATHLETE：只返回账号绑定本人；未绑定 → 空集（不 403）。"""
+        from apps.persons.services import apply_person_scope, people_queryset
+
+        scoped = apply_person_scope(people_queryset(), self.athlete_user)
+        self.assertEqual(list(scoped.values_list("pk", flat=True)), [self.p_c.pk])
+
+        unbound = apply_person_scope(people_queryset(), self.athlete_unbound)
+        self.assertEqual(unbound.count(), 0)
+
+    def test_province_reviewer_sees_whole_province(self):
+        """PROVINCE_REVIEWER：省域组织子树内全部学校人员可见。"""
+        self.assertEqual(
+            self._names(self.prov_token),
+            {"丁甲一", "丁甲二", "丁乙一", "丁甲教"},
+        )
+        resp = self._get(f"{PEOPLE}/{self.p_c.pk}", token=self.prov_token)
+        self.assertEqual(resp.status_code, 200, resp.content)
+
+    # ------------------------------------------------------------ 写链范围
+
+    def test_university_create_person_school_scope(self):
+        """UNIVERSITY 创建人员：提交学校须在本校范围内，越界 403。"""
+        in_scope = self._post(
+            PEOPLE,
+            {
+                "kinds": ["ATHLETE"],
+                "realName": "本校新生",
+                "idNumber": "110101201501010055",
+                "schoolOrgId": str(self.org_school_a.pk),
+            },
+            token=self.uni_token,
+        )
+        self.assertEqual(in_scope.status_code, 200, in_scope.content)
+
+        out_of_scope = self._post(
+            PEOPLE,
+            {
+                "kinds": ["ATHLETE"],
+                "realName": "他校新生",
+                "idNumber": "110101201502020066",
+                "schoolOrgId": str(self.org_school_b.pk),
+            },
+            token=self.uni_token,
+        )
+        self.assertEqual(out_of_scope.status_code, 403)
+        self.assertEqual(out_of_scope.json()["code"], "DATA_SCOPE_DENIED")
+
+    def test_update_and_delete_denied_out_of_scope(self):
+        """写链目标人员越界 → 403（服务层校验，非接口层放行）。"""
+        from apps.persons.schemas import person_version
+
+        resp = self._put(
+            f"{PEOPLE}/{self.p_c.pk}",
+            {
+                "kinds": ["ATHLETE"],
+                "realName": "越权改名",
+                "version": person_version(self.p_c),
+            },
+            token=self.city_token,
+        )
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json()["code"], "DATA_SCOPE_DENIED")
+        self.p_c.refresh_from_db()
+        self.assertEqual(self.p_c.full_name, "丁乙一")
+
+        resp = self.client.delete(
+            f"{PEOPLE}/{self.p_extra.pk}?version={person_version(self.p_extra)}",
+            **self._auth(self.team_token),
+        )
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json()["code"], "DATA_SCOPE_DENIED")
+        self.p_extra.refresh_from_db()
+        self.assertFalse(self.p_extra.is_deleted)

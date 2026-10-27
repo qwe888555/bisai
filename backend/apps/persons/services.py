@@ -34,6 +34,8 @@ from apps.common.errors import (
     ApiError,
     field_errors,
 )
+from apps.common.permissions import ATHLETE, COACH, TEAM
+from apps.common.scopes import account_org_code, is_global_admin, visible_school_codes
 from apps.accounts.models import Organization
 from apps.persons.models import (
     AthleteProfile,
@@ -429,7 +431,7 @@ def people_queryset() -> QuerySet:
                 AthleteProfile.objects.filter(person=OuterRef("pk"))
             ),
             coach_profile_exists=Exists(CoachProfile.objects.filter(person=OuterRef("pk"))),
-            # schoolOrgId 输出（A′-min）：School.code → 组织节点主键（免 N+1；
+            # schoolOrgId 输出：School.code → 组织节点主键（免 N+1；
             # Organization.code 唯一，至多一命中）
             school_org_id_val=Subquery(
                 Organization.objects.filter(code=OuterRef("school__code")).values("pk")[:1]
@@ -439,54 +441,107 @@ def people_queryset() -> QuerySet:
 
 
 def apply_person_scope(queryset: QuerySet, account) -> QuerySet:
-    """人员数据范围过滤（集中一处；方案A′ 落地后仅改本函数）。
+    """人员数据范围过滤（集中一处，读接口统一复用）。
 
-    前端 mock 的目标口径（src/mock/adapter.ts scopePersons）：ADMIN 全量 /
-    CITY 本市 / UNIVERSITY 本校 / TEAM 本队成员 / 其余仅本人。其中"本市/本校/
-    本队/本人"均依赖 org→school→team 映射（方案A′，待确认）与
-    Account.person_id / team_ids 的落库约定（未定）——除 ADMIN 外一律拒绝，
-    不得在映射未定时放行全量造成越权（安全约束不被前端调用覆盖）。
+    - 无组织的全局管理员：不过滤；
+    - roles 含 TEAM：仅本队（Organization.code=team_no 且未软删的 Team）成员
+      关系内人员，CURRENT/EXITED 均视为历史可见；队伍或组织 code 缺失 → 403；
+    - roles 含 ATHLETE/COACH：仅账号绑定的本人；未绑定 → 空集（个人中心空态，
+      不拒绝）；
+    - 其余（UNIVERSITY/CITY/PROVINCE_REVIEWER/挂组织的 ADMIN）：按组织子树
+      内学校类组织 code 过滤 school（org.code=School.code）；可见学校集合为空
+      → 403 DATA_SCOPE_DENIED，不静默放行全量。
     """
-    from apps.common.permissions import ADMIN
-
-    if ADMIN in (getattr(account, "roles", ()) or ()):
+    roles = set(getattr(account, "roles", ()) or ())
+    if is_global_admin(account):
         return queryset
-    raise ApiError(
-        DATA_SCOPE_DENIED,
-        "人员数据范围待组织映射方案确认后开放，当前仅管理员可查询",
-    )
+    if TEAM in roles:
+        code = account_org_code(account)
+        team = (
+            Team.objects.filter(team_no=code, is_deleted=False).first() if code else None
+        )
+        if team is None:
+            raise ApiError(
+                DATA_SCOPE_DENIED, "球队账号未绑定有效球队组织，无法确定人员数据范围"
+            )
+        person_ids = TeamMember.objects.filter(team=team).values("person_id")
+        return queryset.filter(pk__in=person_ids)
+    if roles & {ATHLETE, COACH}:
+        raw = str(getattr(account, "person_id", "") or "").strip()
+        try:
+            person_pk = int(raw) if raw else 0
+        except ValueError:
+            person_pk = 0
+        if person_pk <= 0:
+            return queryset.none()
+        return queryset.filter(pk=person_pk)
+    codes = visible_school_codes(account)
+    if not codes:
+        raise ApiError(DATA_SCOPE_DENIED, "当前账号无可访问的学校数据范围")
+    return queryset.filter(school__code__in=codes)
 
 
 def verify_person_owner(account, owner_id) -> None:
     """PERSON 附件归属校验器（经 PersonsConfig.ready() 注册进 attachments）。
 
-    PERSON 归属文件的上传与读取均由本校验器裁决业务资源所有权
-    （attachments._check_owner / can_access 调用），规则复用既有已确认口径：
+    归属裁决与 apply_person_scope 同口径：
     - 归属记录不存在（人员不存在或已软删）→ 404，默认拒绝；
-    - ADMIN → 放行（A′ 一期数据范围仅 ADMIN 全量，同 apply_person_scope）；
-    - 账号绑定本人档案（account.person_id 服务端签发，与 /me/profile 同源）
-      → 放行（本人材料上传/查看，对应 materialList/Create 含 ATHLETE/COACH
-      的自服务场景）；
-    - 其余一律 DATA_SCOPE_DENIED——本市/本校/本队范围依赖 A′ 映射，未交付
-      前不得放行，不发明组织层级授权。
+    - 全局管理员 / 组织学校范围内 / TEAM 本队成员 / 账号绑定本人 → 放行；
+    - 其余（含无可见学校范围、TEAM 未绑定球队、非本人）→ 403 DATA_SCOPE_DENIED。
     """
-    from apps.common.permissions import ADMIN
-
     raw = str(owner_id or "").strip()
     if not raw:
         raise ApiError(DATA_SCOPE_DENIED, "文件归属对象未确定，暂无法校验归属")
-    if not Person.objects.filter(
+    person = Person.objects.filter(
         pk=parse_path_id(raw, "ownerId"), is_deleted=False
-    ).exists():
+    ).first()
+    if person is None:
         raise ApiError(NOT_FOUND, "归属人员不存在或已删除")
-    if ADMIN in (getattr(account, "roles", ()) or ()):
+    if not apply_person_scope(Person.objects.filter(pk=person.pk), account).exists():
+        raise ApiError(DATA_SCOPE_DENIED, "人员不在当前账号数据范围内")
+
+
+def _ensure_school_in_scope(account, school) -> None:
+    """写链：提交的所属学校必须在账号人员数据范围内（与 apply_person_scope 同口径）。
+
+    - 全局管理员放行；
+    - TEAM 账号仅允许本队所属学校；
+    - 其余按组织子树内学校 code 判定；无可见学校范围 → 403。
+    """
+    if is_global_admin(account):
         return
-    if str(getattr(account, "person_id", "") or "") == raw:
+    roles = set(getattr(account, "roles", ()) or ())
+    if TEAM in roles:
+        code = account_org_code(account)
+        team = (
+            Team.objects.filter(team_no=code, is_deleted=False).first() if code else None
+        )
+        if team is None:
+            raise ApiError(
+                DATA_SCOPE_DENIED, "球队账号未绑定有效球队组织，无法确定人员数据范围"
+            )
+        if school is None or team.school_id != school.pk:
+            raise ApiError(DATA_SCOPE_DENIED, "提交的所属学校不在本队范围内")
         return
-    raise ApiError(
-        DATA_SCOPE_DENIED,
-        "人员数据范围待组织映射方案确认后开放，当前仅管理员与本人可访问",
-    )
+    codes = visible_school_codes(account)
+    if not codes:
+        raise ApiError(DATA_SCOPE_DENIED, "当前账号无可访问的学校数据范围")
+    if school is None or school.code not in codes:
+        raise ApiError(DATA_SCOPE_DENIED, "提交的所属学校不在当前账号数据范围内")
+
+
+def _get_person_for_write(person_id: str, account) -> Person:
+    """写链对象解析：不存在/软删 → 404；存在但不在范围内 → 403。
+
+    与读详情（get_person）的 404 口径不同：写操作显式区分"不可见"与"不存在"，
+    拒绝越界写入且不通过接口层放行绕过服务层校验。
+    """
+    person = people_queryset().filter(pk=parse_path_id(person_id)).first()
+    if person is None:
+        raise ApiError(NOT_FOUND)
+    if not apply_person_scope(Person.objects.filter(pk=person.pk), account).exists():
+        raise ApiError(DATA_SCOPE_DENIED, "人员不在当前账号数据范围内")
+    return person
 
 
 def _check_enum(value: Optional[str], allowed: tuple, field: str) -> None:
@@ -711,7 +766,7 @@ def _apply_kinds(person, new_kinds: list[str], old_kinds: list[str]) -> None:
 
 
 def _resolve_school(school_org_id):
-    """schoolOrgId（Organization 节点 ID）→ School 主档（A′-min 契约）。
+    """schoolOrgId（Organization 节点 ID）→ School 主档（2026-10-25 契约确认）。
 
     2026-10-25 契约确认：按组织节点主键查询，不把该值当作 School.code 或
     Organization.code；节点必须存在、未删除未停用、类型属于学校类
@@ -845,6 +900,7 @@ def create_person(payload: dict, account):
     id_number = (payload.get("idNumber") or "").strip().upper() or None
     phone = (payload.get("phone") or "").strip() or None
     school = _resolve_school(payload.get("schoolOrgId"))
+    _ensure_school_in_scope(account, school)
     avatar = _resolve_avatar_file(payload.get("avatarFileId"))
     if not id_number:
         raise ApiError(
@@ -904,7 +960,7 @@ def update_person(person_id: str, payload: dict, account):
     idNumber 不接受（身份证变更走更正流程，一期不开放）；
     education/coachCategory 声明但不持久化（承载待定）。
     """
-    person = get_person(person_id, account)
+    person = _get_person_for_write(person_id, account)
     ensure_version(person, payload["version"])
     kind_list = _kind_list(payload.get("kinds"))
     old_kinds = _current_kinds(person)
@@ -939,6 +995,7 @@ def update_person(person_id: str, payload: dict, account):
         # 可选字段：请求未传 → 保留原值（编辑表单无对应输入，缺省清空=静默丢数据）
         school = _resolve_school(payload.get("schoolOrgId"))
         if school is not None:
+            _ensure_school_in_scope(account, school)
             track("school", person.school_id, school.pk)
             person.school = school
         avatar = _resolve_avatar_file(payload.get("avatarFileId"))
@@ -1072,7 +1129,7 @@ def confirm_own_person(person_id: str, version: int):
 
 
 def list_own_teams(person_id: str) -> list[dict]:
-    """GET /me/teams：本人现役（CURRENT）球员/教练关系的球队，数组直出。
+    """GET /me/teams（ATHLETE/COACH）：本人现役（CURRENT）球员/教练关系的球队。
 
     契约依据（前端实码优先，契约清单 B4）：
     - meApi.teams() 无任何请求参数、响应 Team[]（zuqiu src/api/index.ts:69）；
@@ -1080,8 +1137,6 @@ def list_own_teams(person_id: str) -> list[dict]:
     - 范围=正式关系 TeamMember/TeamCoach 且 status=CURRENT：mock 将"自报归属
       VERIFIED"并入（adapter.ts:340-343），冻结模型无申请表（B5），不采用；
       EXITED 历史关系属履历（/me/team-affiliations 域），不进本接口；
-    - UNIVERSITY 全校分支（mock adapter.ts:335-337 按 orgId 过滤全校球队）
-      依赖 org→school 映射（D1/方案A′ 未批），暂停实现，权限点仅 ATHLETE/COACH；
     - 字段适配（前端 Team 类型 types.ts:185-206 vs 冻结 Team 模型）：
       无承载且页面未消费的字段不输出（shortName/campusName/gender/orgId/
       cityOrgId）；flagUrl/emblemUrl/groupPhotoUrl 属受控下载契约（无公开
@@ -1102,14 +1157,29 @@ def list_own_teams(person_id: str) -> list[dict]:
     )
     if not team_ids:
         return []
+    return _team_brief_rows(Team.objects.filter(pk__in=team_ids, is_deleted=False))
+
+
+def list_university_teams(account) -> list[dict]:
+    """GET /me/teams（UNIVERSITY）：本校组织子树内球队，输出与本人视图同构。
+
+    复用 teams.services.visible_teams（公开入口）做范围过滤：全局管理员全量、
+    学校类组织 code 子树、无可见范围 → 403 DATA_SCOPE_DENIED。
+    """
+    from apps.teams.services import visible_teams
+
+    return _team_brief_rows(visible_teams(account))
+
+
+def _team_brief_rows(queryset: QuerySet) -> list[dict]:
+    """球队行 → /me/teams 输出（memberCount 与现役主教练姓名一次取齐）。"""
     head_coach_subq = TeamCoach.objects.filter(
         team=OuterRef("pk"),
         status=enums.RelationStatus.CURRENT,
         duty=enums.CoachDuty.HEAD_COACH,
     ).values("person__full_name")[:1]
     rows = (
-        Team.objects.filter(pk__in=team_ids, is_deleted=False)
-        .select_related("school", "region")
+        queryset.select_related("school", "region")
         .annotate(
             member_count=Count(
                 "teammember",
@@ -1141,7 +1211,7 @@ def _team_brief_out(team) -> dict:
 
 def delete_person(person_id: str, request_version, account) -> None:
     """DELETE /people/{id}：软删（版本校验 + 现役球队/教练关联保护）。"""
-    person = get_person(person_id, account)
+    person = _get_person_for_write(person_id, account)
     ensure_version(person, request_version)
     if TeamMember.objects.filter(person=person, status=enums.RelationStatus.CURRENT).exists():
         raise ApiError(
@@ -1184,8 +1254,8 @@ def _reject_undeployed_event_filters(payload: dict) -> None:
 def dossier_search_queryset(payload: dict, account) -> QuerySet:
     """POST /selection-dossiers/search 查询构建（§6.8 L1736-1756 + §7 DossierSearch）。
 
-    复用：people_queryset（软删排除+档案行注解）、apply_person_scope（一期仅
-    ADMIN，D5 口径）、list_people 的 -id 排序先例、create_person 的
+    复用：people_queryset（软删排除+档案行注解）、apply_person_scope（角色/
+    组织范围口径）、list_people 的 -id 排序先例、create_person 的
     lookup_hash 受控检索链路；teamId=现役 TeamMember 关系（CURRENT 口径同
     /me/teams）。检索资格：文档 L4708"仅运动员遴选档案受控检索，不允许借用
     教练员或其他人员过滤字段扩大数据范围"→ 强制 athlete_profile_exists=True。

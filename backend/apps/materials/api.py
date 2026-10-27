@@ -4,14 +4,15 @@
 - materialList  GET  /materials                    （page/pageSize/ownerType?/ownerId?）
 - materialCreate POST /materials                  （body 全字段，StrictSchema 多传 400）
 - materialReview POST /materials/{id}/review      （body {decision, reason?, version}）
-- materialRemove DELETE /materials/{id}?version=  （软删）
+- materialDelete DELETE /materials/{id}?version=  （软删）
 - materialGet  GET /materials/{id}                （批次 D-2 补齐：文档契约明确，
   多态双表解析与 review/remove 同口径）
 - materialUpdate PUT /materials/{id}               （批次 D-3 补齐：title→remark、
   文件替换留痕、乐观锁；归属/类型不可变 → 400，审计与更新同事务）
 
-审核权限（文档 materialReview：CITY/PROVINCE_REVIEWER/ADMIN）由权限点强制，
-数据范围一期仅 ADMIN（service._require_admin_scope，A′ 未交付同批次 A/B 口径）。
+审核权限（文档 materialReview：CITY/PROVINCE_REVIEWER/ADMIN）由权限点强制；
+数据范围按材料归属对象校验（列表按可见归属过滤、详情/写操作越界 403），
+复用 persons.apply_person_scope / teams.visible_teams 既有规则。
 写操作统一 audit_state()；version 乐观锁按 B4 updated_at 微秒派生。
 """
 
@@ -46,7 +47,7 @@ router = Router(tags=["materials"])
 _auth = JWTAuth()
 
 # 权限点登记：导入期完成，漏登记 require() 会直接报错。
-# 角色按文档原表登记（ATHLETE/COACH 为本人材料预留）；数据范围一期仅 ADMIN。
+# 角色按文档原表登记（与 docs/后端接口文档.md material* 各接口“角色：”行一致）。
 register_operation(
     "materialList", (ADMIN, UNIVERSITY, TEAM, PROVINCE_REVIEWER, ATHLETE, COACH, CITY)
 )
@@ -61,7 +62,7 @@ register_operation(
 )
 register_operation("materialReview", (ADMIN, PROVINCE_REVIEWER, CITY))
 register_operation(
-    "materialRemove", (ADMIN, UNIVERSITY, TEAM, PROVINCE_REVIEWER, ATHLETE, COACH, CITY)
+    "materialDelete", (ADMIN, UNIVERSITY, TEAM, PROVINCE_REVIEWER, ATHLETE, COACH, CITY)
 )
 
 
@@ -142,7 +143,7 @@ def material_review(request, material_id: str, body: s.MaterialReviewBody):
 
 @router.delete("/materials/{material_id}", auth=_auth, response=EnvelopeOut, summary="删除材料")
 def material_remove(request, material_id: str, version: Optional[int] = Query(None, ge=0)):
-    account = require("materialRemove")
+    account = require("materialDelete")
     if version is None:
         raise ApiError(
             INVALID_ARGUMENT,

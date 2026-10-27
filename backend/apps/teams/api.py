@@ -5,9 +5,11 @@
 remove（DELETE）暂不开放（关联检查依赖报名/比赛域，契约清单在案）；
 coaches 属批次 C，matches 属比赛域，不在本轮。
 
-- 权限：查询多角色可见（menus.ts L145-176），但数据范围一期仅 ADMIN 全量
-  （UNIVERSITY/TEAM 依赖 A′-min 映射，交付前 403 DATA_SCOPE_DENIED）；
-  创建/更新=(ADMIN, UNIVERSITY)，成员管理=(ADMIN, UNIVERSITY, TEAM)，
+- 权限：角色登记按 docs/后端接口文档.md 各接口“角色：”行执行（teamList/
+  teamGet/teamCreate/teamUpdate 与成员域 6 接口均为 ADMIN/UNIVERSITY/TEAM/
+  CITY/PROVINCE_REVIEWER）；数据范围由 services.visible_teams 判定：全局
+  管理员全量、TEAM 本队、UNIVERSITY/CITY/PROVINCE_REVIEWER/挂组织 ADMIN
+  按组织子树内的学校范围，越界 403 DATA_SCOPE_DENIED（详情 404）；
   学校解析经 A′-min 组织映射（ensure_business_org，2026-10-25 已移植交付）；
 - 写操作统一 audit_state()（team.create/team.update/team.member.*）；
 - audit_status 字段保留（Q2 审核流程不启用），创建即默认 APPROVED；
@@ -33,6 +35,7 @@ from apps.common.middleware import audit_state
 from apps.common.pagination import paginate
 from apps.common.permissions import (
     ADMIN,
+    CITY,
     PROVINCE_REVIEWER,
     TEAM,
     UNIVERSITY,
@@ -47,21 +50,22 @@ from . import services
 router = Router(tags=["teams"])
 _auth = JWTAuth()
 
-# 权限点登记：导入期完成，漏登记 require() 会直接报错
-register_operation("teamList", (ADMIN, UNIVERSITY, TEAM, PROVINCE_REVIEWER))
-register_operation("teamGet", (ADMIN, UNIVERSITY, TEAM, PROVINCE_REVIEWER))
-register_operation("teamCreate", (ADMIN, UNIVERSITY))
-register_operation("teamUpdate", (ADMIN, UNIVERSITY))
-# 成员域：读=管理端花名册（admin/TeamsView）+ 球队端名单页（menus L164-169）；
-# 写=名单页（TEAM/UNIVERSITY 菜单）+ ADMIN 兜底；数据范围仍一期仅 ADMIN。
-register_operation("memberList", (ADMIN, UNIVERSITY, TEAM, PROVINCE_REVIEWER))
-# memberGet（批次 D-2）：文档角色表含 CITY，与 memberList 登记口径对齐
-# （不含 CITY）；数据范围一期仅 ADMIN，该差异无实际访问影响（验收报告记录）。
-register_operation("memberGet", (ADMIN, UNIVERSITY, TEAM, PROVINCE_REVIEWER))
-register_operation("memberSearch", (ADMIN, UNIVERSITY, TEAM))
-register_operation("memberCreate", (ADMIN, UNIVERSITY, TEAM))
-register_operation("memberUpdate", (ADMIN, UNIVERSITY, TEAM))
-register_operation("memberDelete", (ADMIN, UNIVERSITY, TEAM))
+# 权限点登记：导入期完成，漏登记 require() 会直接报错。
+# 角色集逐条对齐契约文档（docs/后端接口文档.md 各接口“角色：”行）：
+# 10 个接口均为 TEAM / UNIVERSITY / CITY / PROVINCE_REVIEWER / ADMIN。
+_TEAM_ROLES = (ADMIN, UNIVERSITY, TEAM, CITY, PROVINCE_REVIEWER)
+register_operation("teamList", _TEAM_ROLES)
+register_operation("teamGet", _TEAM_ROLES)
+register_operation("teamCreate", _TEAM_ROLES)
+register_operation("teamUpdate", _TEAM_ROLES)
+# 成员域：读=管理端花名册 + 球队端名单页；写=名单页 + 省市管理端，
+# 数据范围统一由 services.visible_teams 判定。
+register_operation("memberList", _TEAM_ROLES)
+register_operation("memberGet", _TEAM_ROLES)
+register_operation("memberSearch", _TEAM_ROLES)
+register_operation("memberCreate", _TEAM_ROLES)
+register_operation("memberUpdate", _TEAM_ROLES)
+register_operation("memberDelete", _TEAM_ROLES)
 
 
 @router.get("/teams", auth=_auth, response=EnvelopeOut, summary="球队档案列表")
