@@ -24,6 +24,7 @@ from apps.common.pagination import paginate, paginate_list
 from apps.common.permissions import (
     ADMIN,
     CITY,
+    MATCH_RECORDER,
     PROVINCE_REVIEWER,
     TEAM,
     UNIVERSITY,
@@ -41,7 +42,10 @@ _auth = JWTAuth()
 
 # 角色元组：R5 全业务角色（只读/名单/材料维护）；R1 仅学校端（报名单写操作）；
 # R3 审核/统计（ADMIN 依口径可代审，但不代建代提）。
-R5 = (TEAM, UNIVERSITY, CITY, PROVINCE_REVIEWER, ADMIN)
+# MATCH_RECORDER 纳入 R5 仅为赛前身份核验读取名册/运动员（只读，不授予任何写权限）。
+# 报送主体口径（已确认 2026-10-27）：仅 UNIVERSITY 可报送；TEAM/CITY/PROVINCE_REVIEWER/ADMIN
+# 一律不可代报（含市州代报）。故 R1 仅含 UNIVERSITY，subject_type_allowed 亦只放行 UNIVERSITY。
+R5 = (TEAM, UNIVERSITY, CITY, PROVINCE_REVIEWER, ADMIN, MATCH_RECORDER)
 R1 = (UNIVERSITY,)
 R3 = (CITY, PROVINCE_REVIEWER, ADMIN)
 

@@ -1,0 +1,5 @@
+type_code,value,label,sort_order,is_active,ext_json
+position,GK,守门员,10,1,
+position,DF,后卫,20,1,
+position,MF,中场,30,1,
+position,FW,前锋,40,1,

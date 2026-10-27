@@ -206,11 +206,12 @@ def answer(question: str, event_id: Optional[str] = None, season: Optional[str] 
         }
 
     if not ranked:
+        # 零命中通常是与政策/报名无关的问题：明确边界，不给无关政策卡片
         return {
             "status": "NO_EVIDENCE",
-            "answer": "未在已发布的政策中找到相关依据，请查阅相关政策原文或咨询组织方。",
+            "answer": "本问答仅支持校园足球政策与报名相关问题，未找到相关依据。请改问政策条款或报名流程。",
             "citations": [],
-            "fallbackPolicies": fallback,
+            "fallbackPolicies": [],
             "aiGenerated": False,
             "requestId": get_request_id(),
         }

@@ -295,6 +295,45 @@ class ApiSmokeTests(TestCase):
         self.assertEqual(direct.status_code, 200)
         self.assertEqual(direct["Content-Type"], "image/jpeg")
 
+    # ---------------------------------------------------------------- 比赛页只读权限
+    def test_match_page_reads_open_to_school_city_team(self):
+        admin = self.login()
+        event = self.post(
+            "/events",
+            {
+                "name": "权限联调赛事",
+                "season": "2026",
+                "registrationOpensAt": "2026-01-01T00:00:00+08:00",
+                "registrationClosesAt": "2026-12-31T23:59:59+08:00",
+            },
+            admin,
+        )
+        self.assertEqual(event.status_code, 200, event.content)
+        event_id = body(event)["data"]["id"]
+
+        for username in ("city", "team", "university"):
+            token = self.login(username)
+            for path in ("/events", "/matches", f"/events/{event_id}/groups"):
+                response = self.get(path, token)
+                self.assertEqual(
+                    response.status_code,
+                    200,
+                    f"{username} 读取 {path} 被拒：{response.content}",
+                )
+            me = body(self.get("/me", token))["data"]
+            self.assertIn("api:matchList", me["permissions"])
+            self.assertIn("api:eventList", me["permissions"])
+
+    def test_match_and_event_writes_still_denied_for_school_city_team(self):
+        for username in ("city", "team", "university"):
+            token = self.login(username)
+            deleted = self.client.delete(
+                f"{BASE}/events/evt_demo?version=0",
+                HTTP_AUTHORIZATION=f"Bearer {token}",
+            )
+            self.assertEqual(deleted.status_code, 403, deleted.content)
+            self.assertEqual(body(deleted)["code"], "FORBIDDEN")
+
     # ---------------------------------------------------------------- 账号绑定约定
     def test_account_role_must_match_org_type(self):
         token = self.login()
@@ -608,6 +647,9 @@ class ApiSmokeTests(TestCase):
         self.assertTrue(hasattr(MySQLdb, "connect"))
 
     def test_policy_document_syncs_on_publish_and_offline(self):
+        from unittest import mock
+
+        from apps.common import conf
         from apps.events.models import Content
         from apps.events.services import publish_content, unpublish_content
         from apps.policyqa.models import PolicyDocument
@@ -629,7 +671,8 @@ class ApiSmokeTests(TestCase):
         self.assertTrue(document.enabled)
         self.assertIsNotNone(document.published_at)
 
-        result = answer("报名需要什么条件")
+        with mock.patch.object(conf, "AI_ENABLED", False):
+            result = answer("报名需要什么条件")
         self.assertEqual(result["status"], "DISABLED")
         self.assertEqual(len(result["fallbackPolicies"]), 1)
         self.assertEqual(result["fallbackPolicies"][0]["title"], "省级足球赛事报名办法")

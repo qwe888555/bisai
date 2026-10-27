@@ -65,9 +65,25 @@ def test_cross_school_access_denied(client, auth):
     assert listing.json()["data"]["items"] == []
 
 
-def test_non_university_cannot_create_or_operate(client, auth):
-    """图2 口径：学校端是唯一报送主体；TEAM/CITY/省级/ADMIN 均不能新建、
-    也不能操作他人报名单的新建/编辑/提交/撤回路径。"""
+def test_team_role_cannot_create_enrollment(client, auth):
+    """报送主体已确认仅学校端（UNIVERSITY）；球队端 TEAM 不可建报名单。"""
+    headers = auth("team")
+    payload = {
+        "eventId": "event_01",
+        "groupId": GROUP_ID,
+        "teamId": "org_team_01",
+        "subjectType": "SCHOOL_TEAM",
+        "contactName": "刘教练",
+        "contactPhone": "13800000001",
+    }
+    response = post_json(client, f"{BASE}/enrollments", headers, payload)
+    assert response.status_code == 403, response.json()
+    assert response.json()["code"] == "FORBIDDEN"
+
+
+def test_non_team_or_university_cannot_create_or_operate(client, auth):
+    """CITY/PROVINCE_REVIEWER/ADMIN 不可代报（已确认 2026-10-27），
+    仍不能新建、也不能操作他人报名单的新建/编辑/提交/撤回路径。"""
     school_headers = auth("university")
     enrollment = create_draft(client, school_headers)
     url = f"{BASE}/enrollments"
@@ -79,7 +95,7 @@ def test_non_university_cannot_create_or_operate(client, auth):
         "contactName": "张老师",
         "contactPhone": "13800000001",
     }
-    for username in ("team", "city", "province", "admin"):
+    for username in ("city", "province", "admin"):
         headers = auth(username)
         created = post_json(client, url, headers, payload)
         assert created.status_code == 403, username

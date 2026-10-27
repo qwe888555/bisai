@@ -33,10 +33,15 @@ register_operation("fileSignedUrl", ALL_ROLES)
 
 
 class FileUploadIn(StrictSchema):
-    """单文件上传表单字段，字段名与 FileUploadRequest 一致。"""
+    """单文件上传表单字段，字段名与 FileUploadRequest 一致。
+
+    ownerId 允许空串（前端新建人员先传头像：PeopleManageView.uploadAvatar
+    传 editingId || ''，人员落库前无法预知 ID）——空归属走角色兜底校验，
+    人员创建/更新成功后由写链回填 owner_id（先传后绑，不绕过归属校验）。
+    """
 
     ownerType: str
-    ownerId: str = Field(..., min_length=1, max_length=64)
+    ownerId: str = Field(default="", max_length=64)
     category: str
 
 
