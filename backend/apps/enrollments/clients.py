@@ -147,10 +147,37 @@ class TeamClient:
                 "org_univ_01": ["org_univ_01"],
                 "org_prov": ["org_team_01", "org_team_02", "org_univ_01"],
             }
-            return list(mapping.get(org_id, [org_id]))
+            ids = list(mapping.get(org_id, [org_id]))
+            # mock 叠加真实主档：Organization.code == Team.team_no（唯一），
+            # 球队 org 节点的 parent 即报送主体，子树上挂的真实球队一并放行
+            ids.extend(self._real_team_ids(org_id))
+            return ids
         from apps.common.errors import ApiError, DEPENDENCY_UNAVAILABLE
 
         raise ApiError(DEPENDENCY_UNAVAILABLE, "球队服务尚未接通，请置 ENROLLMENT_MOCK_CLIENTS=true")
+
+    @staticmethod
+    def _real_team_ids(org_id: str) -> list[str]:
+        """球队 org 节点 parent=org_id 的真实 Team 主档 PK（mock 兜底，异常降级为空）。"""
+        try:
+            from apps.accounts.models import Organization
+            from apps.teams.models import Team
+
+            codes = list(
+                Organization.objects.filter(org_type="TEAM", parent_id=org_id).values_list(
+                    "code", flat=True
+                )
+            )
+            if not codes:
+                return []
+            return [
+                str(pk)
+                for pk in Team.objects.filter(
+                    team_no__in=codes, is_deleted=False
+                ).values_list("pk", flat=True)
+            ]
+        except Exception:
+            return []
 
     def get_coach(self, coach_id: str) -> dict[str, Any]:
         if mock_enabled():
