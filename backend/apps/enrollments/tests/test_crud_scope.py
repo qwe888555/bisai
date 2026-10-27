@@ -65,8 +65,8 @@ def test_cross_school_access_denied(client, auth):
     assert listing.json()["data"]["items"] == []
 
 
-def test_team_can_create_only_own_team(client, auth):
-    """球队端现在可以建自己球队的报名单，但不能报主体类型错的。"""
+def test_team_cannot_create_enrollment(client, auth):
+    """球队不能报送（R1 仅 UNIVERSITY 可建报名单），任何主体类型均 403。"""
     headers = auth("team")
     payload = {
         "eventId": "event_01",
@@ -77,10 +77,10 @@ def test_team_can_create_only_own_team(client, auth):
         "contactPhone": "13800000001",
     }
     response = post_json(client, f"{BASE}/enrollments", headers, payload)
-    assert response.status_code == 200, response.json()
-    assert response.json()["data"]["teamId"] == "org_team_01"
+    assert response.status_code == 403, response.json()
+    assert response.json()["code"] == "FORBIDDEN"
 
-    # subjectType 不匹配也会被拦
+    # 改报主体类型也仍然 403（非学校端一律不可报送）
     wrong_type = post_json(
         client,
         f"{BASE}/enrollments",
@@ -90,9 +90,9 @@ def test_team_can_create_only_own_team(client, auth):
     assert wrong_type.status_code == 403
 
 
-def test_non_team_or_university_cannot_create_or_operate(client, auth):
-    """CITY/PROVINCE_REVIEWER/ADMIN 代报未放开（TODO 确认项#6），
-    仍不能新建、也不能操作他人报名单的新建/编辑/提交/撤回路径。"""
+def test_non_university_cannot_create_or_operate(client, auth):
+    """CITY/PROVINCE_REVIEWER/ADMIN/TEAM 均不能代报或操作他人报名单
+    （R1 仅 UNIVERSITY 可建，数据范围层再拦跨校操作）。"""
     school_headers = auth("university")
     enrollment = create_draft(client, school_headers)
     url = f"{BASE}/enrollments"
@@ -104,7 +104,7 @@ def test_non_team_or_university_cannot_create_or_operate(client, auth):
         "contactName": "张老师",
         "contactPhone": "13800000001",
     }
-    for username in ("city", "province", "admin"):
+    for username in ("team", "city", "province", "admin"):
         headers = auth(username)
         created = post_json(client, url, headers, payload)
         assert created.status_code == 403, username
