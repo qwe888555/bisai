@@ -50,7 +50,6 @@ _REFERENCE_READ_ROLES = (
     TEAM,
 )
 register_operation("eventList", _REFERENCE_READ_ROLES)
-register_operation("eventGet", _REFERENCE_READ_ROLES)
 # 报名可见：全角色
 register_operation("availableEvents", ALL_ROLES)
 # 组别只读：同赛事读取范围
