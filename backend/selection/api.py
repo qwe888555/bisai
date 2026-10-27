@@ -25,6 +25,7 @@ from .common import (
     parse_page,
 )
 from .enums import GroupType, RoundType
+from .services import candidates as candidate_service
 from .services import excel as excel_service
 from .services import publicity as publicity_service
 from .services import results as result_service
@@ -82,6 +83,7 @@ _ADMIN_ONLY_OPERATIONS = (
     "selectionScoreExport",
     "selectionScoreGet",
     "selectionScoreUpdate",
+    "selectionCandidateList",
     "selectionResultGenerate",
     "selectionResultLatest",
     "selectionResultBatches",
@@ -276,6 +278,22 @@ def update_template(request, template_id: int, payload: dict = Body(...)):
     return ok(
         template_service.update_template(
             template_id, payload, get_current_user_id(request)
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
+# Candidates
+# ---------------------------------------------------------------------------
+@router.get("/candidates/", response=ResponseEnvelope)
+def list_candidates(request):
+    """可评分运动员列表：来自已通过报名名册，按组别/赛事/关键字过滤。"""
+    _require_operation("selectionCandidateList")
+    return ok(
+        candidate_service.list_candidates(
+            event_id=_query(request, "event_id", "eventId"),
+            group_type=_query(request, "group_type", "groupType"),
+            keyword=_query(request, "keyword") or "",
         )
     )
 

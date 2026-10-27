@@ -216,7 +216,13 @@ def generate_result(data, user_id):
             )
 
     if not rows:
-        raise BusinessError(400, "没有可用于生成结果的评分数据")
+        round_label = RoundType.label(result_round)
+        raise BusinessError(
+            400,
+            f"当前「{GroupType.label(group_type)} · {round_label}」没有可用的评分数据"
+            f"（初选 {len(initial_scores)} 条 / 复选 {len(final_scores)} 条），"
+            f"请先在「评分录入」中录入{round_label}评分后再生成结果。",
+        )
 
     tie_code = str(
         getattr(settings, "SELECTION_TIE_BREAK_DIMENSION_CODE", "TECH") or ""

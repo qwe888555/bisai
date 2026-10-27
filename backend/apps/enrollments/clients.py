@@ -108,12 +108,58 @@ _TEAM_SEED: dict[str, dict[str, Any]] = {
 
 
 class TeamClient:
+    @staticmethod
+    def _real_team(team_id: str) -> Optional[dict[str, Any]]:
+        """优先读本库真实球队主档，读不到再走演示数据。"""
+        try:
+            from apps.accounts.models import Organization
+            from apps.teams.models import Team, TeamCoach
+
+            team = Team.objects.filter(pk=str(team_id), is_deleted=False).first()
+            if team is None:
+                return None
+            school = team.school
+            region = team.region
+            city_org = None
+            if region is not None:
+                city_org = (
+                    Organization.objects.filter(org_type="CITY")
+                    .filter(code=region.code)
+                    .first()
+                    or Organization.objects.filter(org_type="CITY", name=region.name).first()
+                )
+            school_org = None
+            if school is not None and school.code:
+                school_org = Organization.objects.filter(code=school.code).first()
+            coach_ids = [
+                str(person_id)
+                for person_id in TeamCoach.objects.filter(team=team).values_list(
+                    "person_id", flat=True
+                )
+            ]
+            return {
+                "id": str(team.pk),
+                "name": team.name,
+                "orgId": school_org.pk if school_org else (str(school.pk) if school else ""),
+                "cityOrgId": city_org.pk if city_org else "",
+                "cityName": region.name if region else "",
+                "schoolCode": (school.code if school and school.code else ""),
+                "schoolName": school.name if school else "",
+                "coachIds": coach_ids,
+            }
+        except Exception:  # pragma: no cover - 演示兜底，任何异常都退回 mock
+            logger.debug("读取真实球队失败，回退演示数据", exc_info=True)
+            return None
+
     def get_team(self, team_id: str) -> dict[str, Any]:
         if not team_id:
             from apps.common.errors import INVALID_ARGUMENT, ApiError
 
             raise ApiError(INVALID_ARGUMENT, "缺少球队 ID")
         if mock_enabled():
+            real = self._real_team(team_id)
+            if real is not None:
+                return real
             seed = _TEAM_SEED.get(team_id)
             if seed:
                 return dict(seed)
@@ -158,7 +204,11 @@ class TeamClient:
 
     @staticmethod
     def _real_team_ids(org_id: str) -> list[str]:
-        """球队 org 节点 parent=org_id 的真实 Team 主档 PK（mock 兜底，异常降级为空）。"""
+        """球队 org 节点 parent=org_id 的真实 Team 主档 PK（mock 兜底，异常降级为空）。
+
+        球队账号自身绑定的就是 TEAM 组织节点，其 code 即 Team.team_no，
+        因此也要把本节点映射出的球队算进来，否则本队报名单不可见。
+        """
         try:
             from apps.accounts.models import Organization
             from apps.teams.models import Team
@@ -168,6 +218,13 @@ class TeamClient:
                     "code", flat=True
                 )
             )
+            own_code = (
+                Organization.objects.filter(pk=org_id, org_type="TEAM")
+                .values_list("code", flat=True)
+                .first()
+            )
+            if own_code:
+                codes.append(own_code)
             if not codes:
                 return []
             return [
@@ -298,12 +355,50 @@ def _mock_window() -> tuple[datetime, datetime]:
 
 
 class EventConfigClient:
+    @staticmethod
+    def _real_event(event_id: str) -> Optional[dict[str, Any]]:
+        try:
+            from apps.events.models import Event
+
+            event = Event.objects.filter(pk=str(event_id)).first()
+            if event is None:
+                return None
+            return {
+                "id": event.pk,
+                "name": event.name,
+                "year": event.season,
+                "timezone": "Asia/Shanghai",
+            }
+        except Exception:  # pragma: no cover
+            logger.debug("读取真实赛事失败，回退演示数据", exc_info=True)
+            return None
+
+    @staticmethod
+    def _real_group(event_id: str, group_id: str) -> Optional[dict[str, Any]]:
+        try:
+            from apps.events.models import EventGroup
+
+            group = EventGroup.objects.filter(
+                pk=str(group_id), event_id=str(event_id)
+            ).first()
+            if group is None:
+                group = EventGroup.objects.filter(pk=str(group_id)).first()
+            if group is None:
+                return None
+            return {"id": group.pk, "name": group.name, "eventId": group.event_id}
+        except Exception:  # pragma: no cover
+            logger.debug("读取真实组别失败，回退演示数据", exc_info=True)
+            return None
+
     def get_event(self, event_id: str) -> dict[str, Any]:
         if not event_id:
             from apps.common.errors import INVALID_ARGUMENT, ApiError
 
             raise ApiError(INVALID_ARGUMENT, "缺少赛事 ID")
         if mock_enabled():
+            real = self._real_event(event_id)
+            if real is not None:
+                return real
             return {
                 "id": event_id,
                 "name": f"省级中小学足球赛事{_suffix(event_id)}",
@@ -320,6 +415,9 @@ class EventConfigClient:
 
             raise ApiError(INVALID_ARGUMENT, "缺少组别 ID")
         if mock_enabled():
+            real = self._real_group(event_id, group_id)
+            if real is not None:
+                return real
             return {
                 "id": group_id,
                 "name": f"组别{_suffix(group_id)}",
@@ -331,6 +429,17 @@ class EventConfigClient:
 
     def get_groups(self, event_id: str) -> list[dict[str, Any]]:
         if mock_enabled():
+            try:
+                from apps.events.models import EventGroup
+
+                rows = EventGroup.objects.filter(event_id=str(event_id)).order_by("created_at")
+                if rows.exists():
+                    return [
+                        {"id": item.pk, "name": item.name, "eventId": item.event_id}
+                        for item in rows
+                    ]
+            except Exception:  # pragma: no cover
+                logger.debug("读取真实组别列表失败，回退演示数据", exc_info=True)
             return [
                 {"id": "group_u12", "name": "小学男子组", "eventId": event_id},
                 {"id": "group_u15", "name": "初中男子组", "eventId": event_id},

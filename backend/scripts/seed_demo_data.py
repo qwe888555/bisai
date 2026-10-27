@@ -667,6 +667,7 @@ def seed_match_events(contexts: list[dict], matches: dict[str, Match]) -> int:
         nonlocal created
         mev_id = kwargs.pop("id")
         defaults = {
+            "match_id": match.pk,
             "match_version": match.version,
             "stoppage_minute": None,
             "own_goal": False,
