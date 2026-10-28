@@ -92,8 +92,8 @@ class MainAdapterTests(TestCase):
         group = EventGroup.objects.create(
             id="evg_u18",
             event=event,
-            name="高校男子组",
-            category="UNIVERSITY",
+            name="中学男子组",
+            category="MIDDLE",
             gender="MALE",
             max_players=11,
         )
@@ -150,7 +150,7 @@ class MainAdapterTests(TestCase):
         )
 
         cls.event_id = event.id
-        cls.group_type = GroupType.HIGHER
+        cls.group_type = GroupType.MIDDLE
         cls.athlete_id = str(athlete.id)
         cls.team_coach_id = str(
             TeamCoach.objects.get(duty=CoachDuty.HEAD_COACH).id
@@ -163,14 +163,14 @@ class MainAdapterTests(TestCase):
         self.assertIsNotNone(candidate)
         self.assertEqual(candidate.candidate_id, self.athlete_id)
         self.assertEqual(candidate.event_id, self.event_id)
-        self.assertEqual(candidate.group_type, GroupType.HIGHER)
+        self.assertEqual(candidate.group_type, GroupType.MIDDLE)
         self.assertEqual(candidate.name, "张三")
         self.assertEqual(candidate.team_name, "江城一中队")
         self.assertEqual(candidate.position, "FW")
 
         self.assertIsNone(client.get_candidate("rst_draft", self.event_id))
 
-        candidates = client.list_candidates("UNIVERSITY")
+        candidates = client.list_candidates("MIDDLE")
         self.assertEqual([item.candidate_id for item in candidates], [self.athlete_id])
 
     def test_publicity_source_maps_athlete_coach_team(self):
@@ -179,7 +179,7 @@ class MainAdapterTests(TestCase):
         athlete = client.get_registration(
             PublicityType.ATHLETE, "rst_approved", event_id=self.event_id
         )
-        self.assertEqual(athlete.group_type, GroupType.HIGHER)
+        self.assertEqual(athlete.group_type, GroupType.MIDDLE)
         self.assertEqual(athlete.city, "江城市")
         self.assertEqual(athlete.data["name"], "张三")
         self.assertEqual(athlete.data["team_name"], "江城一中队")
@@ -201,7 +201,7 @@ class MainAdapterTests(TestCase):
 
     def test_publicity_list_filters_and_excludes_drafts(self):
         records = get_publicity_source_client().list_registrations(
-            group_type="UNIVERSITY",
+            group_type="MIDDLE",
             event_id=self.event_id,
         )
         athlete_records = [
@@ -216,8 +216,9 @@ class MainAdapterTests(TestCase):
             "rst_draft", [item.source_id for item in records]
         )
 
-        middle = get_publicity_source_client().list_registrations(
-            group_type=GroupType.MIDDLE,
+        # 其他组别没有报名记录时必须返回空列表。
+        primary = get_publicity_source_client().list_registrations(
+            group_type=GroupType.PRIMARY,
             event_id=self.event_id,
         )
-        self.assertEqual(middle, [])
+        self.assertEqual(primary, [])

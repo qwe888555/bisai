@@ -11,7 +11,7 @@
 - 学校组织映射（A′-min，2026-10-25 契约确认并交付）：schoolOrgId（Organization
   节点 ID）→ 节点校验（存在/未停用/学校类类型）→ org.code 反查 School 主档；
   create_team 同事务经 accounts.ensure_business_org 建立 TEAM 组织节点
-  （code=team_no，parent=所属学校/高校组织节点）；
+  （code=team_no，parent=所属学校/院校组织节点）；
 - 无冻结承载的前端字段（shortName/gender/campusName/coachName 输入值）：
   声明但不持久化不回显（同 persons education/coachCategory 先例）；
   coachName 输出仅由现役（CURRENT）主教练关系合成（list_own_teams 先例）。
@@ -260,7 +260,7 @@ def create_team(data: dict, org, school, account) -> Team:
       独立测试编号回填/媒体映射等规则）；
     - TEAM 组织节点经 accounts.ensure_business_org 在同一事务建立（A′-min
       契约 2026-10-25）：Organization.code=team_no、name=队名、parent=所属
-      学校/高校组织节点；幂等/复活/类型冲突 409/并发唯一约束兜底/层级校验
+      学校/院校组织节点；幂等/复活/类型冲突 409/并发唯一约束兜底/层级校验
       复用 accounts 实现，异常上抛 → 本事务整体回滚，不产生孤立球队或孤立
       组织节点（accounts 侧不吞异常）；
     - 忽略无承载字段：shortName/gender/campusName（schema 声明以放行前端

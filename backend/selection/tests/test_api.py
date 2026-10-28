@@ -55,7 +55,7 @@ class SelectionApiTests(TestCase):
 
     def create_template(
         self,
-        group_type="HIGHER",
+        group_type="MIDDLE",
         round_code="INITIAL",
         name="测试模板",
         items=None,
@@ -94,7 +94,7 @@ class SelectionApiTests(TestCase):
         template_id,
         candidate_id,
         round_code="INITIAL",
-        group_type="HIGHER",
+        group_type="MIDDLE",
         scores=None,
         event_id=1,
     ):
@@ -122,14 +122,14 @@ class SelectionApiTests(TestCase):
         initial = self.create_template()
         self.assertEqual(initial["status"], 1)
         self.assertEqual(len(initial["items"]), 2)
-        self.assertEqual(initial["group_type"], "HIGHER")
+        self.assertEqual(initial["group_type"], "MIDDLE")
 
         final = self.create_template(round_code="FINAL", name="复选模板")
         self.assertEqual(final["round"], "FINAL")
 
         response = self.get_json(
             TEMPLATE_PATH,
-            {"group_type": "HIGHER", "round": "INITIAL"},
+            {"group_type": "MIDDLE", "round": "INITIAL"},
         )
         listing = self.body(response)["data"]
         self.assertEqual(len(listing), 1)
@@ -168,7 +168,7 @@ class SelectionApiTests(TestCase):
         # Group and round are immutable after creation.
         response = self.put_json(
             f"{TEMPLATE_PATH}{initial['id']}/",
-            {"group_type": "MIDDLE"},
+            {"group_type": "PRIMARY"},
         )
         self.assertEqual(response.status_code, 400)
 
@@ -177,7 +177,7 @@ class SelectionApiTests(TestCase):
             TEMPLATE_PATH,
             {
                 "name": "错误权重",
-                "group_type": "HIGHER",
+                "group_type": "MIDDLE",
                 "round": "INITIAL",
                 "items": [
                     {
@@ -202,7 +202,7 @@ class SelectionApiTests(TestCase):
             TEMPLATE_PATH,
             {
                 "name": "重复维度",
-                "group_type": "HIGHER",
+                "group_type": "MIDDLE",
                 "round": "INITIAL",
                 "items": [
                     {
@@ -227,7 +227,7 @@ class SelectionApiTests(TestCase):
             TEMPLATE_PATH,
             {
                 "name": "驼峰字段模板",
-                "groupType": "HIGHER",
+                "groupType": "MIDDLE",
                 "round": "INITIAL",
                 "items": [
                     {
@@ -313,7 +313,7 @@ class SelectionApiTests(TestCase):
             f"{SCORE_PATH}summary/",
             {
                 "event_id": 1,
-                "group_type": "HIGHER",
+                "group_type": "MIDDLE",
                 "round": "INITIAL",
             },
         )
@@ -342,7 +342,7 @@ class SelectionApiTests(TestCase):
             f"{SCORE_PATH}summary/",
             {
                 "event_id": 1,
-                "group_type": "HIGHER",
+                "group_type": "MIDDLE",
                 "round": "INITIAL",
             },
         )
@@ -354,7 +354,7 @@ class SelectionApiTests(TestCase):
             SCORE_PATH,
             {
                 "event_id": 1,
-                "group_type": "HIGHER",
+                "group_type": "MIDDLE",
                 "round": "INITIAL",
                 "page": 1,
                 "size": 2,
@@ -405,7 +405,7 @@ class SelectionApiTests(TestCase):
             f"{SCORE_PATH}summary/",
             {
                 "event_id": 1,
-                "group_type": "HIGHER",
+                "group_type": "MIDDLE",
                 "round": "INITIAL",
             },
         )
@@ -421,7 +421,7 @@ class SelectionApiTests(TestCase):
             f"{SCORE_PATH}summary/",
             data={
                 "event_id": 1,
-                "group_type": "高校组",
+                "group_type": "中学组",
                 "round": "初选",
             },
             **self.headers,
@@ -429,18 +429,17 @@ class SelectionApiTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(len(self.body(response)["data"]), 1)
 
-        # The main backend calls this category "UNIVERSITY"; it maps to HIGHER.
+        # 未知组别编码返回 400。
         response = self.client.get(
             f"{SCORE_PATH}summary/",
             data={
                 "event_id": 1,
-                "group_type": "UNIVERSITY",
+                "group_type": "OTHER",
                 "round": "INITIAL",
             },
             **self.headers,
         )
-        self.assertEqual(response.status_code, 200, response.content)
-        self.assertEqual(len(self.body(response)["data"]), 1)
+        self.assertEqual(response.status_code, 400)
 
     # ------------------------------------------------------------------
     # Results
@@ -493,7 +492,7 @@ class SelectionApiTests(TestCase):
             f"{RESULTS_PATH}generate/",
             {
                 "event_id": 1,
-                "group_type": "HIGHER",
+                "group_type": "MIDDLE",
                 "quota": 2,
                 "result_round": "FINAL",
                 "initial_weight": 0.4,
@@ -521,14 +520,14 @@ class SelectionApiTests(TestCase):
 
         response = self.get_json(
             f"{RESULTS_PATH}latest/",
-            {"event_id": 1, "group_type": "HIGHER"},
+            {"event_id": 1, "group_type": "MIDDLE"},
         )
         self.assertEqual(response.status_code, 200)
         self.assertEqual(self.body(response)["data"]["version_no"], 1)
 
         response = self.get_json(
             f"{RESULTS_PATH}export/",
-            {"event_id": 1, "group_type": "HIGHER"},
+            {"event_id": 1, "group_type": "MIDDLE"},
         )
         self.assertEqual(response.status_code, 200)
         workbook = load_workbook(BytesIO(response.content))
@@ -552,13 +551,13 @@ class SelectionApiTests(TestCase):
 
         response = self.get_json(
             f"{RESULTS_PATH}latest/",
-            {"event_id": 1, "group_type": "HIGHER"},
+            {"event_id": 1, "group_type": "MIDDLE"},
         )
         self.assertTrue(self.body(response)["data"]["stale"])
 
         response = self.get_json(
             f"{RESULTS_PATH}export/",
-            {"event_id": 1, "group_type": "HIGHER"},
+            {"event_id": 1, "group_type": "MIDDLE"},
         )
         self.assertEqual(response.status_code, 409)
         self.assertEqual(self.body(response)["code"], 409)
@@ -567,7 +566,7 @@ class SelectionApiTests(TestCase):
             f"{RESULTS_PATH}generate/",
             {
                 "event_id": 1,
-                "group_type": "HIGHER",
+                "group_type": "MIDDLE",
                 "quota": 2,
                 "result_round": "FINAL",
                 "initial_weight": 0.4,
@@ -584,7 +583,7 @@ class SelectionApiTests(TestCase):
 
         response = self.get_json(
             f"{RESULTS_PATH}batches/",
-            {"event_id": 1, "group_type": "HIGHER"},
+            {"event_id": 1, "group_type": "MIDDLE"},
         )
         history = self.body(response)["data"]
         self.assertEqual(len(history), 2)
@@ -614,7 +613,7 @@ class SelectionApiTests(TestCase):
             f"{RESULTS_PATH}generate/",
             {
                 "event_id": 1,
-                "group_type": "HIGHER",
+                "group_type": "MIDDLE",
                 "quota": 10,
                 "result_round": "INITIAL",
             },
@@ -636,7 +635,7 @@ class SelectionApiTests(TestCase):
             f"{RESULTS_PATH}generate/",
             {
                 "event_id": 1,
-                "group_type": "HIGHER",
+                "group_type": "MIDDLE",
                 "quota": 10,
                 "result_round": "FINAL",
             },
@@ -663,7 +662,7 @@ class SelectionApiTests(TestCase):
             f"{SCORE_PATH}export/",
             {
                 "event_id": 1,
-                "group_type": "HIGHER",
+                "group_type": "MIDDLE",
                 "round": "INITIAL",
             },
         )
@@ -683,7 +682,7 @@ class SelectionApiTests(TestCase):
             f"{SCORE_PATH}export/",
             {
                 "event_id": 1,
-                "group_type": "MIDDLE",
+                "group_type": "PRIMARY",
                 "round": "INITIAL",
             },
         )

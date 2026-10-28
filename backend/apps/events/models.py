@@ -46,7 +46,6 @@ EVENT_STATUSES = (
 GROUP_CATEGORIES = (
     ("PRIMARY", "小学组"),
     ("MIDDLE", "初中组"),
-    ("UNIVERSITY", "高校组"),
 )
 
 GROUP_GENDERS = (
@@ -245,6 +244,8 @@ class Content(SoftDeleteVersionedModel):
     published_at = models.DateTimeField(null=True, blank=True)
     revision = models.PositiveIntegerField(default=1)
     body_text = models.TextField(max_length=50000, blank=True, default="")
+    # 由「门户资源·新闻配图」自动创建：标题/摘要/正文跟随配图同步，删除配图时一并下线。
+    auto_created = models.BooleanField(default=False)
 
     class Meta:
         db_table = "events_content"
@@ -271,7 +272,11 @@ class PortalResource(SoftDeleteVersionedModel):
     id = models.CharField(primary_key=True, max_length=64)
     resource_type = models.CharField(max_length=18, choices=PORTAL_RESOURCE_TYPES)
     title = models.CharField(max_length=150)
+    # 文字介绍：合作关系、配图说明等，门户按需展示。
+    description = models.CharField(max_length=300, blank=True, default="")
     image_file_id = models.CharField(max_length=64, blank=True, default="")
+    # 轮播视频：仅 CAROUSEL 使用，直链 mp4/webm，首屏无直播时代替图片播放。
+    video_url = models.CharField(max_length=2000, blank=True, default="")
     target_content_id = models.CharField(max_length=64, blank=True, default="")
     target_url = models.CharField(max_length=2000, blank=True, default="")
     sort_order = models.PositiveIntegerField(default=0)

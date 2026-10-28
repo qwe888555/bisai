@@ -9,6 +9,7 @@ from __future__ import annotations
 from typing import Optional
 
 from django.utils import timezone
+from django.utils.html import escape
 
 from apps.common.errors import (
     BUSINESS_VALIDATION_FAILED,
@@ -853,7 +854,8 @@ def unpublish_content(content_id: str, version: int, reason: str):
 # ---------------------------------------------------------------- 门户资源（7.2）
 
 def _validate_resource_target(resource_type: str, image_file_id: str,
-                             target_content_id: str, target_url: str, enabled: bool) -> None:
+                             target_content_id: str, target_url: str, enabled: bool,
+                             video_url: str = "") -> None:
     if target_content_id and target_url:
         raise ApiError(
             BUSINESS_VALIDATION_FAILED,
@@ -866,6 +868,19 @@ def _validate_resource_target(resource_type: str, image_file_id: str,
             "targetUrl 仅支持 http/https",
             [{"field": "targetUrl", "reason": "必须以 http:// 或 https:// 开头"}],
         )
+    if video_url:
+        if resource_type != "CAROUSEL":
+            raise ApiError(
+                BUSINESS_VALIDATION_FAILED,
+                "只有首页轮播支持配置视频",
+                [{"field": "videoUrl", "reason": "仅 CAROUSEL 类型可填"}],
+            )
+        if not (video_url.startswith("http://") or video_url.startswith("https://")):
+            raise ApiError(
+                BUSINESS_VALIDATION_FAILED,
+                "videoUrl 仅支持 http/https",
+                [{"field": "videoUrl", "reason": "必须以 http:// 或 https:// 开头"}],
+            )
     if resource_type in ("CAROUSEL", "NEWS_LINK_IMAGE") and enabled and not image_file_id:
         raise ApiError(
             BUSINESS_VALIDATION_FAILED,
@@ -894,55 +909,173 @@ def get_portal_resource(resource_id: str):
     return resource
 
 
+def _resource_content_body(title: str, description: str) -> tuple[str, str]:
+    paragraph = (description or "").strip() or f"{title} 的详细内容正在整理中，敬请关注。"
+    return sanitize_body_html(f"<p>{escape(paragraph)}</p>")
+
+
+def _create_content_from_resource(resource):
+    """新闻配图没有关联内容时自动建一条同名赛事资讯，让门户资讯页同步出现新条目。"""
+    from .models import Content
+
+    body_html, body_text = _resource_content_body(resource.title, resource.description)
+    content = Content.objects.create(
+        id=new_id("cnt"),
+        content_type="NEWS",
+        title=resource.title[:200],
+        summary=resource.description[:1000],
+        body_html=body_html,
+        body_text=body_text,
+        cover_file_id=resource.image_file_id,
+        status="PUBLISHED" if resource.enabled else "DRAFT",
+        published_at=timezone.now() if resource.enabled else None,
+        revision=1,
+        auto_created=True,
+    )
+    resource.target_content_id = content.pk
+    resource.save(update_fields=["target_content_id", "updated_at"])
+    return content
+
+
+def _sync_auto_content(resource) -> None:
+    """自动创建的资讯跟随配图：标题、介绍、封面、启停状态保持一致。"""
+    from .models import Content
+
+    if resource.resource_type != "NEWS_LINK_IMAGE" or not resource.target_content_id:
+        return
+    content = Content.objects.filter(pk=resource.target_content_id).first()
+    if content is None or not content.auto_created:
+        return
+
+    changed = False
+    title = resource.title[:200]
+    if content.title != title:
+        content.title = title
+        changed = True
+    summary = resource.description[:1000]
+    if content.summary != summary:
+        content.summary = summary
+        changed = True
+        # 只有配图的文字介绍变了才重写正文，避免覆盖在「内容管理」里补写的正文。
+        body_html, body_text = _resource_content_body(resource.title, resource.description)
+        content.body_html = body_html
+        content.body_text = body_text
+    if resource.image_file_id and content.cover_file_id != resource.image_file_id:
+        content.cover_file_id = resource.image_file_id
+        changed = True
+
+    if resource.enabled:
+        content.status = "PUBLISHED"
+        if content.published_at is None:
+            content.published_at = timezone.now()
+    else:
+        content.status = "OFFLINE" if content.published_at else "DRAFT"
+
+    if changed:
+        content.revision = int(content.revision or 1) + 1
+        bump(content)
+    content.save()
+
+
 def create_portal_resource(data: dict):
     from .models import PortalResource
 
     _validate_resource_target(
         data["resourceType"], data.get("imageFileId", ""),
         data.get("targetContentId", ""), data.get("targetUrl", ""),
-        bool(data.get("enabled", True)),
+        bool(data.get("enabled", True)), data.get("videoUrl", ""),
     )
     resource = PortalResource.objects.create(
         id=new_id("pres"),
         resource_type=data["resourceType"],
         title=data["title"],
+        description=data.get("description", ""),
         image_file_id=data.get("imageFileId", ""),
+        video_url=data.get("videoUrl", ""),
         target_content_id=data.get("targetContentId", ""),
         target_url=data.get("targetUrl", ""),
         sort_order=data.get("sortOrder", 0),
         enabled=bool(data.get("enabled", True)),
     )
+    if resource.resource_type == "NEWS_LINK_IMAGE" and not resource.target_content_id:
+        _create_content_from_resource(resource)
     _invalidate_public_cache()
     return resource
 
 
 def update_portal_resource(resource_id: str, data: dict):
+    from .models import Content
+
     resource = get_portal_resource(resource_id)
     check_version(resource, data.get("version"))
     _validate_resource_target(
         data["resourceType"], data.get("imageFileId", ""),
         data.get("targetContentId", ""), data.get("targetUrl", ""),
-        bool(data.get("enabled", True)),
+        bool(data.get("enabled", True)), data.get("videoUrl", ""),
     )
+    # 管理端「先建停用态资源、上传图片后再保存」的第二步不会回传自动关联的资讯，
+    # 这里保留原绑定，避免把刚生成的赛事资讯解绑。
+    previous_target_id = resource.target_content_id
+    auto_linked = None
+    if resource.target_content_id:
+        auto_linked = Content.objects.filter(
+            pk=resource.target_content_id, auto_created=True
+        ).first()
+    target_content_id = data.get("targetContentId", "")
+    if (
+        data["resourceType"] == "NEWS_LINK_IMAGE"
+        and not target_content_id
+        and auto_linked is not None
+    ):
+        target_content_id = auto_linked.pk
+
     resource.resource_type = data["resourceType"]
     resource.title = data["title"]
+    resource.description = data.get("description", "")
     resource.image_file_id = data.get("imageFileId", "")
-    resource.target_content_id = data.get("targetContentId", "")
+    resource.video_url = data.get("videoUrl", "")
+    resource.target_content_id = target_content_id
     resource.target_url = data.get("targetUrl", "")
     resource.sort_order = data.get("sortOrder", 0)
     resource.enabled = bool(data.get("enabled", True))
     bump(resource)
     resource.save()
+
+    # 配图改成别的关联内容或切成其他类型时，原来自动生成的资讯一并下线。
+    if auto_linked is not None and resource.target_content_id != auto_linked.pk:
+        auto_linked.deleted_at = timezone.now()
+        bump(auto_linked)
+        auto_linked.save()
+    elif (
+        resource.resource_type == "NEWS_LINK_IMAGE"
+        and not resource.target_content_id
+        and not previous_target_id
+    ):
+        # 兼容本次改动前建的、还没关联内容的新闻配图：保存后补建资讯。
+        _create_content_from_resource(resource)
+    else:
+        _sync_auto_content(resource)
     _invalidate_public_cache()
     return resource
 
 
 def delete_portal_resource(resource_id: str, version: int):
+    from .models import Content
+
     resource = get_portal_resource(resource_id)
     check_version(resource, version)
+    auto_linked = None
+    if resource.target_content_id:
+        auto_linked = Content.objects.filter(
+            pk=resource.target_content_id, auto_created=True
+        ).first()
     resource.deleted_at = timezone.now()
     bump(resource)
     resource.save()
+    if auto_linked is not None:
+        auto_linked.deleted_at = timezone.now()
+        bump(auto_linked)
+        auto_linked.save()
     _invalidate_public_cache()
     return resource
 

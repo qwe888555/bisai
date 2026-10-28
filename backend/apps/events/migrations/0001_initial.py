@@ -42,7 +42,7 @@ class Migration(migrations.Migration):
                 ('deleted_at', models.DateTimeField(blank=True, null=True)),
                 ('id', models.CharField(max_length=64, primary_key=True, serialize=False)),
                 ('name', models.CharField(max_length=100)),
-                ('category', models.CharField(choices=[('PRIMARY', '小学组'), ('MIDDLE', '初中组'), ('UNIVERSITY', '高校组')], max_length=12)),
+                ('category', models.CharField(choices=[('PRIMARY', '小学组'), ('MIDDLE', '初中组')], max_length=12)),
                 ('gender', models.CharField(choices=[('MALE', '男子'), ('FEMALE', '女子'), ('MIXED', '混合')], max_length=10)),
                 ('quota', models.PositiveIntegerField(default=0)),
                 ('min_age', models.PositiveSmallIntegerField(blank=True, null=True)),

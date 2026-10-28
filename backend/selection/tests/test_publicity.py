@@ -82,8 +82,8 @@ class PublicityApiTests(TestCase):
 
         self.assertEqual(data["action"], "published")
         self.assertEqual(data["name"], "张伟")
-        self.assertEqual(data["group_type"], "HIGHER")
-        self.assertEqual(data["group_type_label"], "高校组")
+        self.assertEqual(data["group_type"], "MIDDLE")
+        self.assertEqual(data["group_type_label"], "中学组")
         self.assertEqual(data["publicity_type_label"], "运动员")
         self.assertEqual(data["city"], "江城市")
         self.assertEqual(
@@ -140,8 +140,8 @@ class PublicityApiTests(TestCase):
 
         team = self.publish("TEAM", "T1001")
         self.assertEqual(team["publicity_type_label"], "球队")
-        self.assertEqual(team["name"], "江城大学")
-        self.assertEqual(team["team_name"], "江城大学")
+        self.assertEqual(team["name"], "江城一中")
+        self.assertEqual(team["team_name"], "江城一中")
         self.assertEqual(team["id_card_masked"], "")
         self.assertEqual(team["fields"]["coach_name"], "陈志强")
         self.assertNotIn("contact_phone", team["fields"])
@@ -237,19 +237,19 @@ class PublicityApiTests(TestCase):
     # Filters
     # ------------------------------------------------------------------
     def test_filters_by_group_city_and_type(self):
-        self.publish("ATHLETE", "10001")  # HIGHER, 江城市
-        self.publish("ATHLETE", "10002")  # HIGHER, 南湖市
-        self.publish("ATHLETE", "20001")  # MIDDLE, 江城市
+        self.publish("ATHLETE", "10001")  # MIDDLE, 江城市
+        self.publish("ATHLETE", "10002")  # MIDDLE, 南湖市
+        self.publish("ATHLETE", "20001")  # PRIMARY, 江城市
 
-        higher = self.public_list(event_id=1, group_type="HIGHER")
-        self.assertEqual(higher["total"], 2)
+        middle = self.public_list(event_id=1, group_type="MIDDLE")
+        self.assertEqual(middle["total"], 2)
 
-        middle = self.public_list(event_id=1, group_type="中学组")
-        self.assertEqual(middle["total"], 1)
-        self.assertEqual(middle["records"][0]["name"], "郭鹏")
+        primary = self.public_list(event_id=1, group_type="小学组")
+        self.assertEqual(primary["total"], 1)
+        self.assertEqual(primary["records"][0]["name"], "郭鹏")
 
         south_lake = self.public_list(
-            event_id=1, group_type="HIGHER", city="南湖市"
+            event_id=1, group_type="MIDDLE", city="南湖市"
         )
         self.assertEqual(south_lake["total"], 1)
         self.assertEqual(south_lake["records"][0]["name"], "王芳")
@@ -259,7 +259,7 @@ class PublicityApiTests(TestCase):
 
         response = self.get_json(
             f"{PUBLICITY_PATH}cities/",
-            {"event_id": 1, "group_type": "HIGHER"},
+            {"event_id": 1, "group_type": "MIDDLE"},
         )
         self.assertEqual(response.status_code, 200, response.content)
         self.assertEqual(
@@ -273,7 +273,7 @@ class PublicityApiTests(TestCase):
         payload = {
             "event_id": 1,
             "publicity_type": "ATHLETE",
-            "group_type": "HIGHER",
+            "group_type": "MIDDLE",
         }
         response = self.post_json(f"{PUBLICITY_PATH}batch/", payload)
         self.assertEqual(response.status_code, 200, response.content)
@@ -293,14 +293,14 @@ class PublicityApiTests(TestCase):
         self.assertEqual(
             PublicityRecord.objects.filter(
                 event_id=1,
-                group_type="HIGHER",
+                group_type="MIDDLE",
                 publicity_type="ATHLETE",
             ).count(),
             15,
         )
         self.assertEqual(
             self.public_list(
-                event_id=1, group_type="HIGHER", type="ATHLETE"
+                event_id=1, group_type="MIDDLE", type="ATHLETE"
             )["total"],
             15,
         )
@@ -311,7 +311,7 @@ class PublicityApiTests(TestCase):
     def _result_batch(self, candidate_ids, active=True, stale=False):
         batch = ResultBatch.objects.create(
             event_id="1",
-            group_type=GroupType.HIGHER,
+            group_type=GroupType.MIDDLE,
             result_round=RoundType.INITIAL,
             quota=len(candidate_ids),
             initial_weight=1,

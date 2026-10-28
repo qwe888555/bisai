@@ -17,7 +17,7 @@ from .services import event_phase
 from . import display
 
 EventStatus = Literal["DRAFT", "REGISTRATION_OPEN", "REGISTRATION_CLOSED", "RUNNING", "FINISHED"]
-GroupCategory = Literal["PRIMARY", "MIDDLE", "UNIVERSITY"]
+GroupCategory = Literal["PRIMARY", "MIDDLE"]
 GroupGender = Literal["MALE", "FEMALE", "MIXED"]
 
 
@@ -358,7 +358,9 @@ class ContentUpdate(ContentCreate):
 class PortalResourceCreate(StrictSchema):
     resourceType: ResourceType
     title: str = Field(min_length=1, max_length=150)
+    description: str = Field(default="", max_length=300)
     imageFileId: str = Field(default="", max_length=64)
+    videoUrl: str = Field(default="", max_length=2000)
     targetContentId: str = Field(default="", max_length=64)
     targetUrl: str = Field(default="", max_length=2000)
     sortOrder: int = Field(default=0, ge=0)
@@ -436,7 +438,9 @@ def portal_resource_out(resource) -> dict:
         "id": resource.pk,
         "resourceType": resource.resource_type,
         "title": resource.title,
+        "description": resource.description or "",
         "imageFileId": resource.image_file_id or "",
+        "videoUrl": resource.video_url or "",
         "targetContentId": resource.target_content_id or "",
         "targetUrl": resource.target_url or "",
         "sortOrder": int(resource.sort_order or 0),
@@ -453,7 +457,9 @@ def public_resource_out(resource, base_url: str = "") -> dict:
         "id": resource.pk,
         "resourceType": resource.resource_type,
         "title": resource.title,
+        "description": resource.description or "",
         "imageUrl": _portal_image_url(resource.image_file_id, base_url),
+        "videoUrl": resource.video_url or "",
         "targetContentId": resource.target_content_id or "",
         "targetUrl": resource.target_url or "",
         "sortOrder": int(resource.sort_order or 0),

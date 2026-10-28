@@ -32,7 +32,7 @@ from selection.services.publicity_source import get_publicity_source_client
 from selection.services.results import generate_result
 from selection.services.scoring import calculate_total
 
-GROUPS = [GroupType.HIGHER, GroupType.MIDDLE, GroupType.PRIMARY]
+GROUPS = [GroupType.MIDDLE, GroupType.PRIMARY]
 ROUNDS = [RoundType.INITIAL, RoundType.FINAL]
 
 TEMPLATE_ITEMS = [

@@ -11,7 +11,7 @@ Mapping (main -> member6):
 main model/field        member6 concept
 ======================  ==========================================
 Enrollment.event_id     event_id (string ``evt_...``)
-EventGroup.category     group_type (``UNIVERSITY`` -> ``HIGHER``)
+EventGroup.category     group_type (PRIMARY / MIDDLE)
 RosterItem.athlete_id   scoring candidate_id (person id)
 RosterItem.id           publicity source_id for ATHLETE
 TeamCoach.id            publicity source_id for COACH
@@ -39,12 +39,10 @@ from .publicity_source import PublicitySourceClient, PublicitySourceRecord
 _CATEGORY_TO_GROUP = {
     "PRIMARY": GroupType.PRIMARY,
     "MIDDLE": GroupType.MIDDLE,
-    "UNIVERSITY": GroupType.HIGHER,
 }
 _GROUP_TO_CATEGORIES = {
     GroupType.PRIMARY: ("PRIMARY",),
     GroupType.MIDDLE: ("MIDDLE",),
-    GroupType.HIGHER: ("UNIVERSITY",),
 }
 
 _REQUIRED_APPS = (
