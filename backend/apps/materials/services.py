@@ -6,7 +6,8 @@
   review/remove 按 id 双表解析：两表同时命中（同 id 有效行）→ 409 归属不明确
   不静默择一（L11 待前端补传 ownerType）；
 - 材料类型以 material_type 表为唯一事实源（不硬编码 13 种类型、不编造字典项）：
-  类型表为空/无效/停用/归属不匹配 → 创建 409 明确报错，不伪造成功；
+  类型表为空/无效/停用/归属不匹配 → 创建 400 明确报错，不伪造成功
+  （2026-10-29 问题⑥裁定，原 409；409 保留给真实资源状态冲突）；
   列表不受类型表影响（空表返回空结果属正常）；
 - 状态机：创建即 PENDING（need_audit=False 类型免审直通 APPROVED；前端创建文案
   "材料已提交审核"）；审核仅 PENDING → APPROVED/REJECTED（REJECT 必填 reason）；
@@ -139,17 +140,23 @@ def _resolve_owner(owner_type: str, owner_id: str):
 
 
 def _resolve_material_type(code: str, owner_type: str) -> MaterialType:
-    """类型必须存在于 material_type 表且启用且归属匹配（applies_to 支持 PERSON,TEAM 双归属；空表 → 409 明确报错）。"""
+    """类型必须存在于 material_type 表且启用且归属匹配（applies_to 支持
+    PERSON,TEAM 双归属；空表 → 400 明确报错）。
+
+    2026-10-29 问题⑥裁定：类型不存在/停用/归属不匹配属于请求引用了
+    无效的类型字典项（配置/参数错误），语义为 400 INVALID_ARGUMENT，
+    不再使用 409 STATE_CONFLICT（409 保留给真实资源状态冲突）。
+    """
     mtype = MaterialType.objects.filter(code=code).first()
     if mtype is None:
         raise ApiError(
-            STATE_CONFLICT,
+            INVALID_ARGUMENT,
             f"材料类型 {code} 不存在：类型字典尚未初始化，暂无法受理材料创建",
         )
     if not mtype.is_active:
-        raise ApiError(STATE_CONFLICT, f"材料类型 {code} 已停用")
+        raise ApiError(INVALID_ARGUMENT, f"材料类型 {code} 已停用")
     if owner_type not in [p.strip() for p in mtype.applies_to.split(",") if p.strip()]:
-        raise ApiError(STATE_CONFLICT, f"材料类型 {code} 不适用于 {owner_type} 归属")
+        raise ApiError(INVALID_ARGUMENT, f"材料类型 {code} 不适用于 {owner_type} 归属")
     return mtype
 
 
