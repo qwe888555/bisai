@@ -204,9 +204,32 @@ def create_invitation(actor: Account, data: dict) -> dict[str, Any]:
         try:
             person = Person.objects.filter(pk=person_id, is_deleted=False).first()
         except (TypeError, ValueError):
-            # personId 允许是尚未落库的占位值；此时只校验组织类型
             person = None
+        if person is None:
+            raise ApiError(
+                INVALID_ARGUMENT,
+                "人员档案不存在",
+                [{"field": "personId", "reason": "请先在人员管理中建档"}],
+            )
     _ensure_invitation_org(org, person)
+    if person is not None:
+        # 一个人员只能绑定一个账号，也不能同时持有两张可用邀请
+        if Account.objects.filter(person_id=str(person.pk)).exists():
+            raise ApiError(
+                DUPLICATE_RESOURCE,
+                "该人员已绑定账号",
+                [{"field": "personId", "reason": "一个人员只能绑定一个账号"}],
+            )
+        if RegistrationInvitation.objects.filter(
+            person_id=str(person.pk),
+            used_at__isnull=True,
+            expires_at__gt=timezone.now(),
+        ).exists():
+            raise ApiError(
+                DUPLICATE_RESOURCE,
+                "该人员已有未使用的邀请",
+                [{"field": "personId", "reason": "请使用已签发凭证或等待过期"}],
+            )
     minutes = int(data.get("expiresInMinutes") or 1440)
     # 凭证明文为 32 字节随机数，只在签发响应里返回一次，库里只存哈希
     plain_token = secrets.token_hex(32)

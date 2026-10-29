@@ -362,13 +362,30 @@ class ApiSmokeTests(TestCase):
         self.assertEqual(body(conflict)["code"], "INVALID_ARGUMENT")
 
     def test_person_can_bind_only_one_account(self):
+        from apps.common import crypto
+        from apps.persons.models import Person, School
+
+        school = School.objects.get(code="SCH001")
+
+        def make_person(person_no: str, id_number: str) -> Person:
+            return Person.objects.create(
+                person_no=person_no,
+                full_name="绑定人员A",
+                id_card_cipher=crypto.encrypt_text(id_number),
+                id_card_hash=crypto.lookup_hash(id_number),
+                id_card_masked=crypto.mask_id_number(id_number),
+                person_category="ATHLETE",
+                school=school,
+            )
+
+        person = make_person("P202699999901", "110101200001010011")
         token = self.login()
         first = {
             "username": "athlete_bound_a",
             "displayName": "绑定人员A",
             "roles": ["ATHLETE"],
             "orgId": "org_school_01",
-            "personId": "person_bind_demo",
+            "personId": str(person.pk),
         }
         self.assertEqual(self.post("/accounts", first, token).status_code, 200)
 
@@ -383,24 +400,40 @@ class ApiSmokeTests(TestCase):
             {
                 "kind": "ATHLETE",
                 "orgId": "org_school_01",
-                "personId": "person_bind_demo",
+                "personId": str(person.pk),
             },
             token,
         )
-        self.assertEqual(invite.status_code, 200, invite.content)
-        register_token = body(invite)["data"]["registrationToken"]
-        registered = self.post(
-            "/auth/registrations",
+        self.assertEqual(invite.status_code, 409, invite.content)
+        self.assertEqual(body(invite)["code"], "DUPLICATE_RESOURCE")
+
+        # 未建档的 personId 直接拒绝，不再用占位值建凭证
+        missing = self.post(
+            "/accounts/registration-invitations",
             {
-                "registrationToken": register_token,
-                "username": "athlete_invited",
-                "password": "Invited@2026",
-                "realName": "受邀人员",
-                "idNumber": "110101200001010011",
+                "kind": "ATHLETE",
+                "orgId": "org_school_01",
+                "personId": "person_bind_missing",
             },
+            token,
         )
-        self.assertEqual(registered.status_code, 409, registered.content)
-        self.assertEqual(body(registered)["code"], "DUPLICATE_RESOURCE")
+        self.assertEqual(missing.status_code, 400, missing.content)
+        self.assertEqual(body(missing)["code"], "INVALID_ARGUMENT")
+
+        # 同一个人不能同时持有一张以上可用邀请
+        fresh = make_person("P202699999902", "11010120000101002X")
+        payload = {
+            "kind": "ATHLETE",
+            "orgId": "org_school_01",
+            "personId": str(fresh.pk),
+        }
+        self.assertEqual(
+            self.post("/accounts/registration-invitations", payload, token).status_code,
+            200,
+        )
+        again = self.post("/accounts/registration-invitations", payload, token)
+        self.assertEqual(again.status_code, 409, again.content)
+        self.assertEqual(body(again)["code"], "DUPLICATE_RESOURCE")
 
     def test_bad_extension_is_415(self):
         from django.core.files.uploadedfile import SimpleUploadedFile
