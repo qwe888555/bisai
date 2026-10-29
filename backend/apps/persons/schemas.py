@@ -47,8 +47,14 @@ class SchoolCreate(StrictSchema):
     isActive: bool = True
 
 
-class SchoolUpdate(SchoolCreate):
-    """学校修改（PUT 全量替换）；school 的 code 允许修改（可空唯一）。"""
+class SchoolUpdate(StrictSchema):
+    """学校修改（PUT 全量替换可变字段）；code 创建后禁改（稳定编码，A′ 组织绑定）。"""
+
+    name: str = Field(min_length=1, max_length=100)
+    schoolType: str = Field(min_length=1, max_length=20)
+    regionId: int = Field(ge=1, description="所属区县")
+    address: Optional[str] = Field(default=None, max_length=200)
+    isActive: bool = True
 
 
 class DictTypeCreate(StrictSchema):
@@ -151,6 +157,19 @@ class PersonSearchBody(StrictSchema):
     keyword: str = Field(min_length=1, max_length=50)
 
 
+class PersonReviewBody(StrictSchema):
+    """审核档案（POST /people/{id}/review，P0-2）：decision APPROVE/REJECT →
+    audit_status APPROVED/REJECTED，与材料域 MaterialReviewBody 同构。
+
+    仅 PENDING 可处理（服务层状态机）；REJECT 必填 reason（同材料域口径）；
+    version 必填乐观锁。审核留痕复用既有 PersonChangeLog（change_type=AUDIT），
+    不新增模型/迁移。"""
+
+    decision: Literal["APPROVE", "REJECT"]
+    reason: Optional[str] = Field(None, max_length=200, description="REJECT 时必填")
+    version: int = Field(ge=0)
+
+
 class DossierSearchBody(StrictSchema):
     """POST /selection-dossiers/search 请求体（接口文档 §6.8 dossierSearch + §7 DossierSearch）。
 
@@ -194,10 +213,14 @@ def person_version(person) -> int:
 class PersonCreate(StrictSchema):
     """POST /people 创建（契约对齐 PeopleManageView 新建表单 + 文档 §6.5）。
 
-    - kinds：方案A 一期单类别（2026-10-24 用户决策）——schema 限项数=1，
-      多类别/空值直接 400，不静默取首值或丢弃；
-    - education / coachCategory：前端表单会提交（PeopleManageView L130-131），
-      为避免 extra=forbid 拦截 400 阻断保存而**声明但不持久化**（承载方案待定）；
+    - kinds：方案C 双类别（2026-10-24 用户决策：前端多选为准，扩展档案行承载）
+      ——schema 限 1-2 项；person_category 存首项主类别，按类别建扩展档案行
+      （行存在性=类别事实源）；重复项/空值/非法值 400，不静默取首值或丢弃；
+    - education：**E1 已持久化**（2026-10-27 组长批准加列 Person.education，
+      可选自由文本 max_length=100，创建/更新/回显全链生效）；
+    - coachCategory：前端表单会提交（PeopleManageView L130-131），
+      为避免 extra=forbid 拦截 400 阻断保存而**声明但不持久化**
+      （正式字典 E2 待签发，存储语义未定，不得猜测映射，2026-10-28 恢复原口径）。
     - idNumber/phone 只写不回显，服务端加密+查重索引；一期创建服务层强制
       要求 idNumber（冻结 id_card_hash 无 NULL 且全局唯一含软删行，无证件
       档案最多只能存在一条空串行，与文档"可选"冲突，已列待确认）。
@@ -222,8 +245,9 @@ class PersonUpdate(StrictSchema):
 
     - version 必填：乐观锁（updated_at UTC 微秒派生，B4 已验证方案）；
     - 必填字段（kinds/realName/gender/birthDate）全量替换；可选字段
-      （phone/schoolOrgId/avatarFileId）未传=保留原值——编辑表单无手机号输入，
-      缺省清空会造成静默数据丢失（实现口径在案，非全量清空）；
+      （phone/schoolOrgId/avatarFileId/education）未传=保留原值——编辑表单
+      无手机号输入，缺省清空会造成静默数据丢失（实现口径在案）；
+      education 传值（含空串）= 覆盖写入（表单有输入框，可主动清空）；
     - idNumber 不接受：身份证变更走更正流程（文档 §9 待确认），一期不开放。
     """
 
@@ -247,15 +271,19 @@ class MyProfileUpdate(StrictSchema):
       缺失/非法 → 400 INVALID_ARGUMENT 统一校验错误；不匹配 → 409 VERSION_CONFLICT）；
     - kinds/schoolOrgId/phone/idNumber/avatarFileId 不接受：身份、归属、联系方式与
       证件属管理员/更正链路（页面声明"身份证号与手机号需通过管理员复核后变更"）；
-    - schoolName/education/coachCategory：前端提交但冻结模型无对应持久列
-      （D2 在案）——接受不持久化不回显，不虚构成功（回显为空=预期非缺陷）；
+    - schoolName：**不再接受**（批次 A 2026-10-28 用户批准）——school 关系
+      派生展示字段，本人端不开放归属变更（E1 口径），提交即 400
+      INVALID_ARGUMENT（extra_forbidden）；响应仍按实际归属派生回显；
+    - coachCategory：声明不持久化（正式字典 E2 待签发，不得猜测映射，
+      2026-10-28 恢复原口径）；
+    - education：**E1 已持久化**（可选自由文本 max_length=100，未传=保留
+      原值，传值覆盖，回显真实列值）。
     - birthDate 与 /people 写链同为全量替换语义（缺省=清空）。
     """
 
     realName: str = Field(min_length=1, max_length=100)
     gender: Optional[str] = Field(None, max_length=20)
     birthDate: Optional[date] = None
-    schoolName: Optional[str] = Field(None, max_length=100)
     education: Optional[str] = Field(None, max_length=100)
     coachCategory: Optional[str] = Field(None, max_length=64)
     version: int = Field(ge=0)
@@ -339,7 +367,8 @@ def person_out(person) -> dict:
       "教练等级"，与前端 coachCategory"教练类别"无法确认同一，字典清单（成员5）
       未交付前停止输出该映射，避免错误值进入前端表单；前端字段为可选，读取侧
       取不到即 undefined（编辑表单该项显示为空），无解析错误；
-    - education：冻结无承载列，不输出（承载方案待决策，见核查报告）；
+    - education：**E1 输出真实列值**（Person.education，可选自由文本；
+      创建未传 → None，本人端/管理端更新后回显持久化结果）；
     - avatarUrl：mock 发明的公开直链，违反"附件禁止公开直链"基线，不输出；
       头像正式字段=avatarFileId ← photo_file_id，展示走受控下载 /files/{id}/content；
     - reviewStatus 直出 audit_status（冻结含 DRAFT，前端类型未定义该值）。
@@ -359,6 +388,7 @@ def person_out(person) -> dict:
         "birthDate": person.birth_date.isoformat() if person.birth_date else None,
         "schoolOrgId": _school_org_id_out(person),
         "schoolName": person.school.name if person.school_id else None,
+        "education": person.education,
         "teamName": getattr(person, "team_name_val", None),
         "avatarFileId": person.photo_file_id,
         "reviewStatus": person.audit_status,

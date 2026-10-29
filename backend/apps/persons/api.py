@@ -25,7 +25,7 @@ from apps.common.errors import (
     field_errors,
 )
 from apps.common.middleware import audit_state
-from apps.common.pagination import paginate, paginate_list
+from apps.common.pagination import paginate, paginate_list, read_page_params
 from apps.common.permissions import (
     ADMIN,
     ALL_ROLES,
@@ -415,12 +415,33 @@ def people_list(
     keyword: Optional[str] = None,
     kind: Optional[str] = None,
     reviewStatus: Optional[str] = None,
+    coachDuty: Optional[str] = None,
 ):
+    """D-CAT：coachDuty 按现役任职筛选（任一命中返回一次）；列表项附带
+    coachDuties（现役岗位集合，去重枚举序，无现役任职=空数组）。
+
+    coachDuties 仅注入本列表响应：person_out 为详情/本人档案共用映射，
+    本批不扩展其输出（边界：详情与个人资料响应不变）。
+    """
     account = require("personList")
     queryset = services.list_people(
-        {"keyword": keyword, "kind": kind, "reviewStatus": reviewStatus}, account
+        {
+            "keyword": keyword,
+            "kind": kind,
+            "reviewStatus": reviewStatus,
+            "coachDuty": coachDuty,
+        },
+        account,
     )
-    return paginate(request, queryset, mapper=s.person_out)
+    page_number, page_size = read_page_params(request)
+    total = queryset.count()
+    rows = list(queryset[(page_number - 1) * page_size : page_number * page_size])
+    duties = services.coach_duties_map([row.pk for row in rows])
+    items = [
+        {**s.person_out(row), "coachDuties": duties.get(row.pk, [])}
+        for row in rows
+    ]
+    return page(items, page_number, page_size, total)
 
 
 @router.post(
@@ -446,6 +467,30 @@ def people_search(request, body: s.PersonSearchBody):
 def people_get(request, person_id: str):
     account = require("personGet")
     return ok(s.person_out(services.get_person(person_id, account)))
+
+
+# P0-2（2026-10-28）：学校端档案审核。学校端是人员资格与履历的最终审核方
+# （统一业务规则），权限点口径对齐 D1：仅 UNIVERSITY，ADMIN 不因数据范围
+# 获得审核权，CITY/PROVINCE_REVIEWER 只审报名，TEAM 维护权限≠审核权限。
+# 数据范围在服务层按本校组织子树过滤（同材料域 D1/D5 口径）；
+# 留痕复用 PersonChangeLog（change_type=AUDIT），不新增模型/迁移。
+register_operation("personReview", (UNIVERSITY,))
+
+
+@router.post(
+    "/people/{person_id}/review", auth=_auth, response=EnvelopeOut, summary="审核人员档案"
+)
+def people_review(request, person_id: str, body: s.PersonReviewBody):
+    account = require("personReview")
+    person = services.review_person(person_id, body.model_dump(), account)
+    audit_state(
+        request,
+        "person.review",
+        object_type="Person",
+        object_id=str(person.pk),
+        summary=f"审核人员 {person.full_name}：{body.decision}",
+    )
+    return ok(s.person_out(person))
 
 
 # 写操作仅 ADMIN（PeopleManageView 为管理端页面；学校端可否创建人员待确认④）
@@ -512,8 +557,10 @@ def people_delete(request, person_id: str, version: Optional[int] = Query(None, 
 # GET：自读对象=服务端账号 person_id 绑定档案，无客户端传入 id，无数据范围歧义。
 # PUT（2026-10-24 用户裁定）：version 必填乐观锁（缺失/非法=400 统一校验错误，
 # 不匹配=409 VERSION_CONFLICT）；字段集=MyProfileUpdate（前端实际提交集），
-# 身份/归属/联系方式/证件不在本人可改集；schoolName/education/coachCategory
-# 接受不持久化（D2 在案，遗留问题清单在档）。
+# 身份/归属/联系方式/证件不在本人可改集；education 已持久化（E1）；
+# schoolName 不再接受——提交即 400 INVALID_ARGUMENT（批次 A 2026-10-28
+# 用户批准，静默忽略已消除）；coachCategory 声明不持久化（D2 在案，
+# 2026-10-28 恢复原口径，E2 待签发）。
 register_operation("myProfileGet", (ATHLETE, COACH))
 register_operation("myProfileUpdate", (ATHLETE, COACH))
 

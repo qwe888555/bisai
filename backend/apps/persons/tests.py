@@ -313,13 +313,13 @@ class BaseDataApiTests(TestCase):
         resp = self._put(
             f"{BASE}/schools/{data['id']}",
             {"name": "庚一小改", "schoolType": "JUNIOR", "regionId": county["id"],
-             "address": "yy路2号", "code": "SCH001", "isActive": True},
+             "address": "yy路2号", "isActive": True},
             token=self.admin_token,
         )
         self.assertEqual(resp.status_code, 200)
         data = resp.json()["data"]
         self.assertEqual(data["schoolType"], "JUNIOR")
-        self.assertEqual(data["code"], "SCH001")
+        self.assertIsNone(data["code"])
 
     def test_school_validation_errors(self):
         _, _, county = self._region_tree()
@@ -389,21 +389,47 @@ class BaseDataApiTests(TestCase):
             {"name": "乙校", "schoolType": "PRIMARY", "regionId": county["id"],
              "code": "SCH201"}
         )
+        # 更新为他人校名：(name, region) 唯一冲突
         resp = self._put(
             f"{BASE}/schools/{second['id']}",
-            {"name": "乙校", "schoolType": "PRIMARY", "regionId": county["id"],
-             "code": "SCH200"},
+            {"name": "甲校", "schoolType": "PRIMARY", "regionId": county["id"]},
             token=self.admin_token,
         )
         self.assertEqual(resp.status_code, 409)
 
+        # 保持自身校名（排除自身）；请求不含 code（编码创建后禁改），正常更新
         resp = self._put(
             f"{BASE}/schools/{second['id']}",
-            {"name": "乙校改", "schoolType": "PRIMARY", "regionId": county["id"],
-             "code": "SCH201"},
+            {"name": "乙校", "schoolType": "PRIMARY", "regionId": county["id"]},
             token=self.admin_token,
         )
         self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["data"]["code"], "SCH201")
+
+    def test_school_update_code_immutable(self):
+        _, _, county = self._region_tree()
+        data = self._create_school(
+            {"name": "稳码校", "schoolType": "PRIMARY", "regionId": county["id"],
+             "code": "SCH300"}
+        )
+        # 试图通过更新修改编码：StrictSchema extra=forbid → 400 INVALID_ARGUMENT
+        resp = self._put(
+            f"{BASE}/schools/{data['id']}",
+            {"name": "稳码校", "schoolType": "PRIMARY", "regionId": county["id"],
+             "code": "SCH301"},
+            token=self.admin_token,
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(School.objects.get(pk=data["id"]).code, "SCH300")
+
+        # 编码未变化的正常更新不受影响
+        resp = self._put(
+            f"{BASE}/schools/{data['id']}",
+            {"name": "稳码校改", "schoolType": "JUNIOR", "regionId": county["id"]},
+            token=self.admin_token,
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["data"]["code"], "SCH300")
 
     def test_school_disable_and_list_filters(self):
         _, _, county = self._region_tree()
@@ -623,6 +649,167 @@ class BaseDataApiTests(TestCase):
         )
 
 
+class PersonCoachDutiesTests(TestCase):
+    """D-CAT：人员列表 coachDuties 聚合与 coachDuty 现役任职筛选。
+
+    规则（2026-10-28 负责人确认）：岗位类别=TeamCoach 任职关系（六值 duty）；
+    列表汇总 status=CURRENT 的 duty 去重并列展示；筛选任一现役任职命中即
+    返回该人员一次；EXITED 不参与展示与筛选；coachDuties 仅注入列表响应。
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.admin = Account.objects.create(
+            id=new_account_id(),
+            username="duties-admin",
+            display_name="岗位列表管理员",
+            roles=["ADMIN"],
+            password=make_password("admin-pass-123"),
+            enabled=True,
+        )
+        cls.admin_token = issue_access_token(cls.admin)[0]
+
+        # 多岗教练：队1 HEAD_COACH、队2 GOALKEEPER_COACH、队3 HEAD_COACH（同人
+        # 两处现役 HEAD，验证筛选去重）、队4 FITNESS_COACH 已退出（EXITED 不参与）
+        cls.multi_coach = Person.objects.create(
+            person_no="P202600000011",
+            full_name="王多岗",
+            id_card_cipher=encrypt_text("110101198201023456"),
+            id_card_hash=lookup_hash("110101198201023456"),
+            id_card_masked=mask_id_number("110101198201023456"),
+            person_category=enums.PersonCategory.COACH,
+            audit_status=enums.AuditStatus.APPROVED,
+        )
+        CoachProfile.objects.create(person=cls.multi_coach)
+        # 无现役任职教练（刚建档未入队）
+        cls.free_coach = Person.objects.create(
+            person_no="P202600000012",
+            full_name="赵未任职",
+            id_card_cipher=encrypt_text("110101198303034567"),
+            id_card_hash=lookup_hash("110101198303034567"),
+            id_card_masked=mask_id_number("110101198303034567"),
+            person_category=enums.PersonCategory.COACH,
+            audit_status=enums.AuditStatus.APPROVED,
+        )
+        CoachProfile.objects.create(person=cls.free_coach)
+
+        teams = [
+            Team.objects.create(
+                team_no=f"T20260000001{i}",
+                name=f"岗位测试队{i}",
+                category_code="U12",
+            )
+            for i in range(1, 5)
+        ]
+        TeamCoach.objects.create(
+            team=teams[0],
+            person=cls.multi_coach,
+            duty=enums.CoachDuty.HEAD_COACH,
+            joined_at=date(2026, 1, 1),
+        )
+        TeamCoach.objects.create(
+            team=teams[1],
+            person=cls.multi_coach,
+            duty=enums.CoachDuty.GOALKEEPER_COACH,
+            joined_at=date(2026, 1, 2),
+        )
+        TeamCoach.objects.create(
+            team=teams[2],
+            person=cls.multi_coach,
+            duty=enums.CoachDuty.HEAD_COACH,
+            joined_at=date(2026, 1, 3),
+        )
+        TeamCoach.objects.create(
+            team=teams[3],
+            person=cls.multi_coach,
+            duty=enums.CoachDuty.FITNESS_COACH,
+            status=enums.RelationStatus.EXITED,
+            joined_at=date(2025, 1, 1),
+        )
+
+    @staticmethod
+    def _auth(token):
+        return {"HTTP_AUTHORIZATION": f"Bearer {token}"} if token else {}
+
+    def _get(self, path, token=None, query=None):
+        return self.client.get(path, data=query or {}, **self._auth(token))
+
+    def _list_items(self, query=None):
+        resp = self._get(PEOPLE, token=self.admin_token, query=query)
+        self.assertEqual(resp.status_code, 200)
+        return resp.json()["data"]
+
+    def test_list_coach_duties_aggregated_deduped_in_enum_order(self):
+        data = self._list_items()
+        rows = {row["realName"]: row for row in data["items"]}
+        # 两处现役 HEAD_COACH 去重为一项；枚举序输出（HEAD 在 GOALKEEPER 前）
+        self.assertEqual(
+            rows["王多岗"]["coachDuties"],
+            ["HEAD_COACH", "GOALKEEPER_COACH"],
+        )
+        # 无现役任职教练 → 空数组（非缺键）
+        self.assertEqual(rows["赵未任职"]["coachDuties"], [])
+
+    def test_list_coach_duty_filter_hits_any_current_duty_once(self):
+        # 任一现役任职命中即返回一次：王多岗在两队任 HEAD_COACH，total 仍为 1
+        data = self._list_items({"coachDuty": "HEAD_COACH"})
+        self.assertEqual(data["total"], 1)
+        self.assertEqual(data["items"][0]["realName"], "王多岗")
+
+        data = self._list_items({"coachDuty": "GOALKEEPER_COACH"})
+        self.assertEqual(data["total"], 1)
+        self.assertEqual(data["items"][0]["realName"], "王多岗")
+
+        # 无现役任职的教练不被任何类别命中
+        data = self._list_items({"coachDuty": "ASSISTANT_COACH"})
+        self.assertEqual(data["total"], 0)
+
+    def test_list_coach_duty_filter_excludes_exited_history(self):
+        # EXITED 的 FITNESS_COACH 不参与筛选与展示
+        data = self._list_items({"coachDuty": "FITNESS_COACH"})
+        self.assertEqual(data["total"], 0)
+        data = self._list_items()
+        rows = {row["realName"]: row for row in data["items"]}
+        self.assertNotIn("FITNESS_COACH", rows["王多岗"]["coachDuties"])
+
+    def test_list_coach_duty_invalid_value_rejected_400(self):
+        resp = self._get(PEOPLE, token=self.admin_token, query={"coachDuty": "BOGUS"})
+        self.assertEqual(resp.status_code, 400)
+        body = resp.json()
+        self.assertEqual(body["code"], "INVALID_ARGUMENT")
+
+    def test_list_coach_duties_not_leaked_into_detail_response(self):
+        # coachDuties 仅注入列表响应：详情/本人档案共用 person_out 不含该键
+        resp = self._get(f"{PEOPLE}/{self.multi_coach.pk}", token=self.admin_token)
+        self.assertEqual(resp.status_code, 200)
+        self.assertNotIn("coachDuties", resp.json()["data"])
+
+    def test_teamcoach_duty_six_values_and_duty_other_column(self):
+        # D-CAT 六值枚举可落库；duty_other 列可空、可存 OTHER 补充说明
+        # （强制校验"OTHER 必填≤50字、非 OTHER 必须为空"随教练任职服务落地）
+        team = Team.objects.create(
+            team_no="T202600000015", name="六值验证队", category_code="U12"
+        )
+        row = TeamCoach.objects.create(
+            team=team,
+            person=self.free_coach,
+            duty=enums.CoachDuty.OTHER,
+            duty_other="外聘顾问兼任",
+            joined_at=date(2026, 2, 1),
+        )
+        row.refresh_from_db()
+        self.assertEqual(row.duty, "OTHER")
+        self.assertEqual(row.duty_other, "外聘顾问兼任")
+        self.assertIsNone(
+            TeamCoach.objects.create(
+                team=team,
+                person=self.multi_coach,
+                duty=enums.CoachDuty.FITNESS_COACH,
+                joined_at=date(2026, 2, 2),
+            ).duty_other
+        )
+
+
 class PeopleApiTests(TestCase):
     """人员主档查询链（GET /people、POST /people/search、GET /people/{id}）。
 
@@ -765,7 +952,7 @@ class PeopleApiTests(TestCase):
         self.assertEqual(athlete_row["schoolName"], "甲一小")
         self.assertEqual(athlete_row["teamName"], "甲一队")
         self.assertIsNone(athlete_row["maskedPhone"])
-        self.assertNotIn("education", athlete_row)
+        self.assertIsNone(athlete_row["education"])  # E1：education 输出真实列值（创建未传 → None）
         self.assertNotIn("avatarUrl", athlete_row)
 
     def test_list_filters_kind_keyword_review_status(self):
@@ -997,6 +1184,41 @@ class PeopleWriteApiTests(TestCase):
             ).exists()
         )
 
+    # ------------------------------------- 契约测试：coachCategory（2026-10-28 口径）
+
+    def test_create_coach_category_accepted_not_echoed_no_level_write(self):
+        """契约：创建链接受 coachCategory（静默不持久化），响应不输出，
+        CoachProfile 正常创建且 coach_level 保持默认 NULL（无任何映射写入）。"""
+        data, person = self._create(
+            kinds=["COACH"], realName="类别教练", coachCategory="主教练"
+        )
+        self.assertNotIn("coachCategory", data)  # 响应不输出（2026-10-24 决策）
+        profile = CoachProfile.objects.get(person=person)  # COACH 档案行正常创建
+        self.assertIsNone(profile.coach_level)  # 请求字段未被映射写入
+
+    def test_update_coach_category_accepted_no_coach_level_write(self):
+        """契约：更新链提交 coachCategory → 合法字段正常更新、响应不输出、
+        coach_level 未被本次请求写入。"""
+        from apps.persons.schemas import person_version
+
+        _, person = self._create(kinds=["COACH"], realName="教练更新")
+        resp = self._put(
+            person.pk,
+            {
+                "kinds": ["COACH"],
+                "realName": "教练改名单",
+                "coachCategory": "主教练",
+                "version": person_version(person),
+            },
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        data = resp.json()["data"]
+        self.assertNotIn("coachCategory", data)
+        person.refresh_from_db()
+        self.assertEqual(person.full_name, "教练改名单")  # 合法字段正常生效
+        profile = CoachProfile.objects.get(person=person)
+        self.assertIsNone(profile.coach_level)  # 数据库未被写入
+
     def test_create_dual_kind_creates_both_profiles(self):
         """方案C（前端多选为准）：双类别经扩展档案行承载，不静默丢弃。"""
         resp = self._post(
@@ -1093,6 +1315,97 @@ class PeopleWriteApiTests(TestCase):
         self.assertEqual(resp.status_code, 403)
         self.assertEqual(resp.json()["code"], "FORBIDDEN")
 
+    # -------------------------------------------- 批次 A：schoolName 明确拒绝
+    #（coachCategory 已恢复原口径：声明不持久化，提交静默忽略，见上方 E1 用例）
+
+    def test_create_school_name_rejected_400(self):
+        """批次 A：管理端契约本就不接受 schoolName 直写（归属走 schoolOrgId），
+        extra=forbid 统一 400，字段可定位，不建人。"""
+        before = Person.objects.count()
+        resp = self._post(
+            {
+                "kinds": ["ATHLETE"],
+                "realName": "归属拒绝",
+                "idNumber": self.ID_CARD,
+                "schoolName": "乙一小",
+            }
+        )
+        self.assertEqual(resp.status_code, 400, resp.content)
+        body = resp.json()
+        self.assertEqual(body["code"], "INVALID_ARGUMENT")
+        self.assertIn("schoolName", json.dumps(body.get("data") or {}))
+        self.assertEqual(Person.objects.count(), before)  # 无部分写入
+
+    def test_update_school_name_rejected_400(self):
+        """契约：管理端更新链同样不接受 schoolName 直写（归属只走 schoolOrgId）。"""
+        _, person = self._create()
+        from apps.persons.schemas import person_version
+
+        resp = self._put(
+            person.pk,
+            {
+                "kinds": ["ATHLETE"],
+                "realName": "王测试",
+                "schoolName": "乙一小",
+                "version": person_version(person),
+            },
+        )
+        self.assertEqual(resp.status_code, 400, resp.content)
+        body = resp.json()
+        self.assertEqual(body["code"], "INVALID_ARGUMENT")
+        self.assertIn("schoolName", json.dumps(body.get("data") or {}))
+        person.refresh_from_db()
+        self.assertEqual(person.full_name, "王测试")  # 姓名未变
+        self.assertEqual(person.school.code, "SCH-810100-201")  # 归属未变
+
+    def test_create_mixed_payload_rejected_no_person_created(self):
+        """批次 A：合法字段 + schoolName 混合 → 整单 400，education 也不得写入。"""
+        before = Person.objects.count()
+        resp = self._post(
+            {
+                "kinds": ["ATHLETE"],
+                "realName": "混合创建",
+                "idNumber": self.ID_CARD,
+                "schoolOrgId": str(self.org_school.pk),
+                "education": "本科",
+                "schoolName": "乙一小",
+            }
+        )
+        self.assertEqual(resp.status_code, 400, resp.content)
+        self.assertEqual(resp.json()["code"], "INVALID_ARGUMENT")
+        self.assertIn("schoolName", json.dumps(resp.json().get("data") or {}))
+        self.assertEqual(Person.objects.count(), before)
+
+    def test_update_mixed_payload_rejected_without_partial_write(self):
+        """批次 A：合法变更(realName/education) + schoolName → 400 且零落库零留痕。"""
+        _, person = self._create()
+        from apps.persons.schemas import person_version
+
+        before_version = person_version(person)
+        logs_before = PersonChangeLog.objects.filter(person=person).count()
+        audit_before = AuditLog.objects.count()
+        resp = self._put(
+            person.pk,
+            {
+                "kinds": ["ATHLETE"],
+                "realName": "混合更新",
+                "education": "本科",
+                "schoolName": "乙一小",
+                "version": before_version,
+            },
+        )
+        self.assertEqual(resp.status_code, 400, resp.content)
+        self.assertEqual(resp.json()["code"], "INVALID_ARGUMENT")
+        self.assertIn("schoolName", json.dumps(resp.json().get("data") or {}))
+        person.refresh_from_db()
+        self.assertEqual(person.full_name, "王测试")  # 合法字段未写入
+        self.assertIsNone(person.education)
+        self.assertEqual(person_version(person), before_version)  # 版本未前进
+        self.assertEqual(
+            PersonChangeLog.objects.filter(person=person).count(), logs_before
+        )
+        self.assertEqual(AuditLog.objects.count(), audit_before)
+
     # ------------------------------------------------------------ 更新（乐观锁）
 
     def test_update_success_and_change_log(self):
@@ -1163,7 +1476,8 @@ class PeopleWriteApiTests(TestCase):
         person.refresh_from_db()
         self.assertEqual(person.full_name, "并发先写")  # 未被覆盖
 
-    def test_update_education_coach_category_accepted_not_persisted(self):
+    def test_update_education_persisted_and_read_back(self):
+        """E1：education 真实持久化——响应回显 + 数据库列读回；coachCategory 仍不输出。"""
         _, person = self._create()
         from apps.persons.schemas import person_version
 
@@ -1177,9 +1491,100 @@ class PeopleWriteApiTests(TestCase):
                 "version": person_version(person),
             },
         )
-        self.assertEqual(resp.status_code, 200)  # 声明但不持久化，不阻断保存
-        self.assertNotIn("education", resp.json()["data"])
-        self.assertNotIn("coachCategory", resp.json()["data"])
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertEqual(resp.json()["data"]["education"], "本科")
+        self.assertNotIn("coachCategory", resp.json()["data"])  # 字典未签发，仍不持久化不回显
+        person.refresh_from_db()
+        self.assertEqual(person.education, "本科")  # 数据库读回，非仅响应字段
+
+    def test_update_education_absent_keeps_value(self):
+        """E1：更新其他字段未传 education → 原值不丢失（缺省不清空）。"""
+        _, person = self._create(education="硕士")
+        from apps.persons.schemas import person_version
+
+        resp = self._put(
+            person.pk,
+            {
+                "kinds": ["ATHLETE"],
+                "realName": "王改名",
+                "version": person_version(person),
+            },
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        person.refresh_from_db()
+        self.assertEqual(person.education, "硕士")
+        self.assertEqual(resp.json()["data"]["education"], "硕士")
+
+    def test_update_education_blank_clears_value(self):
+        """E1：传空串 → 主动清空（表单有输入框，覆盖写入语义）。"""
+        _, person = self._create(education="硕士")
+        from apps.persons.schemas import person_version
+
+        resp = self._put(
+            person.pk,
+            {
+                "kinds": ["ATHLETE"],
+                "realName": "王清空",
+                "education": "  ",
+                "version": person_version(person),
+            },
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        person.refresh_from_db()
+        self.assertIsNone(person.education)
+        self.assertIsNone(resp.json()["data"]["education"])
+
+    def test_create_education_persisted_and_read_back(self):
+        """E1：创建链持久化 + GET 回显。"""
+        data, person = self._create(education="博士")
+        self.assertEqual(data["education"], "博士")
+        person.refresh_from_db()
+        self.assertEqual(person.education, "博士")
+        resp = self.client.get(
+            f"{PEOPLE}/{person.pk}", **self._auth(self.admin_token)
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["data"]["education"], "博士")
+
+    def test_update_education_too_long_rejected_no_write(self):
+        """E1：超过 100 字符 → 400 校验错误，数据库原值不变。"""
+        _, person = self._create(education="原值")
+        from apps.persons.schemas import person_version
+
+        resp = self._put(
+            person.pk,
+            {
+                "kinds": ["ATHLETE"],
+                "realName": "王超长",
+                "education": "长" * 101,
+                "version": person_version(person),
+            },
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.json()["code"], "INVALID_ARGUMENT")
+        person.refresh_from_db()
+        self.assertEqual(person.education, "原值")  # 未被写入
+
+    def test_update_person_non_admin_scope_denied(self):
+        """写链现状钉住：学校端账号（无组织绑定）更新人员 → 403 FORBIDDEN
+        （persons 写链权限点未授予学校端角色，A′ persons 域范围校验未落地；
+        权限点层即拒，不进入数据范围判断——不在本轮扩大范围）。"""
+        _, person = self._create()
+        from apps.persons.schemas import person_version
+
+        resp = self._put(
+            person.pk,
+            {
+                "kinds": ["ATHLETE"],
+                "realName": "越范围",
+                "version": person_version(person),
+            },
+            token=self.uni_token,
+        )
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json()["code"], "FORBIDDEN")
+        person.refresh_from_db()
+        self.assertEqual(person.full_name, "王测试")  # 未被写入
 
     # ------------------------------------------------------------ 删除（软删+乐观锁）
 
@@ -1376,6 +1781,653 @@ class PeopleWriteApiTests(TestCase):
                 SimpleUploadedFile("a.jpg", b"\xff\xd8\xff\xe0\x00\x10JFIF"),
             )
         self.assertEqual(ctx.exception.code, "FORBIDDEN")
+
+
+class PersonAdminScopeTests(TestCase):
+    """A′ 第一批：ADMIN 数据范围对齐（列表/搜索/详情/创建/转校/删除）。
+
+    口径：全局 ADMIN（无组织绑定）全库；挂组织 ADMIN 仅授权组织子树内
+    人员（Person.school ↔ Organization.code 真实映射）；幽灵/软删组织
+    绑定默认拒绝不退化全库；UNIVERSITY/TEAM/CITY 的 persons 域接口保持
+    拒绝。写测试断言数据库最终状态，不只看 HTTP 状态码。
+
+    组织树夹具：
+        ORG-PS(省,code=P-900) → ORG-CT(市,code=C-900100)
+            → ORG-SA(学校A,code=SCH-900100-301) / ORG-SA2(学校A2,code=SCH-900100-302)
+        ORG-PS → ORG-SB(学校B,code=SCH-900200-901，在市子树之外)
+        ORG-DEAD（软删组织，挂 ADMIN 用）
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        cls._account_seq = 0
+
+        def make_account(username, roles, org_id=None):
+            cls._account_seq += 1
+            return Account.objects.create(
+                id=new_account_id(),
+                username=username,
+                display_name=username,
+                roles=roles,
+                password=make_password("pass-123456"),
+                enabled=True,
+                organization_id=org_id,
+            )
+
+        cls.global_admin = make_account("scope-global-admin", ["ADMIN"])
+        cls.city_admin = make_account("scope-city-admin", ["ADMIN"], org_id="ORG-CT")
+        # 注："绑定不存在的组织"被 Account.organization 外键约束排除（DB 不可能状态），
+        # 不落库夹具；该边界以未保存实例的单元测试覆盖（见 test_nonexistent_org_binding_unit_denied）。
+        cls.dead_admin = make_account("scope-dead-admin", ["ADMIN"], org_id="ORG-DEAD")
+        cls.uni = make_account("scope-uni", ["UNIVERSITY"], org_id="ORG-SA")
+        cls.team_acct = make_account("scope-team", ["TEAM"], org_id="ORG-SA")
+        cls.city_acct = make_account("scope-city", ["CITY"], org_id="ORG-CT")
+        cls.global_token = issue_access_token(cls.global_admin)[0]
+        cls.scoped_admin_token = issue_access_token(cls.city_admin)[0]
+        cls.dead_token = issue_access_token(cls.dead_admin)[0]
+        cls.uni_token = issue_access_token(cls.uni)[0]
+        cls.team_token = issue_access_token(cls.team_acct)[0]
+        cls.city_token = issue_access_token(cls.city_acct)[0]
+
+        prov = Region.objects.create(name="范围省", code="900000", level=1)
+        city = Region.objects.create(
+            name="范围市", code="900100", level=2, parent=prov
+        )
+        prov2 = Region.objects.create(name="外省", code="902000", level=1)
+        cls.school_a = School.objects.create(
+            name="范围一小", code="SCH-900100-301", school_type="PRIMARY", region=city
+        )
+        school_a2 = School.objects.create(
+            name="范围二小", code="SCH-900100-302", school_type="PRIMARY", region=city
+        )
+        cls.school_a2 = school_a2
+        cls.school_b = School.objects.create(
+            name="界外中学", code="SCH-900200-901", school_type="JUNIOR", region=prov2
+        )
+        Organization.objects.create(
+            id="ORG-PS", code="P-900", name="范围省组织", org_type="PROVINCE"
+        )
+        Organization.objects.create(
+            id="ORG-CT", code="C-900100", name="范围市组织", org_type="CITY", parent_id="ORG-PS"
+        )
+        Organization.objects.create(
+            id="ORG-SA", code="SCH-900100-301", name="范围一小组织",
+            org_type="SCHOOL", parent_id="ORG-CT",
+        )
+        Organization.objects.create(
+            id="ORG-SA2", code="SCH-900100-302", name="范围二小组织",
+            org_type="SCHOOL", parent_id="ORG-CT",
+        )
+        Organization.objects.create(
+            id="ORG-SB", code="SCH-900200-901", name="界外中学组织",
+            org_type="SCHOOL", parent_id="ORG-PS",
+        )
+        Organization.objects.create(
+            id="ORG-DEAD", code="C-DEAD", name="已删组织", org_type="CITY", parent_id="ORG-PS"
+        )
+        # 软删组织绑定：模拟组织被删除后账号绑定未清理（幽灵绑定）
+        Organization.objects.filter(pk="ORG-DEAD").update(deleted_at=timezone.now())
+        cls.ORG_SA_ID = "ORG-SA"
+        cls.ORG_SA2_ID = "ORG-SA2"
+        cls.ORG_SB_ID = "ORG-SB"
+
+        def make_person(no, name, id_number, school):
+            return Person.objects.create(
+                person_no=f"P2026{no:08d}",
+                full_name=name,
+                id_card_cipher=encrypt_text(id_number),
+                id_card_hash=lookup_hash(id_number),
+                id_card_masked=mask_id_number(id_number),
+                person_category=enums.PersonCategory.ATHLETE,
+                audit_status=enums.AuditStatus.APPROVED,
+                school=school,
+            )
+
+        cls.p_a1 = make_person(1, "树内一", "110101201301011111", cls.school_a)
+        cls.p_a2 = make_person(2, "树内二", "110101201301012222", cls.school_a)
+        cls.p_a2school = make_person(3, "树内三", "110101201301013333", school_a2)
+        cls.p_b = make_person(4, "树外人", "110101201301014444", cls.school_b)
+        cls.p_none = make_person(5, "无校人", "110101201301015555", None)
+
+    @staticmethod
+    def _auth(token):
+        return {"HTTP_AUTHORIZATION": f"Bearer {token}"} if token else {}
+
+    def _get(self, path, token=None, query=None):
+        return self.client.get(path, data=query or {}, **self._auth(token))
+
+    def _post(self, path, payload, token=None):
+        return self.client.post(
+            path, data=json.dumps(payload), content_type="application/json",
+            **self._auth(token),
+        )
+
+    def _put(self, path, payload, token=None):
+        return self.client.put(
+            path, data=json.dumps(payload), content_type="application/json",
+            **self._auth(token),
+        )
+
+    def _delete(self, path, version=None, token=None):
+        if version is not None:
+            path = f"{path}?version={version}"
+        return self.client.delete(path, **self._auth(token))
+
+    def _create_payload(self, real_name, id_number, school_org_id="keep"):
+        payload = {
+            "kinds": ["ATHLETE"],
+            "realName": real_name,
+            "idNumber": id_number,
+        }
+        if school_org_id != "keep":
+            payload["schoolOrgId"] = school_org_id
+        return payload
+
+    # ------------------------------------------------------------ 列表/搜索
+
+    def test_global_admin_list_covers_all_persons(self):
+        resp = self._get(PEOPLE, token=self.global_token)
+        self.assertEqual(resp.status_code, 200)
+        names = {i["realName"] for i in resp.json()["data"]["items"]}
+        # 全库：树内、树外、无学校归属人员均可见
+        self.assertLessEqual({"树内一", "树内二", "树内三", "树外人", "无校人"}, names)
+
+    def test_scoped_admin_list_limited_to_subtree(self):
+        resp = self._get(PEOPLE, token=self.scoped_admin_token)
+        self.assertEqual(resp.status_code, 200)
+        names = {i["realName"] for i in resp.json()["data"]["items"]}
+        self.assertEqual(names, {"树内一", "树内二", "树内三"})
+        # 数据库不因过滤而改变：树外人员仍然存在，只是不可见
+        self.assertTrue(Person.objects.filter(pk=self.p_b.pk).exists())
+
+    def test_scoped_admin_search_limited_to_subtree(self):
+        resp = self._post(PEOPLE + "/search", {"keyword": "树"}, token=self.scoped_admin_token)
+        self.assertEqual(resp.status_code, 200)
+        names = {p["realName"] for p in resp.json()["data"]}
+        self.assertEqual(names, {"树内一", "树内二", "树内三"})
+
+    def test_scoped_admin_person_without_school_invisible(self):
+        # school=None 的人员对挂组织 ADMIN 不可见（deny-by-default），
+        # 全局 ADMIN 仍可见
+        resp = self._get(
+            PEOPLE, token=self.scoped_admin_token, query={"keyword": "无校人"}
+        )
+        self.assertEqual(resp.json()["data"]["total"], 0)
+        resp = self._get(PEOPLE, token=self.global_token, query={"keyword": "无校人"})
+        self.assertEqual(resp.json()["data"]["total"], 1)
+
+    # ------------------------------------------------------------ 详情
+
+    def test_scoped_admin_detail_in_tree_ok_out_of_tree_404(self):
+        resp = self._get(f"{PEOPLE}/{self.p_a1.pk}", token=self.scoped_admin_token)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["data"]["realName"], "树内一")
+        resp = self._get(f"{PEOPLE}/{self.p_b.pk}", token=self.scoped_admin_token)
+        self.assertEqual(resp.status_code, 404)
+        self.assertEqual(resp.json()["code"], "NOT_FOUND")
+
+    def test_global_admin_detail_out_of_tree_ok(self):
+        resp = self._get(f"{PEOPLE}/{self.p_b.pk}", token=self.global_token)
+        self.assertEqual(resp.status_code, 200)
+
+    # ------------------------------------------------------------ 创建
+
+    def test_scoped_admin_create_in_scope_ok(self):
+        resp = self._post(
+            PEOPLE,
+            self._create_payload("范围内新人", "110101201302011234", self.ORG_SA_ID),
+            token=self.scoped_admin_token,
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        person = Person.objects.get(full_name="范围内新人")
+        self.assertEqual(person.school_id, self.school_a.pk)
+
+    def test_scoped_admin_create_out_of_scope_403_no_partial_write(self):
+        before = Person.objects.count()
+        resp = self._post(
+            PEOPLE,
+            self._create_payload("越界新人", "110101201302021234", self.ORG_SB_ID),
+            token=self.scoped_admin_token,
+        )
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json()["code"], "DATA_SCOPE_DENIED")
+        self.assertEqual(Person.objects.count(), before)
+        self.assertFalse(Person.objects.filter(full_name="越界新人").exists())
+
+    def test_scoped_admin_create_without_school_403(self):
+        # 挂组织 ADMIN 创建必须指定范围内学校：school=None 落在子树之外
+        before = Person.objects.count()
+        resp = self._post(
+            PEOPLE, self._create_payload("无校新人", "110101201302031234", None),
+            token=self.scoped_admin_token,
+        )
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json()["code"], "DATA_SCOPE_DENIED")
+        self.assertEqual(Person.objects.count(), before)
+
+    def test_scoped_admin_create_unknown_org_403(self):
+        # schoolOrgId 指向不存在组织：范围校验先于解析 → DATA_SCOPE_DENIED
+        before = Person.objects.count()
+        resp = self._post(
+            PEOPLE,
+            self._create_payload("幽灵校新人", "110101201302041234", "999999"),
+            token=self.scoped_admin_token,
+        )
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json()["code"], "DATA_SCOPE_DENIED")
+        self.assertEqual(Person.objects.count(), before)
+
+    def test_global_admin_create_without_school_still_ok(self):
+        # 全局 ADMIN 保持原语义：schoolOrgId 可选
+        resp = self._post(
+            PEOPLE, self._create_payload("全局无校新人", "110101201302051234", None),
+            token=self.global_token,
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        person = Person.objects.get(full_name="全局无校新人")
+        self.assertIsNone(person.school_id)
+
+    # ------------------------------------------------------------ 转校
+
+    def test_scoped_admin_transfer_in_scope_ok(self):
+        from apps.persons.schemas import person_version
+
+        resp = self._put(
+            f"{PEOPLE}/{self.p_a1.pk}",
+            {
+                "kinds": ["ATHLETE"],
+                "realName": "树内一",
+                "schoolOrgId": self.ORG_SA2_ID,  # 市子树内另一所学校
+                "version": person_version(self.p_a1),
+            },
+            token=self.scoped_admin_token,
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.p_a1.refresh_from_db()
+        self.assertEqual(self.p_a1.school_id, self.school_a2.pk)
+
+    def test_scoped_admin_transfer_reflects_school_name_in_response(self):
+        """契约：转校成功后，响应与详情的 schoolName 均派生自实际学校关联。"""
+        from apps.persons.schemas import person_version
+
+        resp = self._put(
+            f"{PEOPLE}/{self.p_a1.pk}",
+            {
+                "kinds": ["ATHLETE"],
+                "realName": "树内一",
+                "schoolOrgId": self.ORG_SA2_ID,  # 市子树内另一所学校
+                "version": person_version(self.p_a1),
+            },
+            token=self.scoped_admin_token,
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertEqual(resp.json()["data"]["schoolName"], "范围二小")  # 更新响应跟随新归属
+        self.p_a1.refresh_from_db()
+        self.assertEqual(self.p_a1.school_id, self.school_a2.pk)  # DB 指向目标学校
+        detail = self._get(f"{PEOPLE}/{self.p_a1.pk}", token=self.scoped_admin_token)
+        self.assertEqual(detail.status_code, 200, detail.content)
+        self.assertEqual(detail.json()["data"]["schoolName"], "范围二小")  # 详情同源
+
+    def test_scoped_admin_transfer_out_of_scope_403_school_unchanged(self):
+        from apps.persons.schemas import person_version
+
+        resp = self._put(
+            f"{PEOPLE}/{self.p_a1.pk}",
+            {
+                "kinds": ["ATHLETE"],
+                "realName": "树内一",
+                "schoolOrgId": self.ORG_SB_ID,  # 市子树之外的学校
+                "version": person_version(self.p_a1),
+            },
+            token=self.scoped_admin_token,
+        )
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json()["code"], "DATA_SCOPE_DENIED")
+        self.p_a1.refresh_from_db()
+        self.assertEqual(self.p_a1.school_id, self.school_a.pk)  # 学校归属未变
+
+    def test_scoped_admin_update_without_schoolorgid_keeps_school(self):
+        # 未传 schoolOrgId：保持"不修改学校归属"语义，且不因范围校验被拒
+        from apps.persons.schemas import person_version
+
+        resp = self._put(
+            f"{PEOPLE}/{self.p_a1.pk}",
+            {
+                "kinds": ["ATHLETE"],
+                "realName": "树内一改名",
+                "version": person_version(self.p_a1),
+            },
+            token=self.scoped_admin_token,
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.p_a1.refresh_from_db()
+        self.assertEqual(self.p_a1.full_name, "树内一改名")
+        self.assertEqual(self.p_a1.school_id, self.school_a.pk)
+
+    # ------------------------------------------------------------ 删除
+
+    def test_scoped_admin_delete_in_tree_ok_out_of_tree_404(self):
+        from apps.persons.schemas import person_version
+
+        resp = self._delete(
+            f"{PEOPLE}/{self.p_a2school.pk}",
+            version=person_version(self.p_a2school),
+            token=self.scoped_admin_token,
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.p_a2school.refresh_from_db()
+        self.assertTrue(self.p_a2school.is_deleted)
+        resp = self._delete(
+            f"{PEOPLE}/{self.p_b.pk}",
+            version=person_version(self.p_b),
+            token=self.scoped_admin_token,
+        )
+        self.assertEqual(resp.status_code, 404)
+        self.p_b.refresh_from_db()
+        self.assertFalse(self.p_b.is_deleted)  # 树外人员未被删除
+
+    # ------------------------------------------------------------ 幽灵绑定
+
+    def test_nonexistent_org_binding_unit_denied(self):
+        """绑定不存在的组织（幽灵绑定）：默认拒绝，不得退化为全库。
+
+        Account.organization 为真实外键，"绑定不存在组织"在 DB 层不可能出现，
+        故以未保存 Account 实例直接验证 apply_person_scope：scope_org_codes
+        对该实例返回 []（空范围），在评估 queryset 前即抛 DATA_SCOPE_DENIED，
+        不产生任何落库（也无 FK 违例）。API 层可表达的幽灵绑定（组织已软删）
+        由 test_soft_deleted_binding_admin_denied_everywhere 覆盖。
+        """
+        from apps.common.errors import ApiError
+        from apps.persons.services import apply_person_scope
+
+        ghost = Account(organization_id="ORG-GHOST", roles=["ADMIN"])
+        with self.assertRaises(ApiError) as ctx:
+            apply_person_scope(Person.objects.all(), ghost)
+        self.assertEqual(ctx.exception.code, "DATA_SCOPE_DENIED")
+
+    def test_soft_deleted_binding_admin_denied_everywhere(self):
+        # 绑定已软删除的组织：同样默认拒绝
+        resp = self._get(PEOPLE, token=self.dead_token)
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json()["code"], "DATA_SCOPE_DENIED")
+        resp = self._post(
+            PEOPLE,
+            self._create_payload("死链管理员新人", "110101201302071234", self.ORG_SA_ID),
+            token=self.dead_token,
+        )
+        self.assertEqual(resp.status_code, 403)
+        self.assertFalse(Person.objects.filter(full_name="死链管理员新人").exists())
+
+    # ------------------------------------------------------------ 非 ADMIN 不变
+
+    def test_non_admin_roles_still_denied(self):
+        for token in (self.uni_token, self.team_token, self.city_token):
+            # 查询类权限点含 UNIVERSITY/CITY/TEAM → 落到数据范围层拒绝
+            resp = self._get(PEOPLE, token=token)
+            self.assertEqual(resp.status_code, 403)
+            self.assertEqual(resp.json()["code"], "DATA_SCOPE_DENIED")
+            # 写链权限点仅登记 ADMIN → 角色层即 FORBIDDEN（与既有
+            # test_create_forbidden_for_university 口径一致）
+            resp = self._post(
+                PEOPLE,
+                self._create_payload("非管理员新人", "110101201302081234", self.ORG_SA_ID),
+                token=token,
+            )
+            self.assertEqual(resp.status_code, 403)
+            self.assertEqual(resp.json()["code"], "FORBIDDEN")
+        self.assertFalse(Person.objects.filter(full_name="非管理员新人").exists())
+
+
+class PersonReviewTests(TestCase):
+    """P0-2（2026-10-28）：学校端档案审核 POST /people/{id}/review。
+
+    口径（统一业务规则 + D1 对齐）：
+    - 权限点 personReview 仅 UNIVERSITY（ADMIN 不因数据范围获得审核权，
+      CITY/PROVINCE_REVIEWER 只审报名，TEAM 维护≠审核）；
+    - 数据范围：UNIVERSITY 所属组织子树（Person.school.code 编码映射，
+      同材料域 D1/D5 口径），范围外 404 不泄露存在性；无有效组织范围 403；
+    - 状态机：仅 PENDING → APPROVED/REJECTED，其余 409；REJECT 必填 reason；
+    - 留痕：PersonChangeLog(change_type=AUDIT) 记 audit_status old/new 与
+      审核意见；changed_by 恒空（D4 待批）。
+    写测试断言数据库最终状态，不只看 HTTP 状态码。
+
+    组织树夹具（同 PersonAdminScopeTests 风格）：
+        ORG-RPS(省,P-950) → ORG-RCT(市,C-950100) → ORG-RSA(学校A,SCH-950100-401)
+        ORG-RPS → ORG-RSB(学校B,SCH-950200-402，市子树之外)
+        ORG-RDEAD（软删组织，幽灵绑定用）
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        def make_account(username, roles, org_id=None):
+            return Account.objects.create(
+                id=new_account_id(),
+                username=username,
+                display_name=username,
+                roles=roles,
+                password=make_password("pass-123456"),
+                enabled=True,
+                organization_id=org_id,
+            )
+
+        cls.uni_a = make_account("rv-uni-a", ["UNIVERSITY"], org_id="ORG-RSA")
+        cls.uni_dead = make_account("rv-uni-dead", ["UNIVERSITY"], org_id="ORG-RDEAD")
+        cls.admin = make_account("rv-admin", ["ADMIN"])
+        cls.city_acct = make_account("rv-city", ["CITY"], org_id="ORG-RCT")
+        cls.prov_acct = make_account("rv-prov", ["PROVINCE_REVIEWER"], org_id="ORG-RPS")
+        cls.team_acct = make_account("rv-team", ["TEAM"], org_id="ORG-RSA")
+        cls.uni_a_token = issue_access_token(cls.uni_a)[0]
+        cls.uni_dead_token = issue_access_token(cls.uni_dead)[0]
+        cls.admin_token = issue_access_token(cls.admin)[0]
+        cls.city_token = issue_access_token(cls.city_acct)[0]
+        cls.prov_token = issue_access_token(cls.prov_acct)[0]
+        cls.team_token = issue_access_token(cls.team_acct)[0]
+
+        prov = Region.objects.create(name="审核省", code="950000", level=1)
+        city = Region.objects.create(name="审核市", code="950100", level=2, parent=prov)
+        prov2 = Region.objects.create(name="审核界外省", code="952000", level=1)
+        cls.school_a = School.objects.create(
+            name="审核一小", code="SCH-950100-401", school_type="PRIMARY", region=city
+        )
+        cls.school_b = School.objects.create(
+            name="审核界外校", code="SCH-950200-402", school_type="JUNIOR", region=prov2
+        )
+        Organization.objects.create(
+            id="ORG-RPS", code="P-950", name="审核省组织", org_type="PROVINCE"
+        )
+        Organization.objects.create(
+            id="ORG-RCT", code="C-950100", name="审核市组织",
+            org_type="CITY", parent_id="ORG-RPS",
+        )
+        Organization.objects.create(
+            id="ORG-RSA", code="SCH-950100-401", name="审核一小组织",
+            org_type="SCHOOL", parent_id="ORG-RCT",
+        )
+        Organization.objects.create(
+            id="ORG-RSB", code="SCH-950200-402", name="审核界外校组织",
+            org_type="SCHOOL", parent_id="ORG-RPS",
+        )
+        Organization.objects.create(
+            id="ORG-RDEAD", code="C-RDEAD", name="审核已删组织",
+            org_type="CITY", parent_id="ORG-RPS",
+        )
+        Organization.objects.filter(pk="ORG-RDEAD").update(deleted_at=timezone.now())
+
+        def make_person(no, name, id_number, school, audit_status):
+            return Person.objects.create(
+                person_no=f"P2026{no:08d}",
+                full_name=name,
+                id_card_cipher=encrypt_text(id_number),
+                id_card_hash=lookup_hash(id_number),
+                id_card_masked=mask_id_number(id_number),
+                person_category=enums.PersonCategory.ATHLETE,
+                audit_status=audit_status,
+                school=school,
+            )
+
+        cls.p_pending_a = make_person(
+            1, "待审甲", "110101201401011111", cls.school_a, enums.AuditStatus.PENDING
+        )
+        cls.p_draft_a = make_person(
+            2, "草稿乙", "110101201401012222", cls.school_a, enums.AuditStatus.DRAFT
+        )
+        cls.p_approved_a = make_person(
+            3, "已过丙", "110101201401013333", cls.school_a, enums.AuditStatus.APPROVED
+        )
+        cls.p_pending_b = make_person(
+            4, "界外丁", "110101201401014444", cls.school_b, enums.AuditStatus.PENDING
+        )
+
+    @staticmethod
+    def _auth(token):
+        return {"HTTP_AUTHORIZATION": f"Bearer {token}"} if token else {}
+
+    def _post(self, path, payload, token=None):
+        return self.client.post(
+            path, data=json.dumps(payload), content_type="application/json",
+            **self._auth(token),
+        )
+
+    def _body(self, person, decision="APPROVE", **overrides):
+        from apps.persons.schemas import person_version
+
+        payload = {"decision": decision, "version": person_version(person)}
+        payload.update(overrides)
+        return payload
+
+    def _audit_log(self, person):
+        return PersonChangeLog.objects.filter(
+            person_id=person.pk, change_type=enums.ChangeType.AUDIT
+        )
+
+    # ------------------------------------------------------------ 权限点
+
+    def test_review_permission_roles_only_university(self):
+        from apps.common.permissions import operation_roles
+
+        # D1 口径：普通审核权限仅学校端（对齐 materialReview）。
+        self.assertEqual(operation_roles("personReview"), ("UNIVERSITY",))
+
+    def test_review_denied_for_non_university_roles(self):
+        """ADMIN/CITY/PROVINCE_REVIEWER/TEAM 调审核 → 权限点 403 FORBIDDEN，
+        先于数据范围判定；档案状态与审核留痕零变更。"""
+        for token in (
+            self.admin_token,
+            self.city_token,
+            self.prov_token,
+            self.team_token,
+        ):
+            resp = self._post(
+                f"{PEOPLE}/{self.p_pending_a.pk}/review",
+                self._body(self.p_pending_a),
+                token=token,
+            )
+            self.assertEqual(resp.status_code, 403)
+            self.assertEqual(resp.json()["code"], "FORBIDDEN")
+        self.p_pending_a.refresh_from_db()
+        self.assertEqual(self.p_pending_a.audit_status, enums.AuditStatus.PENDING)
+        self.assertFalse(self._audit_log(self.p_pending_a).exists())
+
+    # ------------------------------------------------------------ 审核正向（本校）
+
+    def test_review_own_school_person_approved(self):
+        resp = self._post(
+            f"{PEOPLE}/{self.p_pending_a.pk}/review",
+            self._body(self.p_pending_a),
+            token=self.uni_a_token,
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.p_pending_a.refresh_from_db()
+        self.assertEqual(self.p_pending_a.audit_status, enums.AuditStatus.APPROVED)
+        entry = self._audit_log(self.p_pending_a).get()
+        self.assertEqual(
+            entry.field_changes,
+            [
+                {
+                    "field": "audit_status",
+                    "old": enums.AuditStatus.PENDING.value,
+                    "new": enums.AuditStatus.APPROVED.value,
+                }
+            ],
+        )
+        self.assertEqual(entry.reason, "审核通过")
+        # changed_by 恒空：底座账号 ID 映射未定（D4 待批），同材料域口径
+        self.assertIsNone(entry.changed_by)
+
+    def test_review_reject_requires_reason(self):
+        """REJECT 未填 reason → 400，状态与留痕零变更。"""
+        resp = self._post(
+            f"{PEOPLE}/{self.p_pending_a.pk}/review",
+            self._body(self.p_pending_a, decision="REJECT"),
+            token=self.uni_a_token,
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.p_pending_a.refresh_from_db()
+        self.assertEqual(self.p_pending_a.audit_status, enums.AuditStatus.PENDING)
+        self.assertFalse(self._audit_log(self.p_pending_a).exists())
+
+    def test_review_reject_with_reason_persists(self):
+        resp = self._post(
+            f"{PEOPLE}/{self.p_pending_a.pk}/review",
+            self._body(
+                self.p_pending_a, decision="REJECT", reason="资格证明材料不全"
+            ),
+            token=self.uni_a_token,
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.p_pending_a.refresh_from_db()
+        self.assertEqual(self.p_pending_a.audit_status, enums.AuditStatus.REJECTED)
+        self.assertEqual(self._audit_log(self.p_pending_a).get().reason, "资格证明材料不全")
+
+    # ------------------------------------------------------------ 状态机与越权
+
+    def test_review_non_pending_state_conflict(self):
+        """DRAFT（未提交复核）与 APPROVED（重复审核）→ 409，零变更。"""
+        for person, label in (
+            (self.p_draft_a, "DRAFT"),
+            (self.p_approved_a, "APPROVED"),
+        ):
+            resp = self._post(
+                f"{PEOPLE}/{person.pk}/review", self._body(person), token=self.uni_a_token
+            )
+            self.assertEqual(resp.status_code, 409)
+            self.assertEqual(resp.json()["code"], "STATE_CONFLICT")
+            person.refresh_from_db()
+            self.assertEqual(person.audit_status, enums.AuditStatus(label).value)
+
+    def test_review_version_conflict(self):
+        resp = self._post(
+            f"{PEOPLE}/{self.p_pending_a.pk}/review",
+            self._body(self.p_pending_a, version=1),
+            token=self.uni_a_token,
+        )
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(resp.json()["code"], "VERSION_CONFLICT")
+        self.p_pending_a.refresh_from_db()
+        self.assertEqual(self.p_pending_a.audit_status, enums.AuditStatus.PENDING)
+
+    def test_review_other_school_person_404(self):
+        """范围外（他校）档案 404：不泄露存在性，状态与留痕零变更。"""
+        resp = self._post(
+            f"{PEOPLE}/{self.p_pending_b.pk}/review",
+            self._body(self.p_pending_b),
+            token=self.uni_a_token,
+        )
+        self.assertEqual(resp.status_code, 404)
+        self.p_pending_b.refresh_from_db()
+        self.assertEqual(self.p_pending_b.audit_status, enums.AuditStatus.PENDING)
+        self.assertFalse(self._audit_log(self.p_pending_b).exists())
+
+    def test_review_university_ghost_binding_denied(self):
+        """无有效组织范围（绑定已软删）→ 403 DATA_SCOPE_DENIED，不退化全库。"""
+        resp = self._post(
+            f"{PEOPLE}/{self.p_pending_a.pk}/review",
+            self._body(self.p_pending_a),
+            token=self.uni_dead_token,
+        )
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json()["code"], "DATA_SCOPE_DENIED")
+        self.assertFalse(self._audit_log(self.p_pending_a).exists())
 
 
 class MyProfileApiTests(TestCase):
@@ -1652,7 +2704,6 @@ class MyProfileApiTests(TestCase):
                 "realName": "张小改",
                 "gender": "MALE",
                 "birthDate": "2013-05-01",
-                "schoolName": "乙一小",
                 "education": "本科",
                 "coachCategory": "主教练",
                 "version": current,
@@ -1691,11 +2742,112 @@ class MyProfileApiTests(TestCase):
         self.assertEqual(fields["realName"]["new"], "张小改")
         self.assertEqual(log.reason, "本人更新档案")
 
-        # 冻结模型无持久列的字段不伪造回显：education/coachCategory 不输出；
-        # schoolName 为派生展示字段（来自 school 关系），提交值"乙一小"未生效
-        self.assertNotIn("education", data)
+        # education：E1 持久化——响应回显 + 数据库读回 + ChangeLog 留痕
+        self.assertEqual(data["education"], "本科")
+        self.athlete.refresh_from_db()
+        self.assertEqual(self.athlete.education, "本科")
+        self.assertEqual(fields["education"]["old"], None)
+        self.assertEqual(fields["education"]["new"], "本科")
+        # coachCategory 仍声明不持久化不回显（恢复原口径）；schoolName 为派生展示字段
         self.assertNotIn("coachCategory", data)
         self.assertEqual(data["schoolName"], "甲一小")
+
+    # -------------------------------------------- 批次 A：schoolName 明确拒绝
+    #（coachCategory 已恢复原口径：声明不持久化，提交静默忽略，见 test_put_success_updates_own_profile）
+
+    def test_put_school_name_rejected_400(self):
+        """批次 A：schoolName 不再声明 → 400 INVALID_ARGUMENT 且字段可定位。"""
+        from apps.persons.schemas import person_version
+
+        resp = self._put(
+            {
+                "realName": "张小明",
+                "schoolName": "乙一小",
+                "version": person_version(self.athlete),
+            }
+        )
+        self.assertEqual(resp.status_code, 400, resp.content)
+        body = resp.json()
+        self.assertEqual(body["code"], "INVALID_ARGUMENT")
+        self.assertIn("schoolName", json.dumps(body.get("data") or {}))
+        self.athlete.refresh_from_db()
+        self.assertEqual(self.athlete.school.name, "甲一小")  # 归属未被改动
+
+    def test_put_mixed_payload_rejected_without_partial_write(self):
+        """批次 A：合法变更 + schoolName 混合 → 400 且零落库零留痕。"""
+        from apps.persons.schemas import person_version
+
+        before_version = person_version(self.athlete)
+        logs_before = PersonChangeLog.objects.filter(person=self.athlete).count()
+        audit_before = AuditLog.objects.count()
+        resp = self._put(
+            {
+                "realName": "张混合",
+                "education": "本科",
+                "schoolName": "乙一小",
+                "version": before_version,
+            }
+        )
+        self.assertEqual(resp.status_code, 400, resp.content)
+        self.assertEqual(resp.json()["code"], "INVALID_ARGUMENT")
+        self.assertIn("schoolName", json.dumps(resp.json().get("data") or {}))
+        self.athlete.refresh_from_db()
+        self.assertEqual(self.athlete.full_name, "张小明")  # 合法字段未写入
+        self.assertIsNone(self.athlete.education)
+        self.assertEqual(self.athlete.school.name, "甲一小")
+        self.assertEqual(person_version(self.athlete), before_version)  # 版本未前进
+        self.assertEqual(
+            PersonChangeLog.objects.filter(person=self.athlete).count(), logs_before
+        )
+        self.assertEqual(AuditLog.objects.count(), audit_before)
+
+    def test_put_education_absent_keeps_value(self):
+        """E1：本人端更新其他字段未传 education → 原值不丢失。"""
+        from apps.persons.schemas import person_version
+
+        self.athlete.education = "本科"
+        self.athlete.save()
+        resp = self._put(
+            {"realName": "张小改2", "version": person_version(self.athlete)}
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.athlete.refresh_from_db()
+        self.assertEqual(self.athlete.education, "本科")
+        self.assertEqual(resp.json()["data"]["education"], "本科")
+
+    def test_put_education_too_long_rejected_no_write(self):
+        """E1：本人端超长 education → 400 校验错误，数据库不变。"""
+        from apps.persons.schemas import person_version
+
+        resp = self._put(
+            {
+                "realName": "张超长",
+                "education": "长" * 101,
+                "version": person_version(self.athlete),
+            }
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.json()["code"], "INVALID_ARGUMENT")
+        self.athlete.refresh_from_db()
+        self.assertIsNone(self.athlete.education)  # 未被写入
+
+    def test_put_school_org_id_rejected_not_own_scope(self):
+        """E1 口径：本人端不能修改学校归属——schoolOrgId 不在本人可改集，
+        StrictSchema extra=forbid 直接 400（越权归零，无需服务层分支）。"""
+        from apps.persons.schemas import person_version
+
+        school_before = self.athlete.school_id
+        resp = self._put(
+            {
+                "realName": "张越权",
+                "schoolOrgId": "org-other-1",
+                "version": person_version(self.athlete),
+            }
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.json()["code"], "INVALID_ARGUMENT")
+        self.athlete.refresh_from_db()
+        self.assertEqual(self.athlete.school_id, school_before)  # 归属未变
 
     def test_put_missing_version_rejected_no_update(self):
         from apps.persons.schemas import person_version
@@ -2007,8 +3159,10 @@ class MyProfileApiTests(TestCase):
         self.athlete.refresh_from_db()
         self.assertEqual(self.athlete.audit_status, enums.AuditStatus.APPROVED)
 
-    def test_confirm_rejected_returns_state_conflict(self):
-        """REJECTED → 409：驳回后本人能否重新提交待业务确认（保守拒绝，未决项 B3）。"""
+    def test_confirm_rejected_resubmits_to_pending(self):
+        """REJECTED → PENDING（P0-2 统一规则 2026-10-28 用户批准决策 3，
+        取代原"未决项 B3 保守拒绝"口径）：本人有效修改后重新提交进入待审；
+        无修改直接重提被 409 拦截，场景断言详见 P0UnifiedFlowTests。"""
         from apps.persons.schemas import person_version
 
         rejected = Person.objects.create(
@@ -2029,14 +3183,21 @@ class MyProfileApiTests(TestCase):
             enabled=True,
             person_id=str(rejected.pk),
         )
-        resp = self._post_confirm(
-            {"version": person_version(rejected)},
-            token=issue_access_token(rejected_user)[0],
+        token = issue_access_token(rejected_user)[0]
+        # 前置：驳回后的有效修改（本人链，realName 实际变化 → field_changes 非空）
+        from apps.persons import services
+
+        services.update_own_person(
+            str(rejected.pk),
+            {"realName": "王驳回改", "version": person_version(rejected)},
         )
-        self.assertEqual(resp.status_code, 409)
-        self.assertEqual(resp.json()["code"], "STATE_CONFLICT")
+        resp = self._post_confirm(
+            {"version": person_version(Person.objects.get(pk=rejected.pk))},
+            token=token,
+        )
+        self.assertEqual(resp.status_code, 200)
         rejected.refresh_from_db()
-        self.assertEqual(rejected.audit_status, enums.AuditStatus.REJECTED)
+        self.assertEqual(rejected.audit_status, enums.AuditStatus.PENDING)
 
     def test_confirm_pending_is_idempotent_no_new_changelog(self):
         """PENDING 重复确认 → 幂等成功：状态不变、无新 ChangeLog（实现选择在案）。"""
@@ -2542,3 +3703,379 @@ class DossierApiTests(TestCase):
         )
         self.assertEqual(resp.status_code, 400)
         self.assertEqual(resp.json()["code"], "INVALID_ARGUMENT")
+
+
+class P0UnifiedFlowTests(TestCase):
+    """P0-2/P0-4 统一链路（2026-10-28 用户批准决策 3/4）：
+
+    - 驳回重提（决策 A）：REJECTED → 本人 my_profile_confirm → PENDING，
+      原 AUDIT 留痕 append-only 保留，新 UPDATE 记 reason="驳回后重新提交"；
+    - 关键字段（realName/birthDate/school/personCategory/kinds/coachCategory/gender）
+      变更使原审核结论失效：APPROVED → PENDING，与字段写入同一事务、同一份
+      PersonChangeLog（UPDATE）同时含字段与 audit_status 条目；
+    - 非关键字段（education/avatar/phone）不变更审核结论；
+    - 并发：过期 version 在 ensure_version 入口拦截（409），不产生过期审核结论。
+
+    coachCategory 例外在案：接受但不持久化 → 无法检测变化 → 不触发失效
+    （报告项，不在本类断言范围）。
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        def make_account(username, roles, person=None):
+            return Account.objects.create(
+                id=new_account_id(),
+                username=username,
+                display_name=username,
+                roles=roles,
+                password=make_password("p0-pass-123"),
+                enabled=True,
+                organization_id="ORG-P0S",
+                person_id=str(person.pk) if person else "",
+            )
+
+        cls.admin = make_account("p0-admin", ["ADMIN"])
+        cls.uni = make_account("p0-uni", ["UNIVERSITY"])
+        cls.admin_token = issue_access_token(cls.admin)[0]
+        cls.uni_token = issue_access_token(cls.uni)[0]
+
+        region = Region.objects.create(name="P0省", code="960000", level=1)
+        city = Region.objects.create(name="P0市", code="960100", level=2, parent=region)
+        school = School.objects.create(
+            name="P0测试校", code="SCH-960100-001", school_type="PRIMARY", region=city
+        )
+        Organization.objects.create(
+            id="ORG-P0S", code="SCH-960100-001", name="P0测试校组织",
+            org_type="SCHOOL", parent_id=None,
+        )
+        cls.school = school
+
+        def make_person(no, name, id_number, audit_status):
+            return Person.objects.create(
+                person_no=f"P2026{no:08d}",
+                full_name=name,
+                id_card_cipher=encrypt_text(id_number),
+                id_card_hash=lookup_hash(id_number),
+                id_card_masked=mask_id_number(id_number),
+                person_category=enums.PersonCategory.ATHLETE,
+                audit_status=audit_status,
+                school=school,
+            )
+
+        # REJECTED：本人重提链路用（含历史 AUDIT 留痕，模拟已驳回审核）
+        cls.p_rejected = make_person(
+            1, "驳回甲", "110101201401011111", enums.AuditStatus.REJECTED
+        )
+        PersonChangeLog.objects.create(
+            person=cls.p_rejected,
+            change_type=enums.ChangeType.AUDIT,
+            field_changes=[
+                {"field": "audit_status", "old": "PENDING", "new": "REJECTED"}
+            ],
+            reason="材料不清晰",
+        )
+        cls.rejected_user = make_account("p0-rejected", ["ATHLETE"], cls.p_rejected)
+        cls.rejected_token = issue_access_token(cls.rejected_user)[0]
+
+        # APPROVED：管理员/本人关键字段链路用（补扩展档案行使 kinds 合成非空）
+        cls.p_approved = make_person(
+            2, "已过乙", "110101201401012222", enums.AuditStatus.APPROVED
+        )
+        AthleteProfile.objects.create(person=cls.p_approved)
+        cls.p_approved_own = make_person(
+            3, "已过丙", "110101201401013333", enums.AuditStatus.APPROVED
+        )
+        AthleteProfile.objects.create(person=cls.p_approved_own)
+        cls.own_user = make_account("p0-own", ["ATHLETE"], cls.p_approved_own)
+        cls.own_token = issue_access_token(cls.own_user)[0]
+
+    @staticmethod
+    def _auth(token):
+        return {"HTTP_AUTHORIZATION": f"Bearer {token}"}
+
+    def _person_version(self, person):
+        from apps.persons.schemas import person_version
+
+        return person_version(person)
+
+    def _update_logs(self, person):
+        return PersonChangeLog.objects.filter(
+            person_id=person.pk, change_type=enums.ChangeType.UPDATE
+        ).order_by("created_at", "id")
+
+    # ---------------------------------------------- 驳回 → 修改 → 重提 → 再审
+
+    def test_rejected_resubmit_via_confirmation_keeps_history(self):
+        """决策 A + 防滥用加固：REJECTED 本人有效修改后确认 → PENDING；
+        旧 AUDIT 保留，UPDATE 留痕两条（本人修改 + 重提 reason="驳回后重新提交"）。
+        未修改即重提被 409 拦截的场景见下方专用用例。"""
+        old_audit = PersonChangeLog.objects.filter(
+            person_id=self.p_rejected.pk, change_type=enums.ChangeType.AUDIT
+        )
+        self.assertEqual(old_audit.count(), 1)
+
+        # 前置：驳回后的有效修改（本人链，realName 实际变化）
+        from apps.persons import services
+        from apps.persons.schemas import person_version
+
+        services.update_own_person(
+            str(self.p_rejected.pk),
+            {"realName": "被驳甲改", "version": person_version(self.p_rejected)},
+        )
+
+        resp = self.client.post(
+            ME_PROFILE_CONFIRM,
+            data=json.dumps(
+                {"version": person_version(Person.objects.get(pk=self.p_rejected.pk))}
+            ),
+            content_type="application/json",
+            **self._auth(self.rejected_token),
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+
+        self.p_rejected.refresh_from_db()
+        self.assertEqual(self.p_rejected.audit_status, enums.AuditStatus.PENDING)
+        # 旧审核留痕不覆盖（append-only）
+        self.assertEqual(old_audit.count(), 1)
+        resubmits = self._update_logs(self.p_rejected)
+        self.assertEqual(resubmits.count(), 2)
+        first, second = list(resubmits)
+        # 本人有效修改：realName 实际变化（构成重提证据）
+        self.assertEqual(
+            first.field_changes,
+            [{"field": "realName", "old": "驳回甲", "new": "被驳甲改"}],
+        )
+        # 重提留痕：仅 audit_status（不构成下一次重提的修改证据）
+        self.assertEqual(second.reason, "驳回后重新提交")
+        self.assertEqual(
+            second.field_changes,
+            [{"field": "audit_status", "old": "REJECTED", "new": "PENDING"}],
+        )
+
+        # 再审核：学校端 APPROVE 通过 → APPROVED，AUDIT 留痕新增（共 2 条）
+        resp = self.client.post(
+            f"{PEOPLE}/{self.p_rejected.pk}/review",
+            {"decision": "APPROVE", "version": self._person_version(self.p_rejected)},
+            content_type="application/json",
+            **self._auth(self.uni_token),
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.p_rejected.refresh_from_db()
+        self.assertEqual(self.p_rejected.audit_status, enums.AuditStatus.APPROVED)
+        self.assertEqual(old_audit.count(), 2)
+        latest = old_audit.order_by("created_at", "id").last()
+        self.assertEqual(
+            latest.field_changes,
+            [{"field": "audit_status", "old": "PENDING", "new": "APPROVED"}],
+        )
+
+    # --------------------------------- 防滥用：驳回后未修改不得重提（2026-10-28）
+
+    def _confirm_rejected(self, person, token):
+        from apps.persons.schemas import person_version
+
+        return self.client.post(
+            ME_PROFILE_CONFIRM,
+            data=json.dumps(
+                {"version": person_version(Person.objects.get(pk=person.pk))}
+            ),
+            content_type="application/json",
+            **self._auth(token),
+        )
+
+    def test_rejected_resubmit_without_change_blocked(self):
+        """REJECTED 未做任何修改直接重提 → 409 STATE_CONFLICT；状态不变、
+        无新增 UPDATE 留痕（不产生重提日志）。"""
+        before = self._update_logs(self.p_rejected).count()
+        resp = self._confirm_rejected(self.p_rejected, self.rejected_token)
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(resp.json()["code"], "STATE_CONFLICT")
+        self.assertIn("未发生有效资料修改", resp.json()["message"])
+        self.p_rejected.refresh_from_db()
+        self.assertEqual(self.p_rejected.audit_status, enums.AuditStatus.REJECTED)
+        self.assertEqual(self._update_logs(self.p_rejected).count(), before)
+
+    def test_rejected_noop_update_not_resubmit_evidence(self):
+        """无效字段修改（本人更新传相同值 → field_changes 为 None 的日志）
+        不构成修改证据：重提仍 409。"""
+        from apps.persons import services
+        from apps.persons.schemas import person_version
+
+        services.update_own_person(
+            str(self.p_rejected.pk),
+            {"realName": "驳回甲", "version": person_version(self.p_rejected)},
+        )
+        # 无变化也写 UPDATE 日志（field_changes=None），但不得视为有效修改
+        self.assertTrue(self._update_logs(self.p_rejected).exists())
+        resp = self._confirm_rejected(self.p_rejected, self.rejected_token)
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(resp.json()["code"], "STATE_CONFLICT")
+        self.p_rejected.refresh_from_db()
+        self.assertEqual(self.p_rejected.audit_status, enums.AuditStatus.REJECTED)
+
+    def test_resubmit_log_alone_not_evidence_for_next_cycle(self):
+        """重复重提防绕过：有效修改→重提→再驳回→此时"最近 AUDIT"为新驳回，
+        此前的重提日志（audit_status-only）在驳回之前，不再构成证据 → 未修改
+        再次重提被 409；同一次修改不可重复消费。"""
+        from apps.persons import services
+        from apps.persons.schemas import person_version
+
+        # 第一轮：有效修改 + 重提
+        services.update_own_person(
+            str(self.p_rejected.pk),
+            {"realName": "被驳甲改", "version": person_version(self.p_rejected)},
+        )
+        self.assertEqual(
+            self._confirm_rejected(self.p_rejected, self.rejected_token).status_code,
+            200,
+        )
+        self.p_rejected.refresh_from_db()
+        self.assertEqual(self.p_rejected.audit_status, enums.AuditStatus.PENDING)
+
+        # 学校端再次驳回（AUDIT 记录新增，成为"最近一次驳回"）
+        resp = self.client.post(
+            f"{PEOPLE}/{self.p_rejected.pk}/review",
+            {"decision": "REJECT", "reason": "仍不符合要求",
+             "version": person_version(self.p_rejected)},
+            content_type="application/json",
+            **self._auth(self.uni_token),
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.p_rejected.refresh_from_db()
+        self.assertEqual(self.p_rejected.audit_status, enums.AuditStatus.REJECTED)
+
+        # 未做新一轮修改即重提 → 409（旧修改/旧重提日志均不可重复消费）
+        resp = self._confirm_rejected(self.p_rejected, self.rejected_token)
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(resp.json()["code"], "STATE_CONFLICT")
+        self.p_rejected.refresh_from_db()
+        self.assertEqual(self.p_rejected.audit_status, enums.AuditStatus.REJECTED)
+
+    def test_rejected_resubmit_stale_version_blocked(self):
+        """旧 version 重提 → 409 VERSION_CONFLICT（乐观锁先于重提校验生效）。"""
+        resp = self.client.post(
+            ME_PROFILE_CONFIRM,
+            data=json.dumps({"version": 1}),
+            content_type="application/json",
+            **self._auth(self.rejected_token),
+        )
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(resp.json()["code"], "VERSION_CONFLICT")
+        self.p_rejected.refresh_from_db()
+        self.assertEqual(self.p_rejected.audit_status, enums.AuditStatus.REJECTED)
+
+    # -------------------------------------------- 关键字段变更 → 结论失效
+
+    def test_admin_update_key_field_invalidates_approval(self):
+        """管理员 PUT /people/{id} 改 realName：APPROVED → PENDING，同一份
+        UPDATE ChangeLog 同时含 realName 与 audit_status 两条变更。"""
+        resp = self.client.put(
+            f"{PEOPLE}/{self.p_approved.pk}",
+            data=json.dumps(
+                {
+                    "kinds": ["ATHLETE"],
+                    "realName": "已过乙改",
+                    "version": self._person_version(self.p_approved),
+                }
+            ),
+            content_type="application/json",
+            **self._auth(self.admin_token),
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+
+        self.p_approved.refresh_from_db()
+        self.assertEqual(self.p_approved.audit_status, enums.AuditStatus.PENDING)
+        logs = self._update_logs(self.p_approved)
+        self.assertEqual(logs.count(), 1)
+        fields = {c["field"]: c for c in logs.first().field_changes}
+        self.assertIn("realName", fields)
+        self.assertEqual(fields["realName"]["old"], "已过乙")
+        self.assertEqual(fields["realName"]["new"], "已过乙改")
+        self.assertEqual(fields["audit_status"]["old"], "APPROVED")
+        self.assertEqual(fields["audit_status"]["new"], "PENDING")
+
+    def test_admin_update_non_key_field_keeps_approval(self):
+        """改 education（非关键字段）：仍 APPROVED，ChangeLog 仅 education 条目。"""
+        resp = self.client.put(
+            f"{PEOPLE}/{self.p_approved.pk}",
+            data=json.dumps(
+                {
+                    "kinds": ["ATHLETE"],
+                    "realName": "已过乙",  # 与原值相同 → 无 realName 变更
+                    "education": "本科",
+                    "version": self._person_version(self.p_approved),
+                }
+            ),
+            content_type="application/json",
+            **self._auth(self.admin_token),
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+
+        self.p_approved.refresh_from_db()
+        self.assertEqual(self.p_approved.audit_status, enums.AuditStatus.APPROVED)
+        logs = self._update_logs(self.p_approved)
+        self.assertEqual(logs.count(), 1)
+        fields = [c["field"] for c in logs.first().field_changes]
+        self.assertEqual(fields, ["education"])
+        self.assertNotIn("audit_status", fields)
+
+    def test_own_update_key_field_invalidates_approval(self):
+        """本人 PUT /me/profile 改 realName：与管理员链路同规则失效。"""
+        resp = self.client.put(
+            ME_PROFILE,
+            data=json.dumps(
+                {
+                    "realName": "已过丙改",
+                    "version": self._person_version(self.p_approved_own),
+                }
+            ),
+            content_type="application/json",
+            **self._auth(self.own_token),
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+
+        self.p_approved_own.refresh_from_db()
+        self.assertEqual(self.p_approved_own.audit_status, enums.AuditStatus.PENDING)
+        logs = self._update_logs(self.p_approved_own)
+        self.assertEqual(logs.count(), 1)
+        entry = logs.first()
+        self.assertEqual(entry.reason, "本人更新档案")
+        fields = {c["field"] for c in entry.field_changes}
+        self.assertEqual(fields, {"realName", "audit_status"})
+
+    def test_own_update_non_key_field_keeps_approval(self):
+        """本人改 education（非关键）：仍 APPROVED，无 audit_status 条目。"""
+        resp = self.client.put(
+            ME_PROFILE,
+            data=json.dumps(
+                {
+                    "realName": "已过丙",
+                    "education": "硕士",
+                    "version": self._person_version(self.p_approved_own),
+                }
+            ),
+            content_type="application/json",
+            **self._auth(self.own_token),
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+
+        self.p_approved_own.refresh_from_db()
+        self.assertEqual(self.p_approved_own.audit_status, enums.AuditStatus.APPROVED)
+        fields = [c["field"] for c in self._update_logs(self.p_approved_own).first().field_changes]
+        self.assertEqual(fields, ["education"])
+
+    def test_stale_version_conflict_keeps_approval(self):
+        """并发：过期 version → 409，审核结论与留痕零变更（无过期结论落库）。"""
+        stale = self._person_version(self.p_approved) - 1
+        resp = self.client.put(
+            f"{PEOPLE}/{self.p_approved.pk}",
+            data=json.dumps({"kinds": ["ATHLETE"], "realName": "并发写", "version": stale}),
+            content_type="application/json",
+            **self._auth(self.admin_token),
+        )
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(resp.json()["code"], "VERSION_CONFLICT")
+        self.p_approved.refresh_from_db()
+        self.assertEqual(self.p_approved.audit_status, enums.AuditStatus.APPROVED)
+        self.assertEqual(self.p_approved.full_name, "已过乙")
+        self.assertFalse(self._update_logs(self.p_approved).exists())
