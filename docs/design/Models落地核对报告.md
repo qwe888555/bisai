@@ -138,6 +138,7 @@ R1–R6 六条"现役唯一"规则未在 Models 中表达为 UniqueConstraint（
 | D7 | append-only 6 表 | 模型层无法强制禁改 | 部署层收回 UPDATE/DELETE（F6）+ 服务层约定 + audit_log 无外键（A5）已按定稿建模 |
 | D8 | nullable 唯一 | school.code / idempotency_key 可空唯一，MySQL 多 NULL 合法，与 DDL 注释一致 | 无处理需要 ✅ |
 | D9 | person_no/team_no | 建表即唯一、应用层回填编号（DDL 一致） | 无处理需要 ✅ |
+| D10 | **V1.5 冻结差异（E1 2026-10-27）：`person.education`** | **V1.4-r1 冻结版无此列**；组长批准 E1 解冻加列：`education VARCHAR(100) NULL`（可选自由文本 ≤100，业务未定字典），模型 `Person.education`（db_comment 与迁移 0003 一致），**A 节"逐项一致"基线自此存在 1 处经批准差异** | ①本条即 V1.5 差异登记备案，部署审批时随本报告提交；②迁移 `persons/0003_person_education`（AddField，`atomic=False` 与 0002 同口径）；③目标 MySQL 8.0 的 migrate 与 `SHOW CREATE TABLE person` 对照**尚未执行**（本地仅 SQLite 内存库验证），Online DDL 锁行为待目标库版本确认 |
 
 ---
 
@@ -155,7 +156,8 @@ R1–R6 六条"现役唯一"规则未在 Models 中表达为 UniqueConstraint（
 
 | # | 事项 | 时机 |
 |---|------|------|
-| 1 | MySQL 8.0 目标库 migrate 后 `SHOW CREATE TABLE` 逐表对照冻结 DDL（列类型/索引名/UNIQUE 名/ON DELETE） | 部署环境就绪 |
+| 1 | MySQL 8.0 目标库 migrate 后 `SHOW CREATE TABLE` 逐表对照冻结 DDL（列类型/索引名/UNIQUE 名/ON DELETE），并确认 `person.education` 按 D10 V1.5 差异落地 | 部署环境就绪 |
+| 1a | **V1.5 差异登记（E1）**：`persons/0003_person_education` 在目标 MySQL 8.0 执行 migrate + 回滚演练（RemoveField 仅限未录业务数据时），Online DDL 实际锁行为以目标库版本实测为准 | 冻结差异登记审批后 |
 | 2 | `0002_seed_dict` 数据迁移（get_or_create 幂等）+ `import_regions` / `import_schools` 命令 | 字典/区划初始化阶段（§十六） |
 | 3 | 部署层 F6：6 张 append-only 表收回业务账号 UPDATE/DELETE | 部署脚本 |
 
@@ -167,3 +169,4 @@ R1–R6 六条"现役唯一"规则未在 Models 中表达为 UniqueConstraint（
 |------|------|------|
 | V1.0 | 2026-10-21 | 基于 DDL V1.4-r1 冻结版完成 22 模型落地与静态核对；自测通过，待审阅 |
 | V1.1 | 2026-10-21 | 迁移阶段执行完毕：4×0001 + 2×0002 生成并审查；3 条 CASCADE 外键经 db_constraint=False + RunSQL 按 DDL 具名落地（D2/D3 更新）；SQLite 全链路 migrate + ORM 冒烟通过 |
+| V1.5 | 2026-10-27 | **E1 冻结差异备案**：组长批准解冻加列 `Person.education`（可选自由文本 ≤100，迁移 0003），A 节基线存在 1 处经批准差异（D10）；目标 MySQL 迁移验证未执行，见 E 节事项 1a |

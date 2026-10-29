@@ -1,0 +1,14 @@
+code,name,applies_to,is_required,need_audit,allow_multiple,allowed_ext,max_size_mb,sort_order,is_active,remark
+STUDENT_STATUS,学籍证明,PERSON,false,true,false,"jpg,jpeg,png,pdf",10,10,true,报名附件与履历材料双用途，不可互替
+EDUCATION,学历证明,PERSON,false,true,true,"jpg,jpeg,png,pdf",10,20,true,
+ATHLETE_CERTIFICATE,运动员证书,PERSON,false,true,true,"jpg,jpeg,png,pdf",10,30,true,
+AWARD,获奖证书,PERSON,false,true,true,"jpg,jpeg,png,pdf",10,40,true,
+COMPETITION,参赛记录,PERSON,false,false,true,"jpg,jpeg,png,pdf,doc,docx,xls,xlsx",10,50,true,
+COACHING_RECORD,执教记录,PERSON,false,false,true,"jpg,jpeg,png,pdf,doc,docx",10,60,true,
+TRAINING_RECORD,培训记录,PERSON,false,false,true,"jpg,jpeg,png,pdf",10,70,true,
+TEACHER_LICENSE,教师资格证,PERSON,false,true,false,"jpg,jpeg,png,pdf",10,80,true,
+COACH_LICENSE,教练员证书,PERSON,false,true,true,"jpg,jpeg,png,pdf",10,90,true,
+OTHER,其他材料,PERSON,false,false,true,"jpg,jpeg,png,pdf,doc,docx,xls,xlsx",10,100,true,
+TRAINING_PLAN,训练计划,TEAM,false,false,true,"pdf,doc,docx,xls,xlsx",10,110,true,
+TEAM_HONOR,球队荣誉,TEAM,false,true,true,"jpg,jpeg,png,pdf",10,120,true,
+MATCH_RECORD,对阵记录,TEAM,false,false,true,"pdf,doc,docx,xls,xlsx,jpg,jpeg,png",10,130,true,
