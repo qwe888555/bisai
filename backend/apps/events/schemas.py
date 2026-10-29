@@ -16,7 +16,10 @@ from apps.common.schemas import StrictSchema
 from . import display
 
 EventStatus = Literal["DRAFT", "REGISTRATION_OPEN", "REGISTRATION_CLOSED", "RUNNING", "FINISHED"]
-GroupCategory = Literal["PRIMARY", "MIDDLE", "UNIVERSITY"]
+# 2026-10-28 业务规则：本项目无"高校组"，学段仅小学/初中/高中（PRIMARY/MIDDLE）；
+# 原 UNIVERSITY"高校组"值在服务端（schema 层）明确拒绝，不做静默转换。
+# 模型 GROUP_CATEGORIES choices 的收敛涉迁移，BLOCKED 登记（规则文档待决 11）。
+GroupCategory = Literal["PRIMARY", "MIDDLE"]
 GroupGender = Literal["MALE", "FEMALE", "MIXED"]
 
 
