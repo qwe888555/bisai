@@ -10,8 +10,11 @@
 - materialUpdate PUT /materials/{id}               （批次 D-3 补齐：title→remark、
   文件替换留痕、乐观锁；归属/类型不可变 → 400，审计与更新同事务）
 
-审核权限（文档 materialReview：CITY/PROVINCE_REVIEWER/ADMIN）由权限点强制，
-数据范围一期仅 ADMIN（service._require_admin_scope，A′ 未交付同批次 A/B 口径）。
+审核权限（2026-10-28 统一业务规则：人员资格与履历材料由学校端审核；
+市州端/省级端只审核赛事报名，不审核材料）由权限点强制，
+数据范围见 services._material_scope
+（D1/D5 修订：全局 ADMIN 全库无审核权 / UNIVERSITY 本校 / TEAM 本队，
+三态口径同 persons A′）。
 写操作统一 audit_state()；version 乐观锁按 B4 updated_at 微秒派生。
 """
 
@@ -25,7 +28,7 @@ from apps.common.authentication import JWTAuth
 from apps.common.envelope import action_result, ok
 from apps.common.errors import INVALID_ARGUMENT, ApiError, field_errors
 from apps.common.middleware import audit_state
-from apps.common.pagination import paginate_list
+from apps.common.pagination import paginate, paginate_list
 from apps.common.permissions import (
     ADMIN,
     ATHLETE,
@@ -46,7 +49,12 @@ router = Router(tags=["materials"])
 _auth = JWTAuth()
 
 # 权限点登记：导入期完成，漏登记 require() 会直接报错。
-# 角色按文档原表登记（ATHLETE/COACH 为本人材料预留）；数据范围一期仅 ADMIN。
+# 角色按 2026-10-28 统一业务规则 + D1/D5 决策登记：
+# - materialReview 仅 UNIVERSITY（学校端审核；D1：ADMIN 不拥有普通材料
+#   审核权限，数据范围能力不推导审核权；CITY/PROVINCE_REVIEWER 只审报名）；
+# - TEAM 有材料维护范围（本队 TEAM 材料，见 services._material_scope），
+#   但不进 materialReview（维护权限≠审核权限，一·补四）；
+# - ATHLETE/COACH 为本人材料预留；数据范围见 services._material_scope。
 register_operation(
     "materialList", (ADMIN, UNIVERSITY, TEAM, PROVINCE_REVIEWER, ATHLETE, COACH, CITY)
 )
@@ -59,9 +67,13 @@ register_operation(
 register_operation(
     "materialCreate", (ADMIN, UNIVERSITY, TEAM, PROVINCE_REVIEWER, ATHLETE, COACH, CITY)
 )
-register_operation("materialReview", (ADMIN, PROVINCE_REVIEWER, CITY))
+register_operation("materialReview", (UNIVERSITY,))
 register_operation(
     "materialRemove", (ADMIN, UNIVERSITY, TEAM, PROVINCE_REVIEWER, ATHLETE, COACH, CITY)
+)
+# 审核历史（P1-9 原定任务）：读取类操作，角色集同 materialGet；数据范围同单对象读。
+register_operation(
+    "materialHistory", (ADMIN, UNIVERSITY, TEAM, PROVINCE_REVIEWER, ATHLETE, COACH, CITY)
 )
 
 
@@ -72,10 +84,20 @@ def material_list(
     pageSize: Optional[int] = Query(None, ge=1, le=100),
     ownerType: Optional[str] = None,
     ownerId: Optional[str] = None,
+    status: Optional[str] = None,
+    needAudit: Optional[str] = None,
+    keyword: Optional[str] = None,
 ):
     account = require("materialList")
     rows = services.material_list(
-        {"ownerType": ownerType, "ownerId": ownerId}, account
+        {
+            "ownerType": ownerType,
+            "ownerId": ownerId,
+            "status": status,
+            "needAudit": needAudit,
+            "keyword": keyword,
+        },
+        account,
     )
     # 行为 (material, kind) 元组（多态），先物化再走 paginate_list
     # （paginate 的 count 探测对 list 误判 list.count()，故不直接用 paginate）
@@ -90,6 +112,22 @@ def material_get(request, material_id: str):
     account = require("materialGet")
     material, kind = services.material_get(material_id, account)
     return ok(s.material_out(material, kind))
+
+
+@router.get(
+    "/materials/{material_id}/audit-logs",
+    auth=_auth,
+    response=EnvelopeOut,
+    summary="材料审核历史",
+)
+def material_audit_logs(request, material_id: str):
+    """审核历史（P1-9 原定任务 + D3 分页）：append-only 记录按创建时间正序，
+    统一分页规范 page/pageSize（默认 20 上限 100），data 四字段契约。"""
+    account = require("materialHistory")
+    logs, kind = services.material_audit_logs(material_id, account)
+    # 排序稳定性由服务层 order_by("created_at", "id") 保证；分页切片在
+    # 数据库完成（QuerySet 走 paginate 数据库分支），不整表物化
+    return paginate(request, logs, mapper=lambda log: s.audit_log_out(log, kind))
 
 
 @router.put(

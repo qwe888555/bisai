@@ -22,8 +22,16 @@
 - version 乐观锁按 B4 规则由 updated_at 微秒派生（复用 persons.ensure_version）；
   写链禁 queryset.update() 绕过 auto_now 影响版本派生（文件归属回填除外——
   FileRecord 非 version 事实源）；
-- 数据范围一期仅 ADMIN 全量（同 persons.apply_person_scope / teams 先例），
-  UNIVERSITY/TEAM/CITY 等依赖 A′ 映射，未交付前 403 DATA_SCOPE_DENIED。
+- 数据范围（2026-10-28 统一业务规则+一·补四+D1/D5 批准）：全局 ADMIN 全库
+  （D1：仅数据范围能力，普通审核权限已移除，见 materialReview 登记注释）；
+  UNIVERSITY 本校（School.code ↔ Organization.code 编码映射）；TEAM 仅本队
+  TEAM 材料（绑定依据 accounts.Account.team_ids，ADMIN 账号管理维护，
+  attachments 域已作权威归属校验先例；PERSON 材料对球队端不可见）；无有效
+  范围（无绑定/空绑定）默认拒绝，不退化；其余角色保持拒绝；
+  归属对象无学校归属时对受限账号 deny-by-default；
+- 列表筛选与审核历史（P1-9 原定任务，2026-10-28 统一业务规则批准补齐）：
+  status/needAudit/keyword（keyword 按材料标题 remark 包含匹配）；审核历史
+  GET /materials/{id}/audit-logs 多态解析与数据范围同 material_get。
 """
 
 from __future__ import annotations
@@ -43,7 +51,8 @@ from apps.common.errors import (
     STATE_CONFLICT,
     ApiError,
 )
-from apps.common.permissions import ADMIN
+from apps.common.permissions import ADMIN, TEAM, UNIVERSITY
+from apps.common.scopes import scope_org_codes
 from apps.materials.models import (
     MaterialAuditLog,
     MaterialFileVersion,
@@ -55,19 +64,131 @@ from apps.persons.models import Person
 from apps.teams.models import Team
 
 
-def _require_admin_scope(account) -> None:
-    """材料数据范围门卫：一期仅 ADMIN 全量。
+def _material_scope(account) -> tuple:
+    """材料数据范围（2026-10-28 D1/D5 批准）：返回 (school_codes, team_ids)。
 
-    UNIVERSITY（本校）/TEAM（本队）/CITY 等范围依赖 org→school 映射（A′-min
-    未交付），按安全约束不放行（同 persons.apply_person_scope / teams 先例）；
-    映射交付后仅需扩展本函数，接口层不变。
+    - 全局 ADMIN（无组织绑定）→ (None, None) 全库。D1：数据范围能力保留
+      （系统管理/异常处理），普通材料审核权限已从 materialReview 移除，
+      不因范围推导审核权；材料域挂组织 ADMIN 维持全库（对齐子树三态列为
+      B 类建议，未获批准不实施）；
+    - UNIVERSITY → (codes, None)：所属组织子树编码（本校，A′ 编码映射）；
+      无有效组织范围（无绑定/绑定已软删）→ 默认拒绝，不退化为全库；
+    - TEAM → (None, ids)：仅本队 TEAM 材料（一·补四：球队端提交/维护/补充
+      本队材料；审核权限不开放）。绑定依据 accounts.Account.team_ids
+      （ADMIN 账号管理写入，attachments 域已作权威归属校验先例），集合
+      语义校验服务端归属、不信任客户端传参；空绑定 → 拒绝；PERSON 材料
+      对球队端一律不可见；
+    - 其余角色（CITY/PROVINCE_REVIEWER/ATHLETE/COACH）保持拒绝。
     """
-    if ADMIN in (getattr(account, "roles", ()) or ()):
-        return
+    roles = getattr(account, "roles", ()) or ()
+    if ADMIN in roles:
+        return None, None
+    if UNIVERSITY in roles:
+        codes = scope_org_codes(account)
+        if not codes:
+            raise ApiError(
+                DATA_SCOPE_DENIED,
+                "当前账号无有效组织范围，禁止访问材料数据",
+            )
+        return codes, None
+    if TEAM in roles:
+        raw = getattr(account, "team_ids", None) or []
+        ids = sorted({int(t) for t in raw if str(t).lstrip("-").isdigit()})
+        if not ids:
+            raise ApiError(
+                DATA_SCOPE_DENIED,
+                "当前球队账号未绑定任何球队，禁止访问材料数据",
+            )
+        return None, ids
     raise ApiError(
         DATA_SCOPE_DENIED,
-        "材料数据范围依赖组织映射（A′），交付前仅管理员可访问",
+        "材料数据范围仅对管理员、学校与球队账号开放",
     )
+
+
+def _ensure_owner_in_scope(owner, scope: tuple) -> None:
+    """材料归属对象（Person/Team）必须在账号范围内（单对象/写链共用）。
+
+    scope=(None, None)（全局 ADMIN）直接放行；TEAM 范围：归属必须是 Team
+    且主键在本队集合内（PERSON 材料对球队端不可见）；学校范围 deny-by-
+    default：归属对象无学校归属（Person/Team.school 可空）即无法证明在
+    授权范围内 → 403（同 A′ 写链显式拒绝口径，不静默放行）。
+    """
+    codes, team_ids = scope
+    if codes is None and team_ids is None:
+        return
+    if team_ids is not None:
+        if not isinstance(owner, Team) or owner.pk not in set(team_ids):
+            raise ApiError(
+                DATA_SCOPE_DENIED,
+                "目标材料不在当前球队账号的本队范围内",
+            )
+        return
+    school = getattr(owner, "school", None)
+    if school is None or school.code not in set(codes):
+        raise ApiError(
+            DATA_SCOPE_DENIED,
+            "目标材料归属学校不在当前账号数据范围内",
+        )
+
+
+def _apply_scope(queryset, kind: str, scope: tuple):
+    """列表查询按范围过滤：学校编码（codes）或本队集合（team_ids）。"""
+    codes, team_ids = scope
+    if codes is None and team_ids is None:
+        return queryset
+    if team_ids is not None:
+        if kind != "TEAM":  # 人员材料对球队端不可见（一·补四）
+            return queryset.none()
+        return queryset.filter(team_id__in=team_ids)
+    field = "person__school__code" if kind == "PERSON" else "team__school__code"
+    return queryset.filter(**{f"{field}__in": codes})
+
+
+def _parse_list_filters(filters: dict) -> tuple:
+    """P1-9 列表筛选参数解析：status/needAudit/keyword。
+
+    status 取 MaterialStatus 全枚举（无效 400）；needAudit 仅 true/false
+    （映射到 MaterialType.need_audit）；keyword 去首尾空白后按材料标题
+    remark 包含匹配（口径：标题即 remark，contract title 无独立列）。
+    返回 (status, need_audit, keyword)。
+    """
+    status = filters.get("status")
+    if status not in (None, ""):
+        status = str(status).strip().upper()
+        if status not in enums.MaterialStatus.values:
+            raise ApiError(
+                INVALID_ARGUMENT,
+                "status 仅支持 DRAFT/PENDING/APPROVED/REJECTED/WITHDRAWN",
+                [{"field": "status", "reason": "不在枚举范围内"}],
+            )
+    else:
+        status = None
+    need_audit = filters.get("needAudit")
+    if need_audit not in (None, ""):
+        raw = str(need_audit).strip().lower()
+        if raw not in ("true", "false"):
+            raise ApiError(
+                INVALID_ARGUMENT,
+                "needAudit 仅支持 true/false",
+                [{"field": "needAudit", "reason": "布尔值只能是 true/false"}],
+            )
+        need_audit = raw == "true"
+    else:
+        need_audit = None
+    keyword = str(filters.get("keyword") or "").strip()
+    return status, need_audit, keyword
+
+
+def _apply_list_filters(queryset, status, need_audit, keyword: str):
+    """列表筛选落查询（均通过解析层校验后才会到达）。"""
+    if status:
+        queryset = queryset.filter(status=status)
+    if need_audit is not None:
+        queryset = queryset.filter(type__need_audit=need_audit)
+    if keyword:
+        queryset = queryset.filter(remark__icontains=keyword)
+    return queryset
 
 
 def _resolve_owner(owner_type: str, owner_id: str):
@@ -159,7 +280,8 @@ def material_list(filters: dict, account) -> list:
     数据量增长后应改为归一化视图/联合查询（联调注记）。
     返回 (items, kind) 元组列表，供序列化层携带多态 kind。
     """
-    _require_admin_scope(account)
+    scope = _material_scope(account)
+    status, need_audit, keyword = _parse_list_filters(filters)
     owner_type = filters.get("ownerType")
     owner_id = filters.get("ownerId")
 
@@ -179,14 +301,21 @@ def material_list(filters: dict, account) -> list:
         owner_pk = _parse_owner_id(owner_id)
         kind = owner_type
         rows = (
-            _active_queryset(kind)
+            _apply_scope(_active_queryset(kind), kind, scope)
             .select_related("person" if kind == "PERSON" else "team", "type")
             .filter(**({"person_id": owner_pk} if kind == "PERSON" else {"team_id": owner_pk}))
             .order_by("-created_at", "-id")
         )
+        rows = _apply_list_filters(rows, status, need_audit, keyword)
         return [(m, kind) for m in rows]
-    person_rows = _active_queryset("PERSON").select_related("person", "type")
-    team_rows = _active_queryset("TEAM").select_related("team", "type")
+    person_rows = _apply_list_filters(
+        _apply_scope(_active_queryset("PERSON"), "PERSON", scope),
+        status, need_audit, keyword,
+    ).select_related("person", "type")
+    team_rows = _apply_list_filters(
+        _apply_scope(_active_queryset("TEAM"), "TEAM", scope),
+        status, need_audit, keyword,
+    ).select_related("team", "type")
     merged = sorted(
         chain(person_rows, team_rows),
         key=lambda m: (m.created_at, m.pk),
@@ -203,9 +332,10 @@ def material_create(payload: dict, account) -> tuple:
     事务内完成：材料行 + 文件归属回填（先传后绑）+ MaterialFileVersion v1 留痕。
     返回 (material, kind)。
     """
-    _require_admin_scope(account)
+    scope = _material_scope(account)
     owner_type = payload["ownerType"]
     owner = _resolve_owner(owner_type, payload["ownerId"])
+    _ensure_owner_in_scope(owner, scope)
     mtype = _resolve_material_type(payload["materialType"], owner_type)
     file_ids = payload.get("fileIds") or []
     if len(file_ids) != 1:
@@ -270,10 +400,13 @@ def material_review(material_id: str, payload: dict, account) -> tuple:
 
     前端 body 无归属类型字段，多态由 _get_material_any 双表解析。
     """
-    _require_admin_scope(account)
+    scope = _material_scope(account)
     from apps.persons.services import ensure_version, parse_path_id
 
     material, kind = _get_material_any(parse_path_id(material_id, "materialId"))
+    _ensure_owner_in_scope(
+        material.person if kind == "PERSON" else material.team, scope
+    )
     ensure_version(material, payload["version"])
     if material.status != enums.MaterialStatus.PENDING:
         raise ApiError(
@@ -306,6 +439,8 @@ def material_review(material_id: str, payload: dict, account) -> tuple:
             material_id=material.pk,
             from_status=from_status,
             to_status=material.status,
+            # auditor 恒空：底座账号 ID（acc_* 字符串）→ BigInteger 逻辑引用
+            # 映射未定（同 Material.audited_by 先例），映射定案后回填
             comment=reason,
         )
     return material, kind
@@ -318,10 +453,13 @@ def material_remove(material_id: str, version: int, account) -> None:
 
     前端仅传 ?version=，多态由 _get_material_any 双表解析。
     """
-    _require_admin_scope(account)
+    scope = _material_scope(account)
     from apps.persons.services import ensure_version, parse_path_id
 
     material, _kind = _get_material_any(parse_path_id(material_id, "materialId"))
+    _ensure_owner_in_scope(
+        material.person if _kind == "PERSON" else material.team, scope
+    )
     ensure_version(material, version)
     material.is_deleted = True
     material.deleted_at = timezone.now()
@@ -334,12 +472,39 @@ def material_get(material_id: str, account) -> tuple:
     """材料详情（批次 D-2）：多态双表解析，口径与 review/remove 完全一致。
 
     仅读取：软删行不可见（_active_queryset 同过滤规则）；两表同 id 有效行
-    → 409 STATE_CONFLICT（归属不明确，不静默择一）；数据范围同列表（一期仅 ADMIN）。
+    → 409 STATE_CONFLICT（归属不明确，不静默择一）；数据范围同列表
+    （P1-9：全局 ADMIN 全库 / UNIVERSITY 本校，越权显式 403）。
     """
-    _require_admin_scope(account)
+    scope = _material_scope(account)
     from apps.persons.services import parse_path_id
 
-    return _get_material_any(parse_path_id(material_id, "materialId"))
+    material, kind = _get_material_any(parse_path_id(material_id, "materialId"))
+    _ensure_owner_in_scope(
+        material.person if kind == "PERSON" else material.team, scope
+    )
+    return material, kind
+
+
+# ---------------------------------------------------------------- 审核历史
+
+def material_audit_logs(material_id: str, account):
+    """审核历史查询（P1-9 原定任务，2026-10-28 统一业务规则批准补齐）。
+
+    多态双表解析与数据范围同 material_get（全局 ADMIN 全库 / UNIVERSITY
+    本校，越权显式 403）；返回 (logs, kind)，logs 按创建时间正序（早→晚，
+    与状态机演进方向一致）。append-only 历史，仅读取不派生不聚合。
+    """
+    scope = _material_scope(account)
+    from apps.persons.services import parse_path_id
+
+    material, kind = _get_material_any(parse_path_id(material_id, "materialId"))
+    _ensure_owner_in_scope(
+        material.person if kind == "PERSON" else material.team, scope
+    )
+    logs = MaterialAuditLog.objects.filter(
+        material_kind=kind, material_id=material.pk
+    ).order_by("created_at", "id")
+    return logs, kind
 
 
 # ---------------------------------------------------------------- 更新
@@ -366,10 +531,13 @@ def material_update(material_id: str, payload: dict, account) -> tuple:
       或孤立审计记录；审计 from_status=to_status=当前状态（非状态变更操作
       历史），comment 记录更新动作。
     """
-    _require_admin_scope(account)
+    scope = _material_scope(account)
     from apps.persons.services import ensure_version, parse_path_id
 
     material, kind = _get_material_any(parse_path_id(material_id, "materialId"))
+    _ensure_owner_in_scope(
+        material.person if kind == "PERSON" else material.team, scope
+    )
     # T4-04-L13（2026-10-24 用户批准）：仅 PENDING 可更新。存在性/软删/双表
     # 冲突检查已完成，拒绝发生在任何业务写入之前（早于归属校验、乐观锁、
     # 文件认领、版本留痕与审计），与 materialReview 的 PENDING 门槛同口径。
@@ -461,6 +629,7 @@ def material_update(material_id: str, payload: dict, account) -> tuple:
             material_id=material.pk,
             from_status=material.status,
             to_status=material.status,
+            # auditor 恒空：底座账号 ID 映射未定（同上/同 Material.audited_by 先例）
             comment=f"更新材料: {material.remark}",
         )
     return material, kind

@@ -20,7 +20,7 @@ from django.db import IntegrityError
 from django.test import TestCase
 from django.utils import timezone
 
-from apps.accounts.models import Account, AuditLog
+from apps.accounts.models import Account, AuditLog, Organization
 from apps.attachments.models import FileRecord
 from apps.common import enums
 from apps.common.authentication import issue_access_token, make_password
@@ -32,7 +32,7 @@ from apps.materials.models import (
     PersonMaterial,
     TeamMaterial,
 )
-from apps.persons.models import Person, Region
+from apps.persons.models import Person, Region, School
 from apps.teams.models import Team
 
 BASE = "/api/v1/materials"
@@ -83,6 +83,24 @@ class MaterialApiTests(TestCase):
         # ---- 归属对象 ----
         province = Region.objects.create(name="丙省", code="900000", level=1)
         cls.city = Region.objects.create(name="丙州市", code="900100", level=2, parent=province)
+        cls.school_a = School.objects.create(
+            name="丙一小", code="SCH-900100-101", school_type="PRIMARY", region=cls.city
+        )
+        Organization.objects.create(
+            id="ORG-MSA", code="SCH-900100-101", name="丙一小组织", org_type="SCHOOL"
+        )
+        # D1（2026-10-28）：普通材料审核权限仅学校端——审核类测试统一改用
+        # 本校审核账号；ADMIN 仅保留创建/更新/删除/列表等系统管理能力
+        cls.uni_reviewer = Account.objects.create(
+            id=new_account_id(),
+            username="materials-reviewer",
+            display_name="学校审核员",
+            roles=["UNIVERSITY"],
+            password=make_password("review-pass-123"),
+            enabled=True,
+            organization_id="ORG-MSA",
+        )
+        cls.uni_reviewer_token = _token(cls.uni_reviewer)
 
         def _person(seq, name, deleted=False):
             return Person.objects.create(
@@ -93,6 +111,7 @@ class MaterialApiTests(TestCase):
                 id_card_masked=f"1101****{seq:04d}X",
                 person_category=enums.PersonCategory.ATHLETE,
                 audit_status=enums.AuditStatus.APPROVED,
+                school=cls.school_a,
                 is_deleted=deleted,
                 deleted_at=timezone.now() if deleted else None,
             )
@@ -102,7 +121,8 @@ class MaterialApiTests(TestCase):
         cls.person_c = _person(3, "材料丙")
         cls.person_del = _person(4, "材料删", deleted=True)
         cls.team_a = Team.objects.create(
-            team_no="T202600000101", name="丙一小男足队", category_code="PRIMARY", region=cls.city
+            team_no="T202600000101", name="丙一小男足队", category_code="PRIMARY",
+            region=cls.city, school=cls.school_a,
         )
         cls.team_soft = Team.objects.create(
             team_no="T202600000102",
@@ -245,13 +265,13 @@ class MaterialApiTests(TestCase):
         )
 
     def test_list_athlete_scope_denied(self):
-        """ATHLETE 在文档角色集内但数据范围一期仅 ADMIN（A′ 待决阻塞口径）。"""
+        """ATHLETE 本批未开放材料数据范围（P1-9：仅全局 ADMIN/UNIVERSITY 本校），保持拒绝。"""
         resp = self._get(BASE, token=self.athlete_token)
         self.assertEqual(resp.status_code, 403)
         self.assertEqual(resp.json()["code"], "DATA_SCOPE_DENIED")
 
     def test_list_university_scope_denied(self):
-        """UNIVERSITY 依赖 A′ 映射：范围拒绝（待决阻塞，非最终规则）。"""
+        """UNIVERSITY 无组织绑定（幽灵范围）默认拒绝；本校正向口径见 MaterialUniversityScopeTests。"""
         resp = self._get(BASE, token=self.uni_token, query={"ownerType": "PERSON", "ownerId": self.person_a.pk})
         self.assertEqual(resp.status_code, 403)
         self.assertEqual(resp.json()["code"], "DATA_SCOPE_DENIED")
@@ -468,7 +488,7 @@ class MaterialApiTests(TestCase):
         resp = self._post(
             f"{BASE}/{self.pm_pending.pk}/review",
             {"decision": "APPROVE", "version": version},
-            token=self.admin_token,
+            token=self.uni_reviewer_token,
         )
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.json()["data"]["reviewStatus"], "APPROVED")
@@ -484,7 +504,7 @@ class MaterialApiTests(TestCase):
         resp = self._post(
             f"{BASE}/{self.pm_pending.pk}/review",
             {"decision": "REJECT", "version": self._mver(self.pm_pending)},
-            token=self.admin_token,
+            token=self.uni_reviewer_token,
         )
         self.assertEqual(resp.status_code, 400)
 
@@ -493,7 +513,7 @@ class MaterialApiTests(TestCase):
         resp = self._post(
             f"{BASE}/{self.tm_pending.pk}/review",
             {"decision": "REJECT", "reason": "材料模糊不清", "version": version},
-            token=self.admin_token,
+            token=self.uni_reviewer_token,
         )
         self.assertEqual(resp.status_code, 200)
         data = resp.json()["data"]
@@ -508,7 +528,7 @@ class MaterialApiTests(TestCase):
         resp = self._post(
             f"{BASE}/{self.pm_approved.pk}/review",
             {"decision": "REJECT", "reason": "重复审核", "version": self._mver(self.pm_approved)},
-            token=self.admin_token,
+            token=self.uni_reviewer_token,
         )
         self.assertEqual(resp.status_code, 409)
 
@@ -516,7 +536,7 @@ class MaterialApiTests(TestCase):
         resp = self._post(
             f"{BASE}/{self.pm_pending.pk}/review",
             {"decision": "APPROVE", "version": self._mver(self.pm_pending) - 1},
-            token=self.admin_token,
+            token=self.uni_reviewer_token,
         )
         self.assertEqual(resp.status_code, 409)
         self.pm_pending.refresh_from_db()
@@ -526,7 +546,7 @@ class MaterialApiTests(TestCase):
         resp = self._post(
             f"{BASE}/{self.pm_pending.pk}/review",
             {"decision": "APPROVE"},
-            token=self.admin_token,
+            token=self.uni_reviewer_token,
         )
         self.assertEqual(resp.status_code, 400)
 
@@ -534,9 +554,28 @@ class MaterialApiTests(TestCase):
         resp = self._post(
             f"{BASE}/999999/review",
             {"decision": "APPROVE", "version": 1},
-            token=self.admin_token,
+            token=self.uni_reviewer_token,
         )
         self.assertEqual(resp.status_code, 404)
+
+    def test_admin_review_permission_denied(self):
+        """D1（2026-10-28 批准）：ADMIN 不拥有普通材料审核权限 → 403 FORBIDDEN。
+
+        权限点拒绝先于数据范围判定；全局 ADMIN 的数据范围能力（全库）
+        不推导审核权。状态不变、无审核日志。
+        """
+        resp = self._post(
+            f"{BASE}/{self.pm_pending.pk}/review",
+            {"decision": "APPROVE", "version": self._mver(self.pm_pending)},
+            token=self.admin_token,
+        )
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json()["code"], "FORBIDDEN")
+        self.pm_pending.refresh_from_db()
+        self.assertEqual(self.pm_pending.status, enums.MaterialStatus.PENDING)
+        self.assertFalse(
+            MaterialAuditLog.objects.filter(material_id=self.pm_pending.pk).exists()
+        )
 
     # ------------------------------------------------------------ 软删
 
@@ -597,14 +636,17 @@ class MaterialApiTests(TestCase):
         self._post(
             f"{BASE}/{self.pm_pending.pk}/review",
             {"decision": "APPROVE", "version": self._mver(self.pm_pending)},
-            token=self.admin_token,
+            token=self.uni_reviewer_token,
         )
         self.pm_pending.refresh_from_db()
         self._delete(
             f"{BASE}/{self.pm_pending.pk}", token=self.admin_token, version=self._mver(self.pm_pending)
         )
+        # 审核（material.review）由学校端审核账号触发（D1：ADMIN 无普通审核权限）
         actions = set(
-            AuditLog.objects.filter(operator_account_id=self.admin.pk).values_list("action", flat=True)
+            AuditLog.objects.filter(
+                operator_account_id__in=[self.admin.pk, self.uni_reviewer.pk]
+            ).values_list("action", flat=True)
         )
         self.assertTrue({"material.create", "material.review", "material.remove"} <= actions)
 
@@ -644,7 +686,7 @@ class MaterialApiTests(TestCase):
         resp = self._post(
             f"{BASE}/300/review",
             {"decision": "APPROVE", "version": 1},
-            token=self.admin_token,
+            token=self.uni_reviewer_token,
         )
         self.assertEqual(resp.status_code, 409)
         self.assertEqual(resp.json()["code"], "STATE_CONFLICT")
@@ -682,7 +724,7 @@ class MaterialApiTests(TestCase):
         resp = self._post(
             f"{BASE}/300/review",
             {"decision": "APPROVE", "version": version},
-            token=self.admin_token,
+            token=self.uni_reviewer_token,
         )
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.json()["data"]["ownerName"], "丙一小男足队")  # 解析到 TEAM
@@ -701,7 +743,7 @@ class MaterialApiTests(TestCase):
         resp = self._post(
             f"{BASE}/999888/review",
             {"decision": "APPROVE", "version": 1},
-            token=self.admin_token,
+            token=self.uni_reviewer_token,
         )
         self.assertEqual(resp.status_code, 404)
         resp2 = self._delete(f"{BASE}/999888", token=self.admin_token, version=1)
@@ -743,7 +785,7 @@ class MaterialApiTests(TestCase):
             resp = self._post(
                 f"{BASE}/{self.tm_pending.pk}/review",
                 {"decision": "APPROVE", "version": version},
-                token=self.admin_token,
+                token=self.uni_reviewer_token,
             )
         self.assertEqual(resp.status_code, 500)  # 未处理异常 → INTERNAL_ERROR 信封
         self.assertEqual(resp.json()["code"], "INTERNAL_ERROR")
@@ -1177,3 +1219,1037 @@ class MaterialApiTests(TestCase):
         self.assertFalse(
             MaterialAuditLog.objects.filter(material_kind="PERSON", material_id=self.pm_pending.pk).exists()
         )
+
+
+class MaterialUniversityScopeTests(TestCase):
+    """P0-1+P1-9（2026-10-28 批准）：材料审核纳入学校端 + UNIVERSITY 本校数据范围。
+
+    口径（同 persons A′ 编码映射）：
+    - UNIVERSITY 按所属组织子树编码过滤（School.code ↔ Organization.code），
+      列表过滤 + 单对象归属校验（越权目标显式 403 DATA_SCOPE_DENIED）；
+    - 归属对象无学校归属（Person/Team.school 可空）→ deny-by-default；
+    - 无组织绑定/软删组织绑定（幽灵）→ 默认拒绝不退化全库；
+    - 其他角色（CITY 等）本批未开放，保持拒绝；
+    - materialReview 权限点已纳入 UNIVERSITY（P0-1）。
+    写测试断言数据库最终状态，不只看 HTTP 状态码。
+
+    组织树夹具：
+        ORG-MPS(省,code=P-800) → ORG-MCT(市,code=C-800100)
+            → ORG-MSA(学校A,code=SCH-800100-701)
+        ORG-MPS → ORG-MSB(学校B,code=SCH-800200-801，在市子树之外)
+        ORG-MDEAD（软删组织，幽灵绑定用）
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        def make_account(username, roles, org_id=None):
+            return Account.objects.create(
+                id=new_account_id(),
+                username=username,
+                display_name=username,
+                roles=roles,
+                password=make_password("pass-123456"),
+                enabled=True,
+                organization_id=org_id,
+            )
+
+        cls.admin = make_account("msc-admin", ["ADMIN"])
+        cls.uni_a = make_account("msc-uni-a", ["UNIVERSITY"], org_id="ORG-MSA")
+        cls.uni_b = make_account("msc-uni-b", ["UNIVERSITY"], org_id="ORG-MSB")
+        cls.uni_ghost = make_account("msc-uni-ghost", ["UNIVERSITY"], org_id="ORG-MDEAD")
+        cls.city_acct = make_account("msc-city", ["CITY"], org_id="ORG-MCT")
+        cls.prov_acct = make_account("msc-prov", ["PROVINCE_REVIEWER"], org_id="ORG-MPS")
+        cls.admin_token = _token(cls.admin)
+        cls.uni_a_token = _token(cls.uni_a)
+        cls.uni_b_token = _token(cls.uni_b)
+        cls.uni_ghost_token = _token(cls.uni_ghost)
+        cls.city_token = _token(cls.city_acct)
+        cls.prov_token = _token(cls.prov_acct)
+
+        prov = Region.objects.create(name="材料范围省", code="800000", level=1)
+        city = Region.objects.create(name="材料范围市", code="800100", level=2, parent=prov)
+        prov2 = Region.objects.create(name="材料界外省", code="802000", level=1)
+        cls.school_a = School.objects.create(
+            name="材料一小", code="SCH-800100-701", school_type="PRIMARY", region=city
+        )
+        cls.school_b = School.objects.create(
+            name="材料界外校", code="SCH-800200-801", school_type="JUNIOR", region=prov2
+        )
+
+        Organization.objects.create(
+            id="ORG-MPS", code="P-800", name="材料省组织", org_type="PROVINCE"
+        )
+        Organization.objects.create(
+            id="ORG-MCT", code="C-800100", name="材料市组织",
+            org_type="CITY", parent_id="ORG-MPS",
+        )
+        Organization.objects.create(
+            id="ORG-MSA", code="SCH-800100-701", name="材料一小组织",
+            org_type="SCHOOL", parent_id="ORG-MCT",
+        )
+        Organization.objects.create(
+            id="ORG-MSB", code="SCH-800200-801", name="材料界外校组织",
+            org_type="SCHOOL", parent_id="ORG-MPS",
+        )
+        Organization.objects.create(
+            id="ORG-MDEAD", code="C-DEAD-M", name="材料已删组织",
+            org_type="CITY", parent_id="ORG-MPS",
+        )
+        # 软删组织绑定：模拟组织被删除后账号绑定未清理（幽灵绑定）
+        Organization.objects.filter(pk="ORG-MDEAD").update(deleted_at=timezone.now())
+
+        def make_person(no, name, school):
+            return Person.objects.create(
+                person_no=f"P2026{no:08d}",
+                full_name=name,
+                id_card_cipher=f"msc-cipher-{no}",
+                id_card_hash=f"msc-hash-{no}",
+                id_card_masked=f"1101****{no:04d}X",
+                person_category=enums.PersonCategory.ATHLETE,
+                audit_status=enums.AuditStatus.APPROVED,
+                school=school,
+            )
+
+        cls.p_a = make_person(701, "校属甲", cls.school_a)
+        cls.p_b = make_person(702, "校外乙", cls.school_b)
+        cls.p_none = make_person(703, "无校丙", None)
+        cls.team_a = Team.objects.create(
+            team_no="T202600000701", name="材料校队甲",
+            category_code="PRIMARY", region=city, school=cls.school_a,
+        )
+        cls.team_b = Team.objects.create(
+            team_no="T202600000702", name="材料校队乙",
+            category_code="PRIMARY", school=cls.school_b,
+        )
+
+        cls.type_person = MaterialType.objects.create(
+            code="MSC_AWARD", name="范围获奖证书", applies_to="PERSON"
+        )
+        cls.type_person_multi = MaterialType.objects.create(
+            code="MSC_REPORT", name="范围报告", applies_to="PERSON", allow_multiple=True
+        )
+        cls.type_team = MaterialType.objects.create(
+            code="MSC_HONOR", name="范围球队荣誉", applies_to="TEAM"
+        )
+
+        def _file(owner_type, owner_id="", name="范围材料.pdf"):
+            return FileRecord.objects.create(
+                id=new_file_id(),
+                owner_type=owner_type,
+                owner_id=owner_id,
+                original_name=name,
+                storage_key=f"msc/{name}",
+                uploaded_by="tester",
+            )
+
+        cls.file_a = _file("PERSON", owner_id=str(cls.p_a.pk))
+        cls.file_b = _file("PERSON", owner_id=str(cls.p_b.pk))
+        cls.file_none = _file("PERSON", name="无校人员文件.pdf")
+        cls.file_free_a = _file("PERSON", name="新建无主人员文件.pdf")  # 创建正向用例（先传后绑）
+        cls.file_ta = _file("TEAM", owner_id=str(cls.team_a.pk))
+        cls.file_tb = _file("TEAM", owner_id=str(cls.team_b.pk))
+
+        # 显式错开两表主键，避免 _get_material_any 双表解析撞 id
+        cls.pm_a = PersonMaterial.objects.create(
+            person=cls.p_a, type=cls.type_person, file_id=cls.file_a.pk,
+            file_name="甲.pdf", status=enums.MaterialStatus.PENDING, remark="甲材料",
+        )
+        cls.pm_b = PersonMaterial.objects.create(
+            person=cls.p_b, type=cls.type_person, file_id=cls.file_b.pk,
+            file_name="乙.pdf", status=enums.MaterialStatus.PENDING, remark="乙材料",
+        )
+        cls.pm_none = PersonMaterial.objects.create(
+            person=cls.p_none, type=cls.type_person, file_id=cls.file_none.pk,
+            file_name="丙.pdf", status=enums.MaterialStatus.PENDING, remark="无校材料",
+        )
+        cls.tm_a = TeamMaterial.objects.create(
+            pk=401, team=cls.team_a, type=cls.type_team, file_id=cls.file_ta.pk,
+            file_name="甲队.pdf", status=enums.MaterialStatus.PENDING, remark="甲队材料",
+        )
+        cls.tm_b = TeamMaterial.objects.create(
+            pk=402, team=cls.team_b, type=cls.type_team, file_id=cls.file_tb.pk,
+            file_name="乙队.pdf", status=enums.MaterialStatus.PENDING, remark="乙队材料",
+        )
+
+    # ------------------------------------------------------------ helpers
+
+    @staticmethod
+    def _auth(token):
+        return {"HTTP_AUTHORIZATION": f"Bearer {token}"} if token else {}
+
+    def _get(self, path, token=None, query=None):
+        return self.client.get(path, data=query or {}, **self._auth(token))
+
+    def _post(self, path, payload, token=None):
+        return self.client.post(
+            path, data=json.dumps(payload), content_type="application/json", **self._auth(token)
+        )
+
+    def _put(self, path, payload, token=None):
+        return self.client.put(
+            path, data=json.dumps(payload), content_type="application/json", **self._auth(token)
+        )
+
+    def _delete(self, path, token=None, version=None):
+        if version is not None:
+            path = f"{path}?version={version}"
+        return self.client.delete(path, **self._auth(token))
+
+    @staticmethod
+    def _mver(material) -> int:
+        return int(material.updated_at.timestamp() * 1_000_000)
+
+    def _review_body(self, material, decision="APPROVE"):
+        return {"decision": decision, "version": self._mver(material)}
+
+    def _update_payload(self, material, **overrides) -> dict:
+        is_person = isinstance(material, PersonMaterial)
+        payload = {
+            "ownerType": "PERSON" if is_person else "TEAM",
+            "ownerId": str(material.person_id if is_person else material.team_id),
+            "materialType": material.type.code,
+            "title": "范围内更新标题",
+            "fileIds": [material.file_id],
+            "version": self._mver(material),
+        }
+        payload.update(overrides)
+        return payload
+
+    # ------------------------------------------------------------ 权限点（P0-1）
+
+    def test_review_permission_includes_university(self):
+        from apps.common.permissions import operation_roles
+
+        # D1（2026-10-28 批准）：普通材料审核权限仅学校端；
+        # ADMIN/CITY/PROVINCE_REVIEWER 均不在审核点。
+        self.assertEqual(operation_roles("materialReview"), ("UNIVERSITY",))
+
+    def test_city_review_permission_denied(self):
+        """CITY 无材料审核权限（统一规则：只审报名）→ 权限点 403 FORBIDDEN，
+        先于数据范围判定。"""
+        resp = self._post(
+            f"{BASE}/{self.pm_a.pk}/review", self._review_body(self.pm_a), token=self.city_token
+        )
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json()["code"], "FORBIDDEN")
+        self.pm_a.refresh_from_db()
+        self.assertEqual(self.pm_a.status, enums.MaterialStatus.PENDING)
+
+    def test_province_review_permission_denied(self):
+        """PROVINCE_REVIEWER 无材料审核权限（统一规则：只审报名）→ 权限点
+        403 FORBIDDEN，先于数据范围判定；材料状态与审核历史零变更。"""
+        resp = self._post(
+            f"{BASE}/{self.pm_a.pk}/review", self._review_body(self.pm_a), token=self.prov_token
+        )
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json()["code"], "FORBIDDEN")
+        self.pm_a.refresh_from_db()
+        self.assertEqual(self.pm_a.status, enums.MaterialStatus.PENDING)
+        self.assertFalse(
+            MaterialAuditLog.objects.filter(
+                material_kind="PERSON", material_id=self.pm_a.pk
+            ).exists()
+        )
+
+    def test_city_history_scope_denied(self):
+        """CITY 在 materialHistory 角色集内（同 materialGet），但数据范围拒绝。"""
+        resp = self._get(f"{BASE}/{self.pm_a.pk}/audit-logs", token=self.city_token)
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json()["code"], "DATA_SCOPE_DENIED")
+
+    # ------------------------------------------------------------ 审核正向（本校）
+
+    def test_review_own_school_person_material_approved(self):
+        resp = self._post(
+            f"{BASE}/{self.pm_a.pk}/review", self._review_body(self.pm_a), token=self.uni_a_token
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.pm_a.refresh_from_db()
+        self.assertEqual(self.pm_a.status, enums.MaterialStatus.APPROVED)
+        self.assertIsNotNone(self.pm_a.audited_at)
+        self.assertTrue(
+            MaterialAuditLog.objects.filter(
+                material_kind="PERSON", material_id=self.pm_a.pk,
+                to_status=enums.MaterialStatus.APPROVED,
+            ).exists()
+        )
+
+    def test_review_own_school_team_material_approved(self):
+        resp = self._post(
+            f"{BASE}/{self.tm_a.pk}/review", self._review_body(self.tm_a), token=self.uni_a_token
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.tm_a.refresh_from_db()
+        self.assertEqual(self.tm_a.status, enums.MaterialStatus.APPROVED)
+        self.assertTrue(
+            MaterialAuditLog.objects.filter(
+                material_kind="TEAM", material_id=self.tm_a.pk,
+                to_status=enums.MaterialStatus.APPROVED,
+            ).exists()
+        )
+
+    # ------------------------------------------------------------ 越权拒绝（显式 403）
+
+    def test_review_other_school_person_material_denied(self):
+        resp = self._post(
+            f"{BASE}/{self.pm_b.pk}/review", self._review_body(self.pm_b), token=self.uni_a_token
+        )
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json()["code"], "DATA_SCOPE_DENIED")
+        self.pm_b.refresh_from_db()
+        self.assertEqual(self.pm_b.status, enums.MaterialStatus.PENDING)  # 状态未变
+        self.assertIsNone(self.pm_b.audited_at)
+        self.assertFalse(
+            MaterialAuditLog.objects.filter(material_kind="PERSON", material_id=self.pm_b.pk).exists()
+        )
+
+    def test_review_other_school_team_material_denied(self):
+        resp = self._post(
+            f"{BASE}/{self.tm_b.pk}/review", self._review_body(self.tm_b), token=self.uni_a_token
+        )
+        self.assertEqual(resp.status_code, 403)
+        self.tm_b.refresh_from_db()
+        self.assertEqual(self.tm_b.status, enums.MaterialStatus.PENDING)
+        self.assertFalse(
+            MaterialAuditLog.objects.filter(material_kind="TEAM", material_id=self.tm_b.pk).exists()
+        )
+
+    def test_review_no_school_owner_denied(self):
+        """归属人员无学校归属 → deny-by-default（无法证明在授权范围内）。"""
+        resp = self._post(
+            f"{BASE}/{self.pm_none.pk}/review",
+            self._review_body(self.pm_none),
+            token=self.uni_a_token,
+        )
+        self.assertEqual(resp.status_code, 403)
+        self.pm_none.refresh_from_db()
+        self.assertEqual(self.pm_none.status, enums.MaterialStatus.PENDING)
+
+    def test_get_other_school_material_denied(self):
+        resp = self._get(f"{BASE}/{self.pm_b.pk}", token=self.uni_a_token)
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json()["code"], "DATA_SCOPE_DENIED")
+
+    def test_get_no_school_owner_denied(self):
+        resp = self._get(f"{BASE}/{self.pm_none.pk}", token=self.uni_a_token)
+        self.assertEqual(resp.status_code, 403)
+
+    def test_update_other_school_material_denied(self):
+        resp = self._put(
+            f"{BASE}/{self.pm_b.pk}",
+            self._update_payload(self.pm_b, title="越权更新"),
+            token=self.uni_a_token,
+        )
+        self.assertEqual(resp.status_code, 403)
+        self.pm_b.refresh_from_db()
+        self.assertEqual(self.pm_b.remark, "乙材料")  # 零写入
+
+    def test_remove_other_school_material_denied(self):
+        resp = self._delete(
+            f"{BASE}/{self.tm_b.pk}", token=self.uni_a_token, version=self._mver(self.tm_b)
+        )
+        self.assertEqual(resp.status_code, 403)
+        self.tm_b.refresh_from_db()
+        self.assertFalse(self.tm_b.is_deleted)  # 未被软删
+
+    def test_create_other_school_owner_denied(self):
+        payload = {
+            "ownerType": "PERSON",
+            "ownerId": str(self.p_b.pk),
+            "materialType": "MSC_AWARD",
+            "title": "越权创建",
+            "fileName": "越权.pdf",
+            "fileIds": [self.file_b.pk],
+        }
+        resp = self._post(BASE, payload, token=self.uni_a_token)
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json()["code"], "DATA_SCOPE_DENIED")
+        self.assertFalse(
+            PersonMaterial.objects.filter(person=self.p_b, remark="越权创建").exists()
+        )
+
+    # ------------------------------------------------------------ 列表范围
+
+    def test_list_only_own_school_materials(self):
+        """无 ownerType 全量列表：仅本校（学校A）材料可见，含 PERSON+TEAM 两表。"""
+        resp = self._get(BASE, token=self.uni_a_token, query={"page": 1, "pageSize": 50})
+        self.assertEqual(resp.status_code, 200)
+        items = resp.json()["data"]["items"]
+        ids = {(i["ownerType"], i["ownerId"]) for i in items}
+        self.assertIn(("PERSON", str(self.p_a.pk)), ids)
+        self.assertIn(("TEAM", str(self.team_a.pk)), ids)
+        self.assertNotIn(("PERSON", str(self.p_b.pk)), ids)
+        self.assertNotIn(("TEAM", str(self.team_b.pk)), ids)
+        self.assertNotIn(("PERSON", str(self.p_none.pk)), ids)  # 无校归属不可见
+
+    def test_list_owner_scoped_other_school_returns_empty(self):
+        """指定校外 owner 查询：范围过滤后为空列表（不泄露数据）。"""
+        resp = self._get(
+            BASE,
+            token=self.uni_a_token,
+            query={"ownerType": "PERSON", "ownerId": self.p_b.pk, "page": 1, "pageSize": 10},
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["data"]["total"], 0)
+        self.assertEqual(resp.json()["data"]["items"], [])
+
+    def test_list_owner_scoped_own_school_returns_rows(self):
+        resp = self._get(
+            BASE,
+            token=self.uni_a_token,
+            query={"ownerType": "TEAM", "ownerId": self.team_a.pk, "page": 1, "pageSize": 10},
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["data"]["total"], 1)
+
+    # ------------------------------------------------------------ 幽灵绑定与其他角色
+
+    def test_ghost_org_binding_denied(self):
+        """软删组织绑定（幽灵）：默认拒绝，不退化为全库。"""
+        resp = self._get(BASE, token=self.uni_ghost_token)
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json()["code"], "DATA_SCOPE_DENIED")
+
+    def test_city_role_still_denied(self):
+        """CITY 本批未开放材料数据范围（P1-9 批次边界），保持拒绝。"""
+        resp = self._get(BASE, token=self.city_token)
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json()["code"], "DATA_SCOPE_DENIED")
+
+    def test_create_own_school_owner_ok(self):
+        """UNIVERSITY 本校创建材料正向：先传后绑文件认领成功（多份类型避开 R6）。"""
+        payload = {
+            "ownerType": "PERSON",
+            "ownerId": str(self.p_a.pk),
+            "materialType": "MSC_REPORT",
+            "title": "校内新建材料",
+            "fileName": "新建.pdf",
+            "fileIds": [self.file_free_a.pk],
+        }
+        resp = self._post(BASE, payload, token=self.uni_a_token)
+        self.assertEqual(resp.status_code, 200)
+        self.file_free_a.refresh_from_db()
+        self.assertEqual(self.file_free_a.owner_id, str(self.p_a.pk))  # 认领回填
+        self.assertTrue(
+            PersonMaterial.objects.filter(person=self.p_a, remark="校内新建材料").exists()
+        )
+
+
+class MaterialListFiltersAndHistoryTests(TestCase):
+    """P1-9 原定任务（2026-10-28 统一业务规则批准补齐）：
+
+    1) 材料列表 status/needAudit/keyword 筛选（keyword 按材料标题 remark
+       包含匹配）；
+    2) GET /materials/{id}/audit-logs 审核历史查询（多态双表解析，按创建
+       时间正序）。
+    数据范围不变：全局 ADMIN 全库；UNIVERSITY 本校；越权 403；
+    CITY 无审核权限点（FORBIDDEN）但可尝试历史读取（由范围拒绝）。
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        def make_account(username, roles, org_id=None):
+            return Account.objects.create(
+                id=new_account_id(),
+                username=username,
+                display_name=username,
+                roles=roles,
+                password=make_password("pass-123456"),
+                enabled=True,
+                organization_id=org_id,
+            )
+
+        cls.admin = make_account("lf-admin", ["ADMIN"])
+        cls.uni_a = make_account("lf-uni-a", ["UNIVERSITY"], org_id="ORG-LMSA")
+        cls.uni_b = make_account("lf-uni-b", ["UNIVERSITY"], org_id="ORG-LMSB")
+        cls.city_acct = make_account("lf-city", ["CITY"], org_id="ORG-LMCT")
+        cls.admin_token = _token(cls.admin)
+        cls.uni_a_token = _token(cls.uni_a)
+        cls.uni_b_token = _token(cls.uni_b)
+        cls.city_token = _token(cls.city_acct)
+
+        prov = Region.objects.create(name="筛选省", code="810000", level=1)
+        city = Region.objects.create(name="筛选市", code="810100", level=2, parent=prov)
+        prov2 = Region.objects.create(name="筛选界外省", code="812000", level=1)
+        cls.school_a = School.objects.create(
+            name="筛选一小", code="SCH-810100-701", school_type="PRIMARY", region=city
+        )
+        cls.school_b = School.objects.create(
+            name="筛选界外校", code="SCH-810200-801", school_type="JUNIOR", region=prov2
+        )
+        Organization.objects.create(
+            id="ORG-LMPS", code="P-810", name="筛选省组织", org_type="PROVINCE"
+        )
+        Organization.objects.create(
+            id="ORG-LMCT", code="C-810100", name="筛选市组织",
+            org_type="CITY", parent_id="ORG-LMPS",
+        )
+        Organization.objects.create(
+            id="ORG-LMSA", code="SCH-810100-701", name="筛选一小组织",
+            org_type="SCHOOL", parent_id="ORG-LMCT",
+        )
+        Organization.objects.create(
+            id="ORG-LMSB", code="SCH-810200-801", name="筛选界外校组织",
+            org_type="SCHOOL", parent_id="ORG-LMPS",
+        )
+
+        def _person(no, name, school):
+            return Person.objects.create(
+                person_no=f"P2026{no:08d}",
+                full_name=name,
+                id_card_cipher=f"lf-cipher-{no}",
+                id_card_hash=f"lf-hash-{no}",
+                id_card_masked=f"1101****{no:04d}X",
+                person_category=enums.PersonCategory.ATHLETE,
+                audit_status=enums.AuditStatus.APPROVED,
+                school=school,
+            )
+
+        cls.p_a = _person(801, "筛选甲", cls.school_a)
+        cls.p_b = _person(802, "筛选乙", cls.school_b)
+        cls.team_a = Team.objects.create(
+            team_no="T202600000801", name="筛选校队甲",
+            category_code="PRIMARY", region=city, school=cls.school_a,
+        )
+
+        cls.type_need = MaterialType.objects.create(
+            code="LF_NEED", name="筛选需审类型", applies_to="PERSON"
+        )
+        cls.type_free = MaterialType.objects.create(
+            code="LF_FREE", name="筛选免审类型", applies_to="PERSON", need_audit=False
+        )
+        cls.type_team = MaterialType.objects.create(
+            code="LF_TEAM", name="筛选球队类型", applies_to="TEAM"
+        )
+
+        def _file(owner_type, owner_id="", name="筛选材料.pdf"):
+            return FileRecord.objects.create(
+                id=new_file_id(),
+                owner_type=owner_type,
+                owner_id=owner_id,
+                original_name=name,
+                storage_key=f"lf/{name}",
+                uploaded_by="tester",
+            )
+
+        cls.file_pa = _file("PERSON", owner_id=str(cls.p_a.pk))
+        cls.file_pb = _file("PERSON", owner_id=str(cls.p_b.pk))
+        cls.file_ta = _file("TEAM", owner_id=str(cls.team_a.pk))
+
+        cls.pm_pending_need = PersonMaterial.objects.create(  # 甲·需审·待审
+            person=cls.p_a, type=cls.type_need, file_id=cls.file_pa.pk,
+            file_name="甲.pdf", status=enums.MaterialStatus.PENDING, remark="甲的体检报告",
+        )
+        cls.pm_approved_need = PersonMaterial.objects.create(  # 甲·需审·已通过
+            person=cls.p_a, type=cls.type_need, file_id=cls.file_pa.pk,
+            file_name="甲2.pdf", status=enums.MaterialStatus.APPROVED, remark="甲的证书",
+        )
+        cls.pm_pending_free = PersonMaterial.objects.create(  # 甲·免审·待审
+            person=cls.p_a, type=cls.type_free, file_id=cls.file_pa.pk,
+            file_name="甲3.pdf", status=enums.MaterialStatus.PENDING, remark="免审直通单",
+        )
+        cls.pm_pending_other = PersonMaterial.objects.create(  # 乙（界外校）
+            person=cls.p_b, type=cls.type_need, file_id=cls.file_pb.pk,
+            file_name="乙.pdf", status=enums.MaterialStatus.PENDING, remark="乙的证书",
+        )
+        cls.tm_pending = TeamMaterial.objects.create(  # 甲校球队材料
+            pk=501, team=cls.team_a, type=cls.type_team, file_id=cls.file_ta.pk,
+            file_name="甲队.pdf", status=enums.MaterialStatus.PENDING, remark="丙队荣誉",
+        )
+
+    # ------------------------------------------------------------ helpers
+
+    @staticmethod
+    def _auth(token):
+        return {"HTTP_AUTHORIZATION": f"Bearer {token}"} if token else {}
+
+    def _get(self, path, token=None, query=None):
+        return self.client.get(path, data=query or {}, **self._auth(token))
+
+    def _post(self, path, payload, token=None):
+        return self.client.post(
+            path, data=json.dumps(payload), content_type="application/json", **self._auth(token)
+        )
+
+    @staticmethod
+    def _mver(material) -> int:
+        return int(material.updated_at.timestamp() * 1_000_000)
+
+    def _ids(self, resp):
+        return {item["id"] for item in resp.json()["data"]["items"]}
+
+    # ------------------------------------------------------------ status 筛选
+
+    def test_status_filter_pending(self):
+        resp = self._get(BASE, token=self.admin_token, query={"status": "PENDING"})
+        self.assertEqual(resp.status_code, 200)
+        ids = self._ids(resp)
+        self.assertIn(str(self.pm_pending_need.pk), ids)
+        self.assertIn(str(self.pm_pending_free.pk), ids)
+        self.assertIn(str(self.tm_pending.pk), ids)  # 两表合并后同样生效
+        self.assertNotIn(str(self.pm_approved_need.pk), ids)
+
+    def test_status_filter_rejected(self):
+        rejected = PersonMaterial.objects.create(
+            person=self.p_a, type=self.type_need, file_id=self.file_pa.pk,
+            file_name="甲4.pdf", status=enums.MaterialStatus.REJECTED, remark="甲被驳回单",
+        )
+        resp = self._get(BASE, token=self.admin_token, query={"status": "REJECTED"})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(self._ids(resp), {str(rejected.pk)})
+
+    def test_status_filter_invalid_value_400(self):
+        resp = self._get(BASE, token=self.admin_token, query={"status": "NO_SUCH"})
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.json()["code"], "INVALID_ARGUMENT")
+
+    # ------------------------------------------------------------ needAudit 筛选
+
+    def test_need_audit_filter_true_false(self):
+        resp = self._get(BASE, token=self.admin_token, query={"needAudit": "true"})
+        self.assertEqual(resp.status_code, 200)
+        ids = self._ids(resp)
+        self.assertNotIn(str(self.pm_pending_free.pk), ids)  # 免审类型被排除
+        self.assertIn(str(self.pm_pending_need.pk), ids)
+
+        resp = self._get(BASE, token=self.admin_token, query={"needAudit": "false"})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(self._ids(resp), {str(self.pm_pending_free.pk)})
+
+    def test_need_audit_filter_invalid_value_400(self):
+        resp = self._get(BASE, token=self.admin_token, query={"needAudit": "yes"})
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.json()["code"], "INVALID_ARGUMENT")
+
+    # ------------------------------------------------------------ keyword 筛选
+
+    def test_keyword_filter_matches_title(self):
+        resp = self._get(BASE, token=self.admin_token, query={"keyword": "甲的"})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(
+            self._ids(resp),
+            {str(self.pm_pending_need.pk), str(self.pm_approved_need.pk)},
+        )
+
+    def test_keyword_filter_is_trimmed(self):
+        resp = self._get(BASE, token=self.admin_token, query={"keyword": "  甲的  "})
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn(str(self.pm_pending_need.pk), self._ids(resp))
+
+    def test_keyword_filter_no_match_empty(self):
+        resp = self._get(BASE, token=self.admin_token, query={"keyword": "不存在的标题"})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["data"]["total"], 0)
+        self.assertEqual(resp.json()["data"]["items"], [])
+
+    def test_combined_filters(self):
+        resp = self._get(
+            BASE, token=self.admin_token, query={"status": "PENDING", "keyword": "甲的"}
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(self._ids(resp), {str(self.pm_pending_need.pk)})
+
+    def test_owner_scoped_with_status_filter(self):
+        resp = self._get(
+            BASE,
+            token=self.admin_token,
+            query={
+                "ownerType": "PERSON", "ownerId": self.p_a.pk,
+                "status": "APPROVED", "page": 1, "pageSize": 10,
+            },
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(self._ids(resp), {str(self.pm_approved_need.pk)})
+
+    def test_filters_respect_data_scope(self):
+        """筛选不得扩大数据范围：UNIVERSITY 校 A 用 status=PENDING 只见本校。"""
+        resp = self._get(BASE, token=self.uni_a_token, query={"status": "PENDING"})
+        self.assertEqual(resp.status_code, 200)
+        ids = self._ids(resp)
+        self.assertIn(str(self.pm_pending_need.pk), ids)
+        self.assertIn(str(self.tm_pending.pk), ids)
+        self.assertNotIn(str(self.pm_pending_other.pk), ids)  # 界外校不可见
+
+    # ------------------------------------------------------------ 审核历史
+
+    def test_history_after_review(self):
+        resp = self._post(
+            f"{BASE}/{self.pm_pending_need.pk}/review",
+            {"decision": "APPROVE", "version": self._mver(self.pm_pending_need)},
+            token=self.uni_a_token,  # D1：审核由学校端执行
+        )
+        self.assertEqual(resp.status_code, 200)
+        resp = self._get(f"{BASE}/{self.pm_pending_need.pk}/audit-logs", token=self.admin_token)
+        self.assertEqual(resp.status_code, 200)
+        logs = resp.json()["data"]["items"]
+        self.assertEqual(resp.json()["data"]["total"], 1)
+        self.assertEqual(len(logs), 1)
+        entry = logs[0]
+        self.assertEqual(entry["fromStatus"], enums.MaterialStatus.PENDING)
+        self.assertEqual(entry["toStatus"], enums.MaterialStatus.APPROVED)
+        self.assertEqual(entry["materialType"], "PERSON")
+        self.assertEqual(entry["materialId"], str(self.pm_pending_need.pk))
+        # auditor 恒空：底座账号 ID（acc_*）→ BigInteger 逻辑引用映射未定，
+        # 同 Material.audited_by 先例；映射定案后回填
+        self.assertIsNone(entry["auditor"])
+        self.assertIsNotNone(entry["createdAt"])
+
+    def test_history_order_ascending(self):
+        MaterialAuditLog.objects.create(
+            material_kind="PERSON", material_id=self.pm_pending_need.pk,
+            from_status=enums.MaterialStatus.DRAFT, to_status=enums.MaterialStatus.PENDING,
+            auditor=None, comment="第一笔",
+        )
+        MaterialAuditLog.objects.create(
+            material_kind="PERSON", material_id=self.pm_pending_need.pk,
+            from_status=enums.MaterialStatus.PENDING, to_status=enums.MaterialStatus.PENDING,
+            auditor=None, comment="第二笔",
+        )
+        resp = self._get(f"{BASE}/{self.pm_pending_need.pk}/audit-logs", token=self.admin_token)
+        self.assertEqual(resp.status_code, 200)
+        comments = [log["comment"] for log in resp.json()["data"]["items"]]
+        self.assertEqual(comments, ["第一笔", "第二笔"])  # 正序：早→晚
+
+    def test_history_pagination(self):
+        """D3：审核历史走统一分页规范（page 从 1 起、pageSize 上限 100、
+        data 四字段），排序跨页稳定（created_at, id 正序）。"""
+        for no in range(1, 4):
+            MaterialAuditLog.objects.create(
+                material_kind="PERSON", material_id=self.pm_pending_need.pk,
+                from_status=enums.MaterialStatus.DRAFT, to_status=enums.MaterialStatus.PENDING,
+                auditor=None, comment=f"第{no}笔",
+            )
+        base = f"{BASE}/{self.pm_pending_need.pk}/audit-logs"
+        resp = self._get(base, token=self.admin_token, query={"page": 1, "pageSize": 2})
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()["data"]
+        self.assertEqual(data["total"], 3)
+        self.assertEqual(data["page"], 1)
+        self.assertEqual(data["pageSize"], 2)
+        self.assertEqual([log["comment"] for log in data["items"]], ["第1笔", "第2笔"])
+
+        resp = self._get(base, token=self.admin_token, query={"page": 2, "pageSize": 2})
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()["data"]
+        self.assertEqual([log["comment"] for log in data["items"]], ["第3笔"])
+
+        # 越界页：items 空但 total 不变
+        resp = self._get(base, token=self.admin_token, query={"page": 99, "pageSize": 2})
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()["data"]
+        self.assertEqual(data["items"], [])
+        self.assertEqual(data["total"], 3)
+
+        # 非法分页参数退回默认（read_page_params 约定：不报错，page=1 默认页大小）
+        resp = self._get(base, token=self.admin_token, query={"page": "abc", "pageSize": -1})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["data"]["total"], 3)
+
+    def test_history_missing_material_404(self):
+        resp = self._get(f"{BASE}/999999/audit-logs", token=self.admin_token)
+        self.assertEqual(resp.status_code, 404)
+
+    def test_history_scope_other_school_denied(self):
+        resp = self._get(f"{BASE}/{self.pm_pending_other.pk}/audit-logs", token=self.uni_a_token)
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json()["code"], "DATA_SCOPE_DENIED")
+
+    def test_history_scope_own_school_ok(self):
+        resp = self._get(f"{BASE}/{self.tm_pending.pk}/audit-logs", token=self.uni_a_token)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["data"]["items"], [])  # 尚无审核记录，空列表不报错
+
+    def test_history_university_b_binding_own_school(self):
+        """UNIVERSITY 校 B 只能查自己学校（乙）的材料历史。"""
+        resp = self._get(f"{BASE}/{self.pm_pending_other.pk}/audit-logs", token=self.uni_b_token)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["data"]["items"], [])
+
+
+class MaterialTeamScopeTests(TestCase):
+    """D5（2026-10-28 批准）：TEAM 本队材料数据范围（一·补四）。
+
+    绑定机制：accounts.Account.team_ids（ADMIN 账号管理维护，attachments
+    域已作权威归属校验先例）。球队端：仅本队 TEAM 材料的列表/详情/创建/
+    更新/软删/审核历史；PERSON 材料一律不可见；不开放任何审核权限
+    （维护权限≠审核权限）；服务端校验归属，不信任客户端传参。
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        def make_account(username, roles, org_id=None, team_ids=None):
+            return Account.objects.create(
+                id=new_account_id(),
+                username=username,
+                display_name=username,
+                roles=roles,
+                password=make_password("pass-123456"),
+                enabled=True,
+                organization_id=org_id,
+                team_ids=team_ids or [],
+            )
+
+        cls.admin = make_account("ts-admin", ["ADMIN"])
+        cls.team_a_acct = make_account("ts-team-a", ["TEAM"], team_ids=None)
+        cls.team_a_acct.team_ids = [501]  # 绑定甲队（Account.team_ids 权威绑定）
+        cls.team_a_acct.save(update_fields=["team_ids"])
+        cls.team_b_acct = make_account("ts-team-b", ["TEAM"], team_ids=[502])
+        cls.team_none_acct = make_account("ts-team-none", ["TEAM"])  # 空绑定
+        cls.admin_token = _token(cls.admin)
+        cls.team_a_token = _token(cls.team_a_acct)
+        cls.team_b_token = _token(cls.team_b_acct)
+        cls.team_none_token = _token(cls.team_none_acct)
+
+        province = Region.objects.create(name="球队省", code="820000", level=1)
+        city = Region.objects.create(name="球队市", code="820100", level=2, parent=province)
+        school_a = School.objects.create(
+            name="球队一小", code="SCH-820100-901", school_type="PRIMARY", region=city
+        )
+        cls.team_a = Team.objects.create(
+            pk=501, team_no="T202600000901", name="球队一小甲队",
+            category_code="PRIMARY", region=city, school=school_a,
+        )
+        cls.team_b = Team.objects.create(
+            pk=502, team_no="T202600000902", name="球队二小乙队",
+            category_code="PRIMARY", region=city,
+        )
+        cls.person_a = Person.objects.create(
+            person_no="P202608000001",
+            full_name="球队甲员",
+            id_card_cipher="ts-cipher-1",
+            id_card_hash="ts-hash-1",
+            id_card_masked="1101****0001X",
+            person_category=enums.PersonCategory.ATHLETE,
+            audit_status=enums.AuditStatus.APPROVED,
+            school=school_a,
+        )
+        cls.type_team = MaterialType.objects.create(
+            code="TS_TEAM_HONOR", name="TS球队荣誉", applies_to="TEAM"
+        )
+        cls.type_team_multi = MaterialType.objects.create(  # R6 放开：创建正向用
+            code="TS_TEAM_REPORT", name="TS球队报告", applies_to="TEAM", allow_multiple=True
+        )
+        cls.type_person = MaterialType.objects.create(
+            code="TS_PERSON_CERT", name="TS人员证书", applies_to="PERSON"
+        )
+
+        def _file(owner_type, owner_id="", name="球队材料.pdf"):
+            return FileRecord.objects.create(
+                id=new_file_id(),
+                owner_type=owner_type,
+                owner_id=owner_id,
+                original_name=name,
+                storage_key=f"ts/{name}",
+                uploaded_by="tester",
+            )
+
+        cls.file_free_ta = _file("TEAM")
+        cls.file_free_tb = _file("TEAM", name="乙队材料.pdf")
+        cls.file_free_pa = _file("PERSON", name="人员材料.pdf")
+
+        cls.tm_own = TeamMaterial.objects.create(  # 甲队材料（本队）
+            pk=601, team=cls.team_a, type=cls.type_team, file_id=cls.file_free_ta.pk,
+            file_name="甲队荣誉.pdf", status=enums.MaterialStatus.PENDING, remark="甲队荣誉",
+        )
+        cls.tm_other = TeamMaterial.objects.create(  # 乙队材料（他队）
+            pk=602, team=cls.team_b, type=cls.type_team, file_id=cls.file_free_tb.pk,
+            file_name="乙队荣誉.pdf", status=enums.MaterialStatus.PENDING, remark="乙队荣誉",
+        )
+        cls.pm_person = PersonMaterial.objects.create(  # 人员材料（对 TEAM 不可见）
+            person=cls.person_a, type=cls.type_person, file_id=cls.file_free_pa.pk,
+            file_name="人员证书.pdf", status=enums.MaterialStatus.PENDING, remark="人员证书",
+        )
+
+    # ------------------------------------------------------------ helpers
+
+    @staticmethod
+    def _auth(token):
+        return {"HTTP_AUTHORIZATION": f"Bearer {token}"} if token else {}
+
+    def _get(self, path, token=None, query=None):
+        return self.client.get(path, data=query or {}, **self._auth(token))
+
+    def _post(self, path, payload, token=None):
+        return self.client.post(
+            path, data=json.dumps(payload), content_type="application/json", **self._auth(token)
+        )
+
+    def _delete(self, path, token=None, version=None):
+        if version is not None:
+            path = f"{path}?version={version}"
+        return self.client.delete(path, **self._auth(token))
+
+    @staticmethod
+    def _mver(material) -> int:
+        return int(material.updated_at.timestamp() * 1_000_000)
+
+    def _ids(self, resp):
+        return {item["id"] for item in resp.json()["data"]["items"]}
+
+    # ------------------------------------------------------------ 列表与详情
+
+    def test_list_only_own_team_materials(self):
+        resp = self._get(BASE, token=self.team_a_token)
+        self.assertEqual(resp.status_code, 200)
+        ids = self._ids(resp)
+        self.assertEqual(ids, {str(self.tm_own.pk)})  # 他队/人员材料均不可见
+
+    def test_list_person_materials_empty_for_team(self):
+        """一·补四：PERSON 材料对球队端一律不可见。"""
+        resp = self._get(
+            BASE,
+            token=self.team_a_token,
+            query={"ownerType": "PERSON", "ownerId": self.person_a.pk,
+                   "page": 1, "pageSize": 10},
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(self._ids(resp), set())
+
+    def test_get_own_team_material_ok(self):
+        resp = self._get(f"{BASE}/{self.tm_own.pk}", token=self.team_a_token)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["data"]["ownerName"], "球队一小甲队")
+
+    def test_get_other_team_material_denied(self):
+        resp = self._get(f"{BASE}/{self.tm_other.pk}", token=self.team_a_token)
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json()["code"], "DATA_SCOPE_DENIED")
+
+    def test_get_person_material_denied_for_team(self):
+        resp = self._get(f"{BASE}/{self.pm_person.pk}", token=self.team_a_token)
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json()["code"], "DATA_SCOPE_DENIED")
+
+    def test_unbound_team_account_denied(self):
+        """空绑定（team_ids=[]）→ 拒绝，不退化为全库。"""
+        resp = self._get(BASE, token=self.team_none_token)
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json()["code"], "DATA_SCOPE_DENIED")
+
+    # ------------------------------------------------------------ 创建
+
+    def test_create_own_team_material_ok(self):
+        payload = {
+            "ownerType": "TEAM",
+            "ownerId": str(self.team_a.pk),
+            "materialType": "TS_TEAM_REPORT",  # allow_multiple：避开 tm_own 的 R6 唯一性
+            "title": "本队新建材料",
+            "fileName": "新建.pdf",
+            "fileIds": [self.file_free_tb.pk],
+        }
+        resp = self._post(BASE, payload, token=self.team_a_token)
+        self.assertEqual(resp.status_code, 200)
+        self.file_free_tb.refresh_from_db()
+        self.assertEqual(self.file_free_tb.owner_id, str(self.team_a.pk))  # 认领回填
+        self.assertTrue(
+            TeamMaterial.objects.filter(team=self.team_a, remark="本队新建材料").exists()
+        )
+
+    def test_create_other_team_material_denied(self):
+        """不信任客户端传参：ownerId 指向他队 → 403，零写入。"""
+        payload = {
+            "ownerType": "TEAM",
+            "ownerId": str(self.team_b.pk),
+            "materialType": "TS_TEAM_HONOR",
+            "title": "他队材料",
+            "fileName": "他队.pdf",
+            "fileIds": [self.file_free_tb.pk],
+        }
+        resp = self._post(BASE, payload, token=self.team_a_token)
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json()["code"], "DATA_SCOPE_DENIED")
+        self.assertFalse(TeamMaterial.objects.filter(remark="他队材料").exists())
+        self.file_free_tb.refresh_from_db()
+        self.assertEqual(self.file_free_tb.owner_id, "")  # 文件未被认领
+
+    def test_create_person_material_denied_for_team(self):
+        """球队端不得创建人员材料（不得经材料链变更人员资格信息）。"""
+        payload = {
+            "ownerType": "PERSON",
+            "ownerId": str(self.person_a.pk),
+            "materialType": "TS_PERSON_CERT",
+            "title": "球队代传人员材料",
+            "fileName": "代传.pdf",
+            "fileIds": [self.file_free_pa.pk],
+        }
+        resp = self._post(BASE, payload, token=self.team_a_token)
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json()["code"], "DATA_SCOPE_DENIED")
+        self.assertFalse(PersonMaterial.objects.filter(remark="球队代传人员材料").exists())
+
+    # ------------------------------------------------------------ 更新与软删
+
+    def test_update_own_team_material_ok(self):
+        version = self._mver(self.tm_own)
+        resp = self.client.put(
+            f"{BASE}/{self.tm_own.pk}",
+            data=json.dumps({
+                "ownerType": "TEAM",
+                "ownerId": str(self.team_a.pk),
+                "materialType": "TS_TEAM_HONOR",
+                "title": "甲队荣誉（修订）",
+                "fileIds": [self.tm_own.file_id],
+                "version": version,
+            }),
+            content_type="application/json",
+            **self._auth(self.team_a_token),
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.tm_own.refresh_from_db()
+        self.assertEqual(self.tm_own.remark, "甲队荣誉（修订）")
+
+    def test_update_other_team_material_denied(self):
+        version = self._mver(self.tm_other)
+        resp = self.client.put(
+            f"{BASE}/{self.tm_other.pk}",
+            data=json.dumps({
+                "ownerType": "TEAM",
+                "ownerId": str(self.team_b.pk),
+                "materialType": "TS_TEAM_HONOR",
+                "title": "越权修订",
+                "fileIds": [self.tm_other.file_id],
+                "version": version,
+            }),
+            content_type="application/json",
+            **self._auth(self.team_a_token),
+        )
+        self.assertEqual(resp.status_code, 403)
+        self.tm_other.refresh_from_db()
+        self.assertEqual(self.tm_other.remark, "乙队荣誉")  # 零写入
+
+    def test_remove_own_team_material_ok(self):
+        version = self._mver(self.tm_own)
+        resp = self._delete(f"{BASE}/{self.tm_own.pk}", token=self.team_a_token, version=version)
+        self.assertEqual(resp.status_code, 200)
+        self.tm_own.refresh_from_db()
+        self.assertTrue(self.tm_own.is_deleted)
+
+    def test_remove_other_team_material_denied(self):
+        version = self._mver(self.tm_other)
+        resp = self._delete(f"{BASE}/{self.tm_other.pk}", token=self.team_a_token, version=version)
+        self.assertEqual(resp.status_code, 403)
+        self.tm_other.refresh_from_db()
+        self.assertFalse(self.tm_other.is_deleted)
+
+    # ------------------------------------------------------------ 审核权限边界
+
+    def test_team_cannot_review_own_material(self):
+        """维护权限≠审核权限：TEAM 不在 materialReview 权限点 → 403 FORBIDDEN。"""
+        resp = self._post(
+            f"{BASE}/{self.tm_own.pk}/review",
+            {"decision": "APPROVE", "version": self._mver(self.tm_own)},
+            token=self.team_a_token,
+        )
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json()["code"], "FORBIDDEN")
+        self.tm_own.refresh_from_db()
+        self.assertEqual(self.tm_own.status, enums.MaterialStatus.PENDING)
+
+    def test_team_history_own_team_ok_other_denied(self):
+        resp = self._get(f"{BASE}/{self.tm_own.pk}/audit-logs", token=self.team_a_token)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["data"]["items"], [])
+
+        resp = self._get(f"{BASE}/{self.tm_other.pk}/audit-logs", token=self.team_a_token)
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json()["code"], "DATA_SCOPE_DENIED")
