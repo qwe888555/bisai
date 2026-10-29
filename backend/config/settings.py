@@ -68,6 +68,17 @@ ALLOWED_HOSTS = env_list("ALLOWED_HOSTS", "*")
 # 运行环境档位：dev（默认，零校验零影响）/ test / prod（触发生产安全启动校验，见 apps/common/production.py）。
 # 未知值显式报错拒绝启动，不静默回退 dev（报错不回显输入内容）。
 DJANGO_ENV = env("DJANGO_ENV", "dev").strip().lower()
+
+# 报名域外部客户端 mock 开关（enrollments.clients 运行期直读 os.environ；
+# 此处镜像解析结果供 production.validate_production_settings 生产启动校验）。
+# 非法取值任何环境启动即报错：配置非法不得静默回退（安全失败原则）。
+_MOCK_CLIENTS_RAW = env("ENROLLMENT_MOCK_CLIENTS", "true").strip().lower()
+if _MOCK_CLIENTS_RAW not in {"1", "true", "yes", "on", "0", "false", "no", "off"}:
+    raise ValueError(
+        "ENROLLMENT_MOCK_CLIENTS 取值非法：仅支持 1/true/yes/on 或 0/false/no/off，"
+        "请在 backend/.env 修正后重启；本错误不回显输入内容"
+    )
+ENROLLMENT_MOCK_CLIENTS = _MOCK_CLIENTS_RAW in {"1", "true", "yes", "on"}
 from apps.common.production import assert_valid_env as _assert_valid_env  # noqa: E402
 
 _assert_valid_env(DJANGO_ENV)

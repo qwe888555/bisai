@@ -72,6 +72,25 @@ def validate_production_settings(s: Any) -> tuple[list[str], list[str]]:
     if "sqlite" in engine:
         violations.append("数据库仍为 SQLite 回退配置：生产环境必须显式设置 DATABASE_URL 指向 MySQL")
 
+    # 6. ENROLLMENT_MOCK_CLIENTS：生产禁止 mock 客户端替身进入报名资格校验链
+    #    （2026-10-28 加固）：人员审核状态/禁用状态/必需附件等终审校验不得被
+    #    mock 派生数据绕过。缺失、开启、非法取值一律拒绝启动（安全失败），
+    #    仅显式 False 放行；运行期另有 enrollments.clients.mock_enabled 的
+    #    prod 强制关闭双保险。
+    mock_flag = getattr(s, "ENROLLMENT_MOCK_CLIENTS", None)
+    if mock_flag is not False:
+        detail = (
+            "未配置"
+            if mock_flag is None
+            else f"配置非法（{mock_flag!r}）" if not isinstance(mock_flag, bool)
+            else "处于开启状态"
+        )
+        violations.append(
+            f"ENROLLMENT_MOCK_CLIENTS {detail}：生产环境必须显式设置 "
+            "ENROLLMENT_MOCK_CLIENTS=false，mock 客户端替身不得作为报名资格"
+            "校验（人员审核状态/禁用状态/必需附件）的替代"
+        )
+
     # ---- 以下为告警项（不阻止启动，但不得视为已通过检查）----
 
     # CRYPTO_KEY：临时告警。人员敏感字段加解密上线前必须升级为 violation（见模块 docstring）

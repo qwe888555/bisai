@@ -18,9 +18,12 @@ from __future__ import annotations
 
 from django.test import TestCase, override_settings
 
-from apps.accounts.models import Account, AuditLog, Organization
+from apps.accounts.models import Account, AuditLog, Organization, RegistrationInvitation
+from apps.common import enums
 from apps.common.authentication import issue_access_token, make_password
+from apps.common.crypto import encrypt_text, lookup_hash, mask_id_number
 from apps.common.ids import new_account_id, new_organization_id
+from apps.persons.models import Person
 
 BASE = "/api/v1"
 PASSWORD = "Pass-12345678"
@@ -728,3 +731,268 @@ class OrganizationBehaviorTests(AccountScopeTestBase):
         self.assertIn("scope-school", school_visible)  # 本校自己
         self.assertNotIn("scope-admin", school_visible)  # 省级账号不可见
         self.assertNotIn("scope-city", school_visible)  # 上级市账号不可见
+
+
+# ================================================================ 幽灵 personId 绑定防线
+
+
+@override_settings(
+    THROTTLE_RATES={
+        "login": "1000000/min",
+        "registration": "1000000/min",
+        "policy_question": "1000000/min",
+    }
+)
+class PersonBindingTests(AccountScopeTestBase):
+    """非空 personId 绑定目标必须存在且未软删（services._ensure_person_bindable）。
+
+    覆盖账号创建 / 账号更新（解绑、重绑）/ 邀请签发 / 邀请激活四条链路；
+    每条用例均验证数据库最终状态（无部分写入），而非仅断言 HTTP 状态码。
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        super().setUpTestData()
+        cls.person_a = cls._person("110101200001010011", "绑定甲")
+        cls.person_b = cls._person("110101200001010022", "绑定乙")
+        cls.person_dead = cls._person("110101200001010033", "已删人", deleted=True)
+
+    # ------------------------------------------------------------ 数据工具
+
+    @staticmethod
+    def _person(id_number: str, name: str, deleted: bool = False) -> Person:
+        return Person.objects.create(
+            person_no=f"P2026{id_number[-6:]}",
+            full_name=name,
+            id_card_cipher=encrypt_text(id_number),
+            id_card_hash=lookup_hash(id_number),
+            id_card_masked=mask_id_number(id_number),
+            person_category=enums.PersonCategory.ATHLETE,
+            is_deleted=deleted,
+        )
+
+    def _account_body(self, username: str, person_id: str = "", **extra) -> dict:
+        # personId 为空时必须省略键：schema 对显式空串按 min_length=1 拒绝
+        body = {
+            "username": username,
+            "displayName": username,
+            "roles": ["UNIVERSITY"],
+            "orgId": self.S.pk,
+        }
+        if person_id:
+            body["personId"] = person_id
+        body.update(extra)
+        return body
+
+    def _create_account(self, username: str, person_id: str = ""):
+        token = self._login("scope-admin")
+        resp = self._post(
+            f"{BASE}/accounts", self._account_body(username, person_id), token=token
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        return Account.objects.get(username=username)
+
+    def _invite(self, person_id: str = "") -> dict:
+        """以 scope-admin 签发邀请，返回响应 json。"""
+        token = self._login("scope-admin")
+        payload = {"kind": "ATHLETE", "orgId": self.S.pk}
+        if person_id:
+            payload["personId"] = person_id
+        return self._post(f"{BASE}/accounts/registration-invitations", payload, token=token)
+
+    def _register(self, token: str, username: str):
+        return self._post(
+            f"{BASE}/auth/registrations",
+            {
+                "registrationToken": token,
+                "username": username,
+                "password": PASSWORD,
+                "realName": "激活人",
+                "idNumber": "110101201305011234",
+            },
+        )
+
+    # ------------------------------------------------------------ 账号创建
+
+    def test_create_account_with_unknown_person_rejected(self):
+        """绑定不存在的 Person → 400，且不产生部分写入。"""
+        token = self._login("scope-admin")
+        resp = self._post(
+            f"{BASE}/accounts", self._account_body("ghost-001", "99999999"), token=token
+        )
+        self.assertEqual(resp.status_code, 400, resp.content)
+        self.assertEqual(resp.json()["code"], "INVALID_ARGUMENT")
+        self.assertEqual(resp.json()["data"][0]["field"], "personId")
+        self.assertFalse(Account.objects.filter(username="ghost-001").exists())
+
+    def test_create_account_with_non_numeric_person_rejected(self):
+        """Person 主键为数值型：非数值 personId 不可能命中，同样 400。"""
+        token = self._login("scope-admin")
+        resp = self._post(
+            f"{BASE}/accounts", self._account_body("ghost-002", "not-a-person"), token=token
+        )
+        self.assertEqual(resp.status_code, 400, resp.content)
+        self.assertEqual(resp.json()["code"], "INVALID_ARGUMENT")
+        self.assertFalse(Account.objects.filter(username="ghost-002").exists())
+
+    def test_create_account_with_soft_deleted_person_rejected(self):
+        """绑定已软删 Person → 400，且不产生部分写入。"""
+        token = self._login("scope-admin")
+        resp = self._post(
+            f"{BASE}/accounts",
+            self._account_body("ghost-003", str(self.person_dead.pk)),
+            token=token,
+        )
+        self.assertEqual(resp.status_code, 400, resp.content)
+        self.assertEqual(resp.json()["code"], "INVALID_ARGUMENT")
+        self.assertEqual(resp.json()["data"][0]["field"], "personId")
+        self.assertFalse(Account.objects.filter(username="ghost-003").exists())
+
+    def test_create_account_with_valid_person_binds(self):
+        """绑定有效 Person → 成功落库 person_id。"""
+        token = self._login("scope-admin")
+        resp = self._post(
+            f"{BASE}/accounts",
+            self._account_body("bound-001", str(self.person_a.pk)),
+            token=token,
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertEqual(resp.json()["data"]["personId"], str(self.person_a.pk))
+        account = Account.objects.get(username="bound-001")
+        self.assertEqual(account.person_id, str(self.person_a.pk))
+
+    # ------------------------------------------------------------ 账号更新
+
+    def test_update_account_unbind_then_rebind_other_person(self):
+        """PUT 解绑（缺省 personId）→ 清空；再绑其他有效 Person → 落库。"""
+        account = self._create_account("rebind-001", str(self.person_a.pk))
+
+        # 解绑：PUT 整份替换且未提交 personId → person_id 清空
+        resp = self._put(
+            f"{BASE}/accounts/{account.pk}",
+            self._account_body("rebind-001", version=account.version),
+            token=self._login("scope-admin"),
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        account.refresh_from_db()
+        self.assertEqual(account.person_id, "")
+
+        # 重绑其他有效 Person
+        resp = self._put(
+            f"{BASE}/accounts/{account.pk}",
+            self._account_body(
+                "rebind-001", str(self.person_b.pk), version=account.version
+            ),
+            token=self._login("scope-admin"),
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        account.refresh_from_db()
+        self.assertEqual(account.person_id, str(self.person_b.pk))
+
+    def test_update_account_rebind_person_bound_elsewhere_rejected(self):
+        """重绑已被其他账号占用的人员 → 409（既有唯一绑定规则），原绑定不变。"""
+        self._create_account("dup-001", str(self.person_a.pk))
+        other = self._create_account("dup-002")
+
+        resp = self._put(
+            f"{BASE}/accounts/{other.pk}",
+            self._account_body(
+                "dup-002", str(self.person_a.pk), version=other.version
+            ),
+            token=self._login("scope-admin"),
+        )
+        self.assertEqual(resp.status_code, 409, resp.content)
+        self.assertEqual(resp.json()["code"], "DUPLICATE_RESOURCE")
+        other.refresh_from_db()
+        self.assertEqual(other.person_id, "")  # 无部分写入
+
+    def test_update_account_with_unknown_person_rejected(self):
+        """更新时绑定幽灵 personId → 400，原绑定不被破坏。"""
+        account = self._create_account("upd-ghost", str(self.person_a.pk))
+
+        resp = self._put(
+            f"{BASE}/accounts/{account.pk}",
+            self._account_body("upd-ghost", "99999999", version=account.version),
+            token=self._login("scope-admin"),
+        )
+        self.assertEqual(resp.status_code, 400, resp.content)
+        self.assertEqual(resp.json()["code"], "INVALID_ARGUMENT")
+        account.refresh_from_db()
+        self.assertEqual(account.person_id, str(self.person_a.pk))  # 无部分写入
+
+    # ------------------------------------------------------------ 邀请签发
+
+    def test_invitation_with_unknown_person_rejected(self):
+        """签发绑定不存在人员 → 400，不落邀请凭证。"""
+        resp = self._invite("99999999")
+        self.assertEqual(resp.status_code, 400, resp.content)
+        self.assertEqual(resp.json()["code"], "INVALID_ARGUMENT")
+        self.assertEqual(resp.json()["data"][0]["field"], "personId")
+        self.assertFalse(RegistrationInvitation.objects.exists())
+
+    def test_invitation_with_soft_deleted_person_rejected(self):
+        """签发绑定已软删人员 → 400，不落邀请凭证。"""
+        resp = self._invite(str(self.person_dead.pk))
+        self.assertEqual(resp.status_code, 400, resp.content)
+        self.assertEqual(resp.json()["code"], "INVALID_ARGUMENT")
+        self.assertFalse(RegistrationInvitation.objects.exists())
+
+    def test_invitation_with_valid_person_created(self):
+        """签发绑定有效人员 → 成功落库 person_id。"""
+        resp = self._invite(str(self.person_a.pk))
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertIn("registrationToken", resp.json()["data"])
+        invitation = RegistrationInvitation.objects.get()
+        self.assertEqual(invitation.person_id, str(self.person_a.pk))
+
+    # ------------------------------------------------------------ 邀请激活
+
+    def test_register_with_valid_person_binds_account(self):
+        """邀请激活：有效 personId 正常建号并绑定。"""
+        resp = self._invite(str(self.person_a.pk))
+        plain_token = resp.json()["data"]["registrationToken"]
+
+        resp = self._register(plain_token, "reg-001")
+        self.assertEqual(resp.status_code, 200, resp.content)
+        account = Account.objects.get(username="reg-001")
+        self.assertEqual(account.person_id, str(self.person_a.pk))
+        invitation = RegistrationInvitation.objects.get()
+        self.assertIsNotNone(invitation.used_at)
+
+    def test_register_revalidates_person_deleted_after_invitation(self):
+        """签发后人员被软删 → 激活时 400 拒绝建号（服务端重验），无部分写入。"""
+        resp = self._invite(str(self.person_a.pk))
+        plain_token = resp.json()["data"]["registrationToken"]
+
+        self.person_a.is_deleted = True
+        self.person_a.save(update_fields=["is_deleted", "updated_at"])
+
+        resp = self._register(plain_token, "reg-002")
+        self.assertEqual(resp.status_code, 400, resp.content)
+        self.assertEqual(resp.json()["code"], "INVALID_ARGUMENT")
+        self.assertEqual(resp.json()["data"][0]["field"], "personId")
+        self.assertFalse(Account.objects.filter(username="reg-002").exists())
+        # 凭证未被消费
+        invitation = RegistrationInvitation.objects.get()
+        self.assertIsNone(invitation.used_at)
+
+    def test_register_with_ghost_person_on_invitation_rejected(self):
+        """凭证上本就挂着幽灵 personId（绕过签发校验直插库）→ 激活仍被拒。"""
+        from datetime import timedelta
+
+        from apps.common import crypto
+        from django.utils import timezone as tz
+
+        RegistrationInvitation.objects.create(
+            id="inv-ghost-001",
+            token_hash=crypto.hash_token("a" * 64),
+            kind="ATHLETE",
+            person_id="99999999",
+            organization_id=self.S.pk,
+            expires_at=tz.now() + timedelta(minutes=30),
+            created_by="scope-admin",
+        )
+        resp = self._register("a" * 64, "reg-003")
+        self.assertEqual(resp.status_code, 400, resp.content)
+        self.assertEqual(resp.json()["code"], "INVALID_ARGUMENT")
+        self.assertFalse(Account.objects.filter(username="reg-003").exists())

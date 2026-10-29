@@ -87,6 +87,49 @@ def ensure_org_in_scope(account, org_id: Optional[str]) -> None:
         raise ApiError(DATA_SCOPE_DENIED, "目标组织不在当前账号数据范围内")
 
 
+def scope_org_codes(account) -> Optional[list[str]]:
+    """当前账号可见组织节点的编码范围（A′ 编码映射：org.code 存学校标识码/球队编号）。
+
+    返回值三态，调用方必须显式区分，不得用 `codes or fallback` 之类写法
+    把空范围放大为全库：
+    - None：全局管理员（复用 is_global_admin），全库范围；
+    - []：无有效组织范围（未绑定组织/绑定不存在/绑定已软删），必须拒绝访问；
+    - 非空列表：所属组织子树内全部节点的 code（含学校标识码与球队编号）。
+    """
+    if is_global_admin(account):
+        return None
+    ids = org_scope_ids(account)
+    if not ids:
+        return []
+    from apps.accounts.models import Organization
+
+    return sorted(Organization.objects.filter(pk__in=ids).values_list("code", flat=True))
+
+
+def ensure_team_in_scope(account, team) -> None:
+    """按已批准的 A′ 编码映射校验球队是否属于当前账号组织范围。
+
+    映射（A′-min 2026-10-25 契约）：TEAM 组织节点 code == team.team_no、
+    parent 为所属学校/高校节点。球队必须能解析出有效 TEAM 节点
+    （存在、未软删、未停用），映射缺失或失效一律 deny-by-default。
+    """
+    if is_global_admin(account):
+        return
+    from apps.accounts.models import Organization
+
+    codes = scope_org_codes(account)
+    if not codes:
+        # 仅剩 [] 一态（None 已在全局管理员分支提前返回）：无有效组织范围
+        raise ApiError(DATA_SCOPE_DENIED, "当前账号无有效组织范围，禁止访问球队数据")
+    team_org = Organization.objects.filter(
+        code=team.team_no, org_type="TEAM", enabled=True
+    ).first()
+    if team_org is None:
+        raise ApiError(DATA_SCOPE_DENIED, "球队缺少有效组织映射，无法确定数据范围")
+    if team_org.code not in set(codes):
+        raise ApiError(DATA_SCOPE_DENIED, "目标球队不在当前账号数据范围内")
+
+
 def ensure_grantable_roles(account, roles: Iterable[str], org_id: Optional[str]) -> None:
     """创建/修改账号时：不得授予超出自身等级或范围的角色。"""
     requested = set(roles or ())
