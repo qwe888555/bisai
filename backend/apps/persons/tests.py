@@ -1788,8 +1788,9 @@ class PersonAdminScopeTests(TestCase):
 
     口径：全局 ADMIN（无组织绑定）全库；挂组织 ADMIN 仅授权组织子树内
     人员（Person.school ↔ Organization.code 真实映射）；幽灵/软删组织
-    绑定默认拒绝不退化全库；UNIVERSITY/TEAM/CITY 的 persons 域接口保持
-    拒绝。写测试断言数据库最终状态，不只看 HTTP 状态码。
+    绑定默认拒绝不退化全库；UNIVERSITY/TEAM 读开放移至
+    PersonThirdBatchScopeTests（A′ 第三批），CITY 保持拒绝。
+    写测试断言数据库最终状态，不只看 HTTP 状态码。
 
     组织树夹具：
         ORG-PS(省,code=P-900) → ORG-CT(市,code=C-900100)
@@ -2161,11 +2162,17 @@ class PersonAdminScopeTests(TestCase):
     # ------------------------------------------------------------ 非 ADMIN 不变
 
     def test_non_admin_roles_still_denied(self):
-        for token in (self.uni_token, self.team_token, self.city_token):
-            # 查询类权限点含 UNIVERSITY/CITY/TEAM → 落到数据范围层拒绝
+        """A′ 第三批拆分后本类保留的拒绝面：TEAM/CITY 读仍拒绝。
+
+        UNIVERSITY 本校读已开放（正向矩阵见 PersonThirdBatchScopeTests）；
+        本测试保留：TEAM/CITY 的列表 403 + 三角色写链 FORBIDDEN。
+        """
+        for token in (self.team_token, self.city_token):
+            # 查询类权限点含 TEAM/CITY → 落到数据范围层拒绝
             resp = self._get(PEOPLE, token=token)
             self.assertEqual(resp.status_code, 403)
             self.assertEqual(resp.json()["code"], "DATA_SCOPE_DENIED")
+        for token in (self.uni_token, self.team_token, self.city_token):
             # 写链权限点仅登记 ADMIN → 角色层即 FORBIDDEN（与既有
             # test_create_forbidden_for_university 口径一致）
             resp = self._post(
@@ -2176,6 +2183,335 @@ class PersonAdminScopeTests(TestCase):
             self.assertEqual(resp.status_code, 403)
             self.assertEqual(resp.json()["code"], "FORBIDDEN")
         self.assertFalse(Person.objects.filter(full_name="非管理员新人").exists())
+
+
+class PersonThirdBatchScopeTests(TestCase):
+    """A′ 第三批（2026-10-29）：UNIVERSITY 本校 / TEAM 本队 CURRENT 成员读开放。
+
+    口径（成员4 专项①，业务决定 5+6 项确认）：
+    - UNIVERSITY：绑定节点须为学校类（SCHOOL/UNIVERSITY），仅见子树内
+      学校类节点 code 对应人员（Person.school.code 映射；无 school 归属
+      不可见，不经任职球队的学校归属反推）；
+    - TEAM：绑定节点须为 TEAM（code==team_no），仅见绑定队正式 CURRENT
+      球员/教练（TeamMember/TeamCoach 各自独立按 CURRENT 过滤），EXITED
+      不可见，不因子树扩展到子球队，不经学校归属反推；
+    - CITY/PROVINCE_REVIEWER：403 DATA_SCOPE_DENIED（市级范围未开放）；
+    - 范围外对象 404 不泄露存在性；写链不开放（403 FORBIDDEN，零落库）；
+    - ADMIN 行为不变（PersonAdminScopeTests 继续覆盖第一批口径）。
+
+    组织树夹具：
+        ORG-3PS(省,P-950) → ORG-3CT(市,C-950100)
+            → ORG-3SA(SCHOOL,SCH-950100-401)
+                → ORG-3TA(TEAM,T-950100-01)      [team_a，绑定队]
+                    → ORG-3TA2(TEAM,T-950100-02) [team_a2，病态子球队]
+            → ORG-3UA(UNIVERSITY,SCH-950100-501) [高校节点]
+        ORG-3PS → ORG-3SB(SCHOOL,SCH-950200-901)
+            → ORG-3TB(TEAM,T-950200-91)          [team_b，界外队]
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        cls._seq = 0
+
+        def make_account(username, roles, org_id=None):
+            cls._seq += 1
+            return Account.objects.create(
+                id=new_account_id(),
+                username=username,
+                display_name=username,
+                roles=roles,
+                password=make_password("pass-123456"),
+                enabled=True,
+                organization_id=org_id,
+            )
+
+        cls.global_admin = make_account("tb-global-admin", ["ADMIN"])
+        cls.uni_sa = make_account("tb-uni-sa", ["UNIVERSITY"], org_id="ORG-3SA")
+        cls.uni_ua = make_account("tb-uni-ua", ["UNIVERSITY"], org_id="ORG-3UA")
+        cls.uni_city = make_account("tb-uni-city", ["UNIVERSITY"], org_id="ORG-3CT")
+        cls.team_ta = make_account("tb-team-ta", ["TEAM"], org_id="ORG-3TA")
+        cls.team_ghost = make_account("tb-team-ghost", ["TEAM"], org_id="ORG-3SA")
+        cls.city_acct = make_account("tb-city", ["CITY"], org_id="ORG-3CT")
+        cls.prov_acct = make_account(
+            "tb-prov", ["PROVINCE_REVIEWER"], org_id="ORG-3PS"
+        )
+        cls.global_token = issue_access_token(cls.global_admin)[0]
+        cls.uni_sa_token = issue_access_token(cls.uni_sa)[0]
+        cls.uni_ua_token = issue_access_token(cls.uni_ua)[0]
+        cls.uni_city_token = issue_access_token(cls.uni_city)[0]
+        cls.team_ta_token = issue_access_token(cls.team_ta)[0]
+        cls.team_ghost_token = issue_access_token(cls.team_ghost)[0]
+        cls.city_token = issue_access_token(cls.city_acct)[0]
+        cls.prov_token = issue_access_token(cls.prov_acct)[0]
+
+        prov = Region.objects.create(name="三批省", code="950000", level=1)
+        city = Region.objects.create(name="三批市", code="950100", level=2, parent=prov)
+        prov2 = Region.objects.create(name="三批外省", code="952000", level=1)
+        cls.school_a = School.objects.create(
+            name="三批一小", code="SCH-950100-401", school_type="PRIMARY", region=city
+        )
+        school_u = School.objects.create(
+            name="三批高校", code="SCH-950100-501", school_type="PRIMARY", region=city
+        )
+        school_b = School.objects.create(
+            name="三批界外校", code="SCH-950200-901", school_type="JUNIOR", region=prov2
+        )
+        Organization.objects.create(id="ORG-3PS", code="P-950", name="三批省组织", org_type="PROVINCE")
+        Organization.objects.create(
+            id="ORG-3CT", code="C-950100", name="三批市组织", org_type="CITY", parent_id="ORG-3PS"
+        )
+        Organization.objects.create(
+            id="ORG-3SA", code="SCH-950100-401", name="三批一小组织",
+            org_type="SCHOOL", parent_id="ORG-3CT",
+        )
+        Organization.objects.create(
+            id="ORG-3UA", code="SCH-950100-501", name="三批高校组织",
+            org_type="UNIVERSITY", parent_id="ORG-3CT",
+        )
+        Organization.objects.create(
+            id="ORG-3TA", code="T-950100-01", name="三批一队组织",
+            org_type="TEAM", parent_id="ORG-3SA",
+        )
+        # 病态子球队：TEAM 节点下再挂 TEAM 节点（模型不禁止），
+        # 用于断言 TEAM 范围不因子树放大
+        Organization.objects.create(
+            id="ORG-3TA2", code="T-950100-02", name="三批子队组织",
+            org_type="TEAM", parent_id="ORG-3TA",
+        )
+        Organization.objects.create(
+            id="ORG-3SB", code="SCH-950200-901", name="三批界外校组织",
+            org_type="SCHOOL", parent_id="ORG-3PS",
+        )
+        Organization.objects.create(
+            id="ORG-3TB", code="T-950200-91", name="三批界外队组织",
+            org_type="TEAM", parent_id="ORG-3SB",
+        )
+
+        team_a = Team.objects.create(
+            team_no="T-950100-01", name="三批一队", category_code="U12",
+            school=cls.school_a, region=city,
+        )
+        team_a2 = Team.objects.create(
+            team_no="T-950100-02", name="三批子队", category_code="U12",
+            school=cls.school_a, region=city,
+        )
+        Team.objects.create(
+            team_no="T-950200-91", name="三批界外队", category_code="U12",
+            school=school_b, region=prov2,
+        )
+        joined = date(2026, 1, 1)
+
+        def make_person(no, name, id_number, school, category):
+            return Person.objects.create(
+                person_no=f"P2026{no:08d}",
+                full_name=name,
+                id_card_cipher=encrypt_text(id_number),
+                id_card_hash=lookup_hash(id_number),
+                id_card_masked=mask_id_number(id_number),
+                person_category=category,
+                audit_status=enums.AuditStatus.APPROVED,
+                school=school,
+            )
+
+        cls.cur_player = make_person(
+            1, "现役球员", "110101201501011111", cls.school_a, enums.PersonCategory.ATHLETE
+        )
+        cls.exited_player = make_person(
+            2, "离队球员", "110101201501012222", cls.school_a, enums.PersonCategory.ATHLETE
+        )
+        cls.no_rel = make_person(
+            3, "无关联员", "110101201501013333", cls.school_a, enums.PersonCategory.ATHLETE
+        )
+        cls.a2_player = make_person(
+            4, "子队球员", "110101201501014444", cls.school_a, enums.PersonCategory.ATHLETE
+        )
+        cls.cur_coach = make_person(
+            5, "现役教练", "110101198801015555", cls.school_a, enums.PersonCategory.COACH
+        )
+        cls.exited_coach = make_person(
+            6, "离队教练", "110101198801016666", cls.school_a, enums.PersonCategory.COACH
+        )
+        cls.none_coach = make_person(
+            7, "无校教练", "110101198801017777", None, enums.PersonCategory.COACH
+        )
+        cls.u_player = make_person(
+            8, "高校球员", "110101201501018888", school_u, enums.PersonCategory.ATHLETE
+        )
+        cls.b_player = make_person(
+            9, "界外球员", "110101201501019999", school_b, enums.PersonCategory.ATHLETE
+        )
+
+        TeamMember.objects.create(team=team_a, person=cls.cur_player, joined_at=joined)
+        TeamMember.objects.create(
+            team=team_a, person=cls.exited_player, joined_at=joined,
+            status=enums.RelationStatus.EXITED,
+        )
+        TeamCoach.objects.create(
+            team=team_a, person=cls.cur_coach, duty=enums.CoachDuty.HEAD_COACH,
+            joined_at=joined,
+        )
+        TeamCoach.objects.create(
+            team=team_a, person=cls.exited_coach, duty=enums.CoachDuty.HEAD_COACH,
+            joined_at=joined, status=enums.RelationStatus.EXITED,
+        )
+        TeamMember.objects.create(team=team_a2, person=cls.a2_player, joined_at=joined)
+        TeamMember.objects.create(
+            team=Team.objects.get(team_no="T-950200-91"), person=cls.b_player,
+            joined_at=joined,
+        )
+
+    @staticmethod
+    def _auth(token):
+        return {"HTTP_AUTHORIZATION": f"Bearer {token}"} if token else {}
+
+    def _get(self, path, token=None, query=None):
+        return self.client.get(path, data=query or {}, **self._auth(token))
+
+    def _post(self, path, payload, token=None):
+        return self.client.post(
+            path, data=json.dumps(payload), content_type="application/json",
+            **self._auth(token),
+        )
+
+    # ------------------------------------------------------------ 鉴权与拒绝面
+
+    def test_unauthenticated_list_401(self):
+        resp = self._get(PEOPLE)
+        self.assertEqual(resp.status_code, 401)
+
+    def test_city_and_province_reviewer_denied(self):
+        for token in (self.city_token, self.prov_token):
+            resp = self._get(PEOPLE, token=token)
+            self.assertEqual(resp.status_code, 403)
+            self.assertEqual(resp.json()["code"], "DATA_SCOPE_DENIED")
+            self.assertEqual(resp.json()["data"], None)
+        # 数据未被过滤动作改变
+        self.assertEqual(Person.objects.count(), 9)
+
+    def test_team_ghost_or_missing_binding_denied(self):
+        # TEAM 绑定学校节点（类型不符）：默认拒绝，不得按子树映射放行
+        resp = self._get(PEOPLE, token=self.team_ghost_token)
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json()["code"], "DATA_SCOPE_DENIED")
+
+    # ------------------------------------------------------------ UNIVERSITY 本校
+
+    def test_university_list_school_scope(self):
+        resp = self._get(PEOPLE, token=self.uni_sa_token)
+        self.assertEqual(resp.status_code, 200)
+        names = {i["realName"] for i in resp.json()["data"]["items"]}
+        # 本校全部人员（含 EXITED/无关联/教练）：学校归属口径，与球队关系无关
+        self.assertEqual(
+            names,
+            {"现役球员", "离队球员", "无关联员", "子队球员", "现役教练", "离队教练"},
+        )
+        self.assertNotIn("界外球员", names)
+        self.assertNotIn("无校教练", names)
+
+    def test_university_university_type_node_scope(self):
+        # 绑定高校节点（org_type=UNIVERSITY）：仅见该校人员
+        resp = self._get(PEOPLE, token=self.uni_ua_token)
+        self.assertEqual(resp.status_code, 200)
+        names = {i["realName"] for i in resp.json()["data"]["items"]}
+        self.assertEqual(names, {"高校球员"})
+
+    def test_university_wrong_node_type_denied(self):
+        # UNIVERSITY 绑定市节点（非学校类）：403
+        resp = self._get(PEOPLE, token=self.uni_city_token)
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json()["code"], "DATA_SCOPE_DENIED")
+
+    def test_university_detail_in_scope_200_out_404(self):
+        resp = self._get(f"{PEOPLE}/{self.cur_player.pk}", token=self.uni_sa_token)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["data"]["realName"], "现役球员")
+        for person in (self.b_player, self.u_player, self.none_coach):
+            resp = self._get(f"{PEOPLE}/{person.pk}", token=self.uni_sa_token)
+            self.assertEqual(resp.status_code, 404)
+            self.assertEqual(resp.json()["code"], "NOT_FOUND")
+
+    def test_university_cannot_see_schoolless_coach(self):
+        # 无 school 归属教练：不经其球队关系反推（本类夹具中该教练无球队关系）
+        resp = self._get(PEOPLE, token=self.uni_sa_token, query={"keyword": "无校教练"})
+        self.assertEqual(resp.json()["data"]["total"], 0)
+        # 全局 ADMIN 仍可见（ADMIN 行为不变）
+        resp = self._get(PEOPLE, token=self.global_token, query={"keyword": "无校教练"})
+        self.assertEqual(resp.json()["data"]["total"], 1)
+
+    # ------------------------------------------------------------ TEAM 本队 CURRENT
+
+    def test_team_list_only_current_members(self):
+        resp = self._get(PEOPLE, token=self.team_ta_token)
+        self.assertEqual(resp.status_code, 200)
+        names = {i["realName"] for i in resp.json()["data"]["items"]}
+        # 仅绑定队 CURRENT 球员+教练（两条关联路径各自过滤）
+        self.assertEqual(names, {"现役球员", "现役教练"})
+        # 数据库不因过滤而改变：EXITED 行仍存在，只是不可见
+        self.assertTrue(
+            TeamMember.objects.filter(
+                person=self.exited_player, status=enums.RelationStatus.EXITED
+            ).exists()
+        )
+        self.assertTrue(
+            TeamCoach.objects.filter(
+                person=self.exited_coach, status=enums.RelationStatus.EXITED
+            ).exists()
+        )
+
+    def test_team_current_member_and_coach_detail_ok(self):
+        resp = self._get(f"{PEOPLE}/{self.cur_player.pk}", token=self.team_ta_token)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["data"]["realName"], "现役球员")
+        # 教练路径独立验证（TeamCoach CURRENT）
+        resp = self._get(f"{PEOPLE}/{self.cur_coach.pk}", token=self.team_ta_token)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["data"]["realName"], "现役教练")
+
+    def test_team_exited_members_404(self):
+        for person in (self.exited_player, self.exited_coach):
+            resp = self._get(f"{PEOPLE}/{person.pk}", token=self.team_ta_token)
+            self.assertEqual(resp.status_code, 404)
+            self.assertEqual(resp.json()["code"], "NOT_FOUND")
+
+    def test_team_unrelated_persons_404(self):
+        # 同校但无任何正式关联的人员、无校教练：均不可见（不经学校归属反推）
+        for person in (self.no_rel, self.none_coach):
+            resp = self._get(f"{PEOPLE}/{person.pk}", token=self.team_ta_token)
+            self.assertEqual(resp.status_code, 404)
+
+    def test_team_subtree_other_team_not_visible(self):
+        # 病态子球队（TEAM 节点下挂 TEAM 节点）成员：不因子树放大而可见
+        resp = self._get(f"{PEOPLE}/{self.a2_player.pk}", token=self.team_ta_token)
+        self.assertEqual(resp.status_code, 404)
+        self.assertEqual(resp.json()["code"], "NOT_FOUND")
+
+    def test_team_cross_team_404(self):
+        resp = self._get(f"{PEOPLE}/{self.b_player.pk}", token=self.team_ta_token)
+        self.assertEqual(resp.status_code, 404)
+        self.assertEqual(resp.json()["code"], "NOT_FOUND")
+
+    # ------------------------------------------------------------ 写链与 ADMIN 回归
+
+    def test_write_chain_closed_for_non_admin(self):
+        before = Person.objects.count()
+        payload = {
+            "kinds": ["ATHLETE"],
+            "realName": "三批越权新人",
+            "idNumber": "110101201901011234",
+            "schoolOrgId": "ORG-3SA",
+        }
+        for token in (self.uni_sa_token, self.team_ta_token, self.city_token):
+            resp = self._post(PEOPLE, payload, token=token)
+            self.assertEqual(resp.status_code, 403)
+            self.assertEqual(resp.json()["code"], "FORBIDDEN")
+        self.assertEqual(Person.objects.count(), before)
+        self.assertFalse(Person.objects.filter(full_name="三批越权新人").exists())
+
+    def test_global_admin_unchanged(self):
+        # ADMIN 行为不变：全局管理员可见全部（含无校归属人员）
+        resp = self._get(PEOPLE, token=self.global_token)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["data"]["total"], 9)
 
 
 class PersonReviewTests(TestCase):

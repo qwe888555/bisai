@@ -439,44 +439,112 @@ def people_queryset() -> QuerySet:
 
 
 def apply_person_scope(queryset: QuerySet, account) -> QuerySet:
-    """人员数据范围过滤（集中一处；方案A′ 落地后仅改本函数）。
+    """人员数据范围过滤（集中一处；A′ 第三批 2026-10-29 起仅改本函数）。
 
-    前端 mock 的目标口径（src/mock/adapter.ts scopePersons）：ADMIN 全量 /
-    CITY 本市 / UNIVERSITY 本校 / TEAM 本队成员 / 其余仅本人。其中"本市/本校/
-    本队/本人"均依赖 org→school→team 映射（方案A′，待确认）与
-    Account.person_id / team_ids 的落库约定（未定）——除 ADMIN 外一律拒绝，
-    不得在映射未定时放行全量造成越权（安全约束不被前端调用覆盖）。
+    口径（成员4 专项① 第三批，业务决定 5+6 项确认）：
 
-    A′ 第一批（ADMIN 数据范围对齐）：非 ADMIN 仍一律拒绝（UNIVERSITY/TEAM/
-    CITY 的 persons 域接口本批不开放）；ADMIN 内部按 scope_org_codes 三态
-    语义（common/scopes.py，不做 `codes or fallback` 式放大）：
-    - None（全局 ADMIN，无组织绑定）→ 全库；
-    - []（无组织绑定/绑定不存在/绑定已软删，即幽灵绑定）→ 默认拒绝，
-      不得退化为全库；
-    - 非空子树编码 → 经 Person.school（School.code）与 Organization.code
-      的真实映射过滤，仅可见授权组织子树内学校归属的人员（school 为空
-      的人员对挂组织 ADMIN 不可见：deny-by-default，无学校归属即无法
-      证明在其组织范围内）。
+    - ADMIN：保持第一批行为不变（不增加学校类型筛选、不重构）——
+      scope_org_codes 三态语义（common/scopes.py，不做 `codes or fallback`
+      式放大）：
+      * None（全局 ADMIN，无组织绑定）→ 全库；
+      * []（无组织绑定/绑定不存在/绑定已软删，即幽灵绑定）→ 默认拒绝，
+        不得退化为全库；
+      * 非空子树编码 → 经 Person.school（School.code）与 Organization.code
+        的真实映射过滤，仅可见授权组织子树内学校归属的人员（school 为空
+        的人员对挂组织 ADMIN 不可见：deny-by-default）。
+
+    - UNIVERSITY（第三批新增）：绑定节点必须存在且 org_type ∈ {SCHOOL,
+      UNIVERSITY}（学校类，同 _resolve_school 口径），否则 403；仅可见
+      其组织子树中学校类节点 code 对应的人员。节点类型仅作范围识别，
+      授权仍以 Person.school.code 编码映射为准；无 school 归属人员不可见
+      （不经任职球队的学校归属反推）。
+
+    - TEAM（第三批新增）：绑定节点必须存在且 org_type == "TEAM"
+      （A′-min：TEAM 节点 code == team_no），否则 403；仅可见**绑定球队**
+      的正式 CURRENT 球员与教练（TeamMember / TeamCoach 两条关联路径
+      各自独立按 CURRENT 过滤），不经学校归属反推，不因组织子树扩展到
+      其他球队（多队授权未立项）。
+
+    - CITY / PROVINCE_REVIEWER：403 DATA_SCOPE_DENIED（市级/省级人员
+      范围留待独立评审，契约文案不区分角色）。
+
     角色门禁必须在 scope_org_codes 之前：该 helper 不校验角色，若颠倒
     顺序，UNIVERSITY 等有组织绑定的账号会被其非空子树编码误放行。
     """
+    from apps.common.enums import RelationStatus
     from apps.common.permissions import ADMIN
-    from apps.common.scopes import scope_org_codes
+    from apps.common.scopes import org_scope_ids, scope_org_codes
 
-    if ADMIN not in (getattr(account, "roles", ()) or ()):
+    roles = set(getattr(account, "roles", ()) or ())
+    if ADMIN in roles:
+        codes = scope_org_codes(account)
+        if codes is None:
+            return queryset
+        if not codes:
+            raise ApiError(
+                DATA_SCOPE_DENIED,
+                "当前账号无有效组织范围，禁止访问人员数据",
+            )
+        return queryset.filter(school__code__in=codes)
+
+    if "UNIVERSITY" not in roles and "TEAM" not in roles:
         raise ApiError(
             DATA_SCOPE_DENIED,
-            "人员数据范围待组织映射方案确认后开放，当前仅管理员可查询",
+            "市级/省级人员数据范围尚未开放，当前仅管理员及学校/球队端可查询",
         )
-    codes = scope_org_codes(account)
-    if codes is None:
-        return queryset
-    if not codes:
+
+    from apps.accounts.models import Organization
+    from apps.teams.models import TeamCoach, TeamMember
+
+    org_id = getattr(account, "organization_id", None)
+    org = Organization.objects.filter(pk=org_id).first() if org_id else None
+    if org is None:
         raise ApiError(
             DATA_SCOPE_DENIED,
             "当前账号无有效组织范围，禁止访问人员数据",
         )
-    return queryset.filter(school__code__in=codes)
+
+    if "UNIVERSITY" in roles:
+        if org.org_type not in ("SCHOOL", "UNIVERSITY"):
+            raise ApiError(
+                DATA_SCOPE_DENIED,
+                "学校端账号必须绑定学校类组织节点，禁止访问人员数据",
+            )
+        # 子树内学校类节点 code（剔除 TEAM 等非学校类子节点，防止脏编码）
+        school_codes = list(
+            Organization.objects.filter(pk__in=org_scope_ids(account))
+            .filter(org_type__in=("SCHOOL", "UNIVERSITY"))
+            .values_list("code", flat=True)
+        )
+        if not school_codes:
+            raise ApiError(
+                DATA_SCOPE_DENIED,
+                "当前账号无有效组织范围，禁止访问人员数据",
+            )
+        return queryset.filter(school__code__in=school_codes)
+
+    # TEAM 分支：仅绑定节点自身（org.code == team_no），不取子树
+    if org.org_type != "TEAM":
+        raise ApiError(
+            DATA_SCOPE_DENIED,
+            "球队端账号必须绑定球队组织节点，禁止访问人员数据",
+        )
+    return queryset.filter(
+        Exists(
+            TeamMember.objects.filter(
+                person=OuterRef("pk"),
+                team__team_no=org.code,
+                status=RelationStatus.CURRENT,
+            )
+        )
+        | Exists(
+            TeamCoach.objects.filter(
+                person=OuterRef("pk"),
+                team__team_no=org.code,
+                status=RelationStatus.CURRENT,
+            )
+        )
+    )
 
 
 def verify_person_owner(account, owner_id) -> None:
