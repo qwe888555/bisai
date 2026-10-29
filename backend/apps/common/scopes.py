@@ -11,20 +11,29 @@ from typing import Iterable, Optional
 from .errors import DATA_SCOPE_DENIED, FORBIDDEN, ApiError
 from .permissions import (
     ADMIN,
-    HIGH_PRIVILEGE_ROLES,
+    ALL_ROLES,
+    ATHLETE,
+    CITY,
+    COACH,
+    MATCH_RECORDER,
+    PROVINCE_REVIEWER,
     ROLE_NAMES,
+    TEAM,
+    UNIVERSITY,
 )
 
-# 账号等级：数字越大权限越高，用于"不得操作同级或更高权限账号"判定
-ROLE_LEVEL: dict[str, int] = {
-    ADMIN: 90,
-    "PROVINCE_REVIEWER": 80,
-    "MATCH_RECORDER": 70,
-    "CITY": 60,
-    "UNIVERSITY": 50,
-    "TEAM": 50,
-    "ATHLETE": 10,
-    "COACH": 10,
+# 账号角色策略：建号（授予）与改号（可管理目标）共用同一张表。
+# 原则：能建的角色必须能管，避免"学校建了球队账号却改不了"。
+# 删号/重置密码仍由权限点收口（仅 ADMIN/省级），不在本表放行。
+# 未列出的角色（ATHLETE/COACH/MATCH_RECORDER）不具备账号管理权限。
+ROLE_POLICY: dict[str, frozenset[str]] = {
+    ADMIN: frozenset(ALL_ROLES),
+    PROVINCE_REVIEWER: frozenset(
+        {CITY, UNIVERSITY, TEAM, MATCH_RECORDER, ATHLETE, COACH}
+    ),
+    CITY: frozenset({UNIVERSITY, TEAM, MATCH_RECORDER, ATHLETE, COACH}),
+    UNIVERSITY: frozenset({TEAM, ATHLETE, COACH}),
+    TEAM: frozenset(),
 }
 
 
@@ -40,8 +49,12 @@ def is_global_admin(account) -> bool:
     return is_admin(account) and not account_org_id(account)
 
 
-def role_level(roles: Optional[Iterable[str]]) -> int:
-    return max((ROLE_LEVEL.get(role, 0) for role in (roles or ())), default=0)
+def policy_roles(account) -> frozenset[str]:
+    """当前账号可授予、可管理的角色集合（多角色取并集）。"""
+    allowed: set[str] = set()
+    for role in getattr(account, "roles", ()) or ():
+        allowed.update(ROLE_POLICY.get(role, ()))
+    return frozenset(allowed)
 
 
 def account_org_id(account) -> str:
@@ -124,30 +137,41 @@ def ensure_org_in_scope(account, org_id: Optional[str]) -> None:
 
 
 def ensure_grantable_roles(account, roles: Iterable[str], org_id: Optional[str]) -> None:
-    """创建/修改账号时：不得授予超出自身等级或范围的角色。"""
+    """创建/修改账号时：只能授予 ROLE_POLICY 允许的角色，且组织在范围内。"""
     requested = set(roles or ())
-    if requested & HIGH_PRIVILEGE_ROLES and not is_admin(account):
+    denied = requested - policy_roles(account)
+    if denied:
+        if ADMIN in denied:
+            raise ApiError(
+                FORBIDDEN,
+                "只有管理员账号可以授予管理员角色",
+                [{"field": "roles", "reason": "无权授予 ADMIN"}],
+            )
         raise ApiError(
             FORBIDDEN,
-            "只有管理员账号可以授予高权限角色",
-            [{"field": "roles", "reason": "无权授予 ADMIN"}],
+            "无权授予所选角色",
+            [{"field": "roles", "reason": f"无权授予：{', '.join(sorted(denied))}"}],
         )
     ensure_org_in_scope(account, org_id)
 
 
 def ensure_manageable_target(account, target) -> None:
-    """删除/停用/改密码时：不得作用于自己或同级及以上权限账号。"""
+    """改/删/停用/重置时：不得作用于自己或超出可管理角色范围的账号。"""
     if target.pk == getattr(account, "pk", None):
         raise ApiError(FORBIDDEN, "不能对本账号执行该操作")
-    target_level = role_level(getattr(target, "roles", ()) or ())
-    if target_level >= role_level(getattr(account, "roles", ()) or ()) and not is_admin(account):
+    target_roles = set(getattr(target, "roles", ()) or ())
+    denied = target_roles - policy_roles(account)
+    if denied:
         raise ApiError(
             FORBIDDEN,
             "不能操作同级或更高权限的账号",
-            [{"field": "accountId", "reason": "目标账号权限不低于当前账号"}],
+            [
+                {
+                    "field": "accountId",
+                    "reason": f"目标角色超出可管理范围：{', '.join(sorted(denied))}",
+                }
+            ],
         )
-    if set(getattr(target, "roles", ()) or ()) & HIGH_PRIVILEGE_ROLES and not is_admin(account):
-        raise ApiError(FORBIDDEN, "无权操作管理员账号")
 
 
 def role_names(roles: Optional[Iterable[str]]) -> list[str]:

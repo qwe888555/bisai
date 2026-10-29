@@ -132,34 +132,8 @@ def operation_roles(operation_id: str) -> tuple[str, ...]:
     return OPERATION_ROLES.get(operation_id, ())
 
 
-# 成员2 负责的接口权限点（其余成员在自己模块里用 register_operation 追加）
-register_operation("createInvite", (ADMIN,))
-register_operation("logout", ALL_ROLES)
-register_operation("currentUser", ALL_ROLES)
-register_operation("changePassword", ALL_ROLES)
-
-register_operation("accountList", (ADMIN, PROVINCE_REVIEWER))
-register_operation("accountCreate", (ADMIN, PROVINCE_REVIEWER))
-register_operation("accountGet", (ADMIN, PROVINCE_REVIEWER))
-register_operation("accountUpdate", (ADMIN, PROVINCE_REVIEWER))
-register_operation("accountDelete", (ADMIN, PROVINCE_REVIEWER))
-register_operation("resetPassword", (ADMIN, PROVINCE_REVIEWER))
-
-register_operation("organizationList", (ADMIN,))
-register_operation("organizationCreate", (ADMIN,))
-register_operation("organizationGet", (ADMIN,))
-register_operation("organizationUpdate", (ADMIN,))
-register_operation("organizationDelete", (ADMIN,))
-
-register_operation("dictionaryList", (ADMIN,))
-register_operation("dictionaryCreate", (ADMIN,))
-register_operation("dictionaryGet", (ADMIN,))
-register_operation("dictionaryUpdate", (ADMIN,))
-register_operation("dictionaryDelete", (ADMIN,))
-register_operation("dictionaryOptions", ALL_ROLES)
-
-register_operation("auditList", (ADMIN, PROVINCE_REVIEWER))
-
+# 成员2 负责的账号/组织/字典/审计权限点统一在 apps/accounts/api.py 导入期登记，
+# 避免 permissions.py 与 api.py 两处注册互相覆盖（改一处不生效）。
 register_operation("messageList", ALL_ROLES)
 register_operation("messageGet", ALL_ROLES)
 register_operation("messageRead", ALL_ROLES)

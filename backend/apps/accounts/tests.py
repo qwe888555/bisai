@@ -769,6 +769,7 @@ class InvitationBatchTests(AccountScopeTestBase):
         cls.other_school = School.objects.create(
             code="QS00", name="外市学校", school_type="SENIOR", region=cls.region
         )
+        cls.other_org = cls._org("QS00", "外市学校", "UNIVERSITY", cls.Q)
         cls.person = cls._person("张三", "110101199001011234", cls.school)
         cls.outsider_person = cls._person("李四", "110101199001011242", cls.other_school)
 
@@ -868,6 +869,59 @@ class InvitationBatchTests(AccountScopeTestBase):
         self.assertEqual(row["status"], "FAILED")
         self.assertEqual(row["code"], "DUPLICATE_RESOURCE")
 
+    def test_batch_rejects_province_or_city_org(self):
+        from apps.accounts.models import RegistrationInvitation
+
+        token = self._login("scope-admin")
+        resp = self._batch(token, [["张三", "110101199001011234", "", "ATHLETE", "P000"]])
+        row = resp.json()["data"]["rows"][0]
+        self.assertEqual(row["status"], "FAILED")
+        self.assertEqual(row["code"], "INVALID_ARGUMENT")
+        self.assertIn("学校或球队", row["error"])
+        self.assertFalse(RegistrationInvitation.objects.exists())
+
+    def test_batch_rejects_person_school_org_mismatch(self):
+        from apps.accounts.models import RegistrationInvitation
+
+        token = self._login("scope-rootless-admin")
+        # 张三属于 S000，却把邀请挂到外市学校 QS00
+        resp = self._batch(token, [["张三", "110101199001011234", "", "ATHLETE", "QS00"]])
+        row = resp.json()["data"]["rows"][0]
+        self.assertEqual(row["status"], "FAILED")
+        self.assertEqual(row["code"], "BUSINESS_VALIDATION_FAILED")
+        self.assertIn("所属学校", row["error"])
+        self.assertFalse(RegistrationInvitation.objects.exists())
+
+    def test_batch_deduplicates_same_id_number(self):
+        from apps.accounts.models import RegistrationInvitation
+
+        token = self._login("scope-admin")
+        resp = self._batch(
+            token,
+            [
+                ["张三", "110101199001011234", "", "ATHLETE", "S000"],
+                ["张三", "110101199001011234", "", "ATHLETE", "S000"],
+            ],
+        )
+        data = resp.json()["data"]
+        self.assertEqual(data["successCount"], 1)
+        self.assertEqual(data["failureCount"], 1)
+        duplicate = data["rows"][1]
+        self.assertEqual(duplicate["status"], "FAILED")
+        self.assertEqual(duplicate["code"], "DUPLICATE_RESOURCE")
+        self.assertIn("名单内身份证号重复", duplicate["error"])
+        self.assertEqual(RegistrationInvitation.objects.count(), 1)
+
+    def test_single_invite_rejects_province_org(self):
+        token = self._login("scope-admin")
+        resp = self._post(
+            f"{BASE}/accounts/registration-invitations",
+            {"kind": "ATHLETE", "orgId": self.P.pk},
+            token=token,
+        )
+        self.assertEqual(resp.status_code, 400, resp.content)
+        self.assertEqual(resp.json()["code"], "INVALID_ARGUMENT")
+
     def test_batch_csv_export_contains_token_and_bom(self):
         token = self._login("scope-admin")
         resp = self._batch(
@@ -918,3 +972,135 @@ class InvitationBatchTests(AccountScopeTestBase):
         )
         self.assertEqual(resp.status_code, 403)
         self.assertEqual(resp.json()["code"], "DATA_SCOPE_DENIED")
+
+
+# ================================================================ 角色策略
+
+
+class RolePolicyTests(AccountScopeTestBase):
+    """建号与管号共用 ROLE_POLICY：能建的角色必须能管，不能越级建同级/更高角色。"""
+
+    def _account_body(self, username: str, roles: list, org_id: str) -> dict:
+        return {
+            "username": username,
+            "displayName": username,
+            "roles": roles,
+            "orgId": org_id,
+        }
+
+    def test_school_can_update_team_account(self):
+        team = self._account("policy-team", ["TEAM"], self.T)
+        resp = self._put(
+            f"{BASE}/accounts/{team.pk}",
+            {
+                "username": "policy-team",
+                "displayName": "球队账号改名",
+                "roles": ["TEAM"],
+                "orgId": self.T.pk,
+                "version": 0,
+            },
+            token=self._login("scope-school"),
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        team.refresh_from_db()
+        self.assertEqual(team.display_name, "球队账号改名")
+
+    def test_school_cannot_create_another_school_account(self):
+        resp = self._post(
+            f"{BASE}/accounts",
+            self._account_body("policy-school-2", ["UNIVERSITY"], self.S.pk),
+            token=self._login("scope-school"),
+        )
+        self.assertEqual(resp.status_code, 403, resp.content)
+        self.assertEqual(resp.json()["code"], "FORBIDDEN")
+
+    def test_city_cannot_create_city_account(self):
+        resp = self._post(
+            f"{BASE}/accounts",
+            self._account_body("policy-city-2", ["CITY"], self.C.pk),
+            token=self._login("scope-city"),
+        )
+        self.assertEqual(resp.status_code, 403, resp.content)
+        self.assertEqual(resp.json()["code"], "FORBIDDEN")
+
+    def test_province_cannot_create_province_reviewer(self):
+        resp = self._post(
+            f"{BASE}/accounts",
+            self._account_body("policy-prov-2", ["PROVINCE_REVIEWER"], self.P.pk),
+            token=self._login("scope-prov"),
+        )
+        self.assertEqual(resp.status_code, 403, resp.content)
+        self.assertEqual(resp.json()["code"], "FORBIDDEN")
+
+    def test_city_can_update_match_recorder(self):
+        recorder = self._account("policy-recorder", ["MATCH_RECORDER"], self.C)
+        resp = self._put(
+            f"{BASE}/accounts/{recorder.pk}",
+            {
+                "username": "policy-recorder",
+                "displayName": "录入员改名",
+                "roles": ["MATCH_RECORDER"],
+                "orgId": self.C.pk,
+                "version": 0,
+            },
+            token=self._login("scope-city"),
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        recorder.refresh_from_db()
+        self.assertEqual(recorder.display_name, "录入员改名")
+
+    def test_school_cannot_update_another_school_account(self):
+        peer = self._account("policy-school-peer", ["UNIVERSITY"], self.S)
+        resp = self._put(
+            f"{BASE}/accounts/{peer.pk}",
+            {
+                "username": "policy-school-peer",
+                "displayName": "同级学校改名",
+                "roles": ["UNIVERSITY"],
+                "orgId": self.S.pk,
+                "version": 0,
+            },
+            token=self._login("scope-school"),
+        )
+        self.assertEqual(resp.status_code, 403, resp.content)
+        self.assertEqual(resp.json()["code"], "FORBIDDEN")
+
+    def test_city_cannot_promote_athlete_to_city(self):
+        athlete = self._account("policy-athlete", ["ATHLETE"], self.C)
+        resp = self._put(
+            f"{BASE}/accounts/{athlete.pk}",
+            {
+                "username": "policy-athlete",
+                "displayName": "越级改角色",
+                "roles": ["CITY"],
+                "orgId": self.C.pk,
+                "version": 0,
+            },
+            token=self._login("scope-city"),
+        )
+        self.assertEqual(resp.status_code, 403, resp.content)
+        self.assertEqual(resp.json()["code"], "FORBIDDEN")
+
+    def test_school_account_can_bind_school_org(self):
+        """学校节点可能是 SCHOOL（种子数据），UNIVERSITY 账号必须能绑定。"""
+        school_org = self._org("S100", "新学校", "SCHOOL", self.C)
+        resp = self._post(
+            f"{BASE}/accounts",
+            self._account_body("policy-school-org", ["UNIVERSITY"], school_org.pk),
+            token=self._login("scope-admin"),
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+
+    def test_account_permissions_have_single_registration(self):
+        import apps.accounts.api  # noqa: F401  确保导入期完成权限点登记
+
+        from apps.common.permissions import operation_roles
+
+        self.assertEqual(
+            set(operation_roles("accountList")),
+            {"ADMIN", "PROVINCE_REVIEWER", "CITY", "UNIVERSITY"},
+        )
+        self.assertEqual(
+            set(operation_roles("accountDelete")),
+            {"ADMIN", "PROVINCE_REVIEWER"},
+        )
