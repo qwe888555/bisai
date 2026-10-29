@@ -344,32 +344,47 @@ class MaterialApiTests(TestCase):
     # ------------------------------------------------------------ 创建：类型
 
     def test_create_type_missing_when_table_empty(self):
-        """类型表无该 code → 409 明确报错（不伪造成功、不硬编码 13 种类型）。"""
+        """类型表无该 code → 400 INVALID_ARGUMENT（不伪造成功、不硬编码 13 种类型）。"""
         resp = self._post(BASE, self._create_payload(materialType="NO_SUCH_TYPE"), token=self.admin_token)
-        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.json()["code"], "INVALID_ARGUMENT")
         self.assertIn("尚未初始化", resp.json()["message"])
 
     def test_create_type_inactive(self):
         resp = self._post(BASE, self._create_payload(materialType="OFF_TYPE"), token=self.admin_token)
-        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.json()["code"], "INVALID_ARGUMENT")
 
     def test_create_type_owner_mismatch(self):
-        """TEAM 类型用于 PERSON 归属 → 409（跨归属类型越权）。"""
+        """TEAM 类型用于 PERSON 归属 → 400（跨归属类型引用无效字典项）。"""
         resp = self._post(BASE, self._create_payload(materialType="TEAM_HONOR"), token=self.admin_token)
-        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.json()["code"], "INVALID_ARGUMENT")
 
-    def test_create_all_types_empty_returns_409(self):
-        """清空类型表模拟种子未导入：创建 409、列表正常空结果。"""
+    def test_create_all_types_empty_returns_400(self):
+        """清空类型表模拟种子未导入：创建 400、列表正常空结果。"""
         PersonMaterial.objects.all().delete()  # PROTECT：先删引用行再清类型表
         TeamMaterial.objects.all().delete()
         MaterialType.objects.all().delete()
         resp = self._post(BASE, self._create_payload(), token=self.admin_token)
-        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.json()["code"], "INVALID_ARGUMENT")
         self.assertIn("尚未初始化", resp.json()["message"])
         resp2 = self._get(
             BASE, token=self.admin_token, query={"ownerType": "PERSON", "ownerId": self.person_a.pk}
         )
         self.assertEqual(resp2.status_code, 200)
+
+    def test_create_type_errors_all_400_not_409(self):
+        """问题⑥回归守护（2026-10-29 裁定）：类型不存在/停用/归属不匹配
+        三分支一律 400 INVALID_ARGUMENT，不得回退 409 STATE_CONFLICT——
+        409 保留给真实资源状态冲突（双命中/文件占用等）。"""
+        for bad_type in ("NO_SUCH_TYPE", "OFF_TYPE", "TEAM_HONOR"):
+            with self.subTest(bad_type=bad_type):
+                resp = self._post(BASE, self._create_payload(materialType=bad_type), token=self.admin_token)
+                self.assertEqual(resp.status_code, 400)
+                self.assertEqual(resp.json()["code"], "INVALID_ARGUMENT")
+                self.assertNotEqual(resp.json()["code"], "STATE_CONFLICT")
 
     # ------------------------------------------------------------ 创建：归属与文件
 

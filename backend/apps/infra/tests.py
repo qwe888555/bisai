@@ -189,6 +189,37 @@ class InitBaseDataTests(TestCase):
         self.assertIn("跳过=1", out2)
         self.assertEqual(MaterialType.objects.count(), 1)
 
+    def test_material_types_official_csv_13codes(self):
+        """对齐 docs/csv/material_types.csv 正式种子（2026-10-26 批文 P1/P2
+        批准 13 码集，维持 13 类口径、不扩 19 类）：真实 CSV 全量导入成功、
+        码集与归属拆分与批文一致、重跑幂等全跳过。"""
+        csv_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "..", "..", "..", "docs", "csv", "material_types.csv",
+        )
+        expected = {
+            "STUDENT_STATUS", "EDUCATION", "ATHLETE_CERTIFICATE", "AWARD",
+            "COMPETITION", "COACHING_RECORD", "TRAINING_RECORD",
+            "TEACHER_LICENSE", "COACH_LICENSE", "OTHER",
+            "TRAINING_PLAN", "TEAM_HONOR", "MATCH_RECORD",
+        }
+        team_only = {"TRAINING_PLAN", "TEAM_HONOR", "MATCH_RECORD"}
+        out = self.call_cmd(phase="material_types", material_csv=csv_path, execute=True)
+        self.assertIn("material_type", out)
+        self.assertIn("新增=13", out)
+        self.assertIn("失败=0", out)
+        self.assertEqual(MaterialType.objects.count(), 13)
+        self.assertEqual({mt.code for mt in MaterialType.objects.all()}, expected)
+        person_codes = {
+            code for code, applies in MaterialType.objects.values_list("code", "applies_to")
+            if applies == "PERSON"
+        }
+        self.assertEqual(person_codes, expected - team_only)
+        out2 = self.call_cmd(phase="material_types", material_csv=csv_path, execute=True)
+        self.assertIn("新增=0", out2)
+        self.assertIn("跳过=13", out2)
+        self.assertEqual(MaterialType.objects.count(), 13)
+
 
     # ------------------------------------------------------------ 参数与数据边界
 
