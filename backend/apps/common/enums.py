@@ -67,9 +67,18 @@ class RelationSource(models.TextChoices):
 
 
 class CoachDuty(models.TextChoices):
+    """教练在球队的任职岗位（D-CAT 六值，2026-10-28 负责人确认）。
+
+    R4 现役主教练唯一（服务层强制）仅约束 HEAD_COACH，不受扩展影响；
+    OTHER 的补充说明存 TeamCoach.duty_other（写入校验随教练任职服务落地）。
+    """
+
     HEAD_COACH = "HEAD_COACH", "主教练"
     ASSISTANT_COACH = "ASSISTANT_COACH", "助理教练"
     GOALKEEPER_COACH = "GOALKEEPER_COACH", "守门员教练"
+    FITNESS_COACH = "FITNESS_COACH", "体能教练"
+    MANAGER = "MANAGER", "领队兼教练"
+    OTHER = "OTHER", "其他"
 
 
 class ConfirmStatus(models.TextChoices):

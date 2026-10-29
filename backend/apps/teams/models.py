@@ -222,7 +222,13 @@ class TeamCoach(models.Model):
     duty = models.CharField(
         max_length=20,
         choices=enums.CoachDuty.choices,
-        db_comment="HEAD_COACH/ASSISTANT_COACH/GOALKEEPER_COACH(R4现役主教练唯一,服务层强制)",
+        db_comment="D-CAT六值:HEAD_COACH/ASSISTANT_COACH/GOALKEEPER_COACH/FITNESS_COACH/MANAGER/OTHER(R4现役主教练唯一,服务层强制)",
+    )
+    duty_other = models.CharField(
+        max_length=50,
+        null=True,
+        blank=True,
+        db_comment="OTHER补充说明(≤50字,仅duty=OTHER时填写且非OTHER必须为空,写入校验随教练任职服务落地)",
     )
     status = models.CharField(
         max_length=20,

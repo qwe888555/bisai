@@ -24,7 +24,7 @@ main 只读投影的展示契约。
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import Field
 
@@ -36,7 +36,10 @@ class TeamCreateBody(StrictSchema):
     """POST /teams 请求体（键名与前端 createTeam payload 一致）。"""
 
     name: str = Field(min_length=1, max_length=100)
-    groupCategory: str = Field(min_length=1, max_length=20)
+    # 2026-10-28 业务规则：无"高校组"，组别仅 PRIMARY/MIDDLE（原 UNIVERSITY
+    # 高校组在服务端拒绝，不静默转换）；字典 team_category CSV 收敛 BLOCKED
+    # 登记（规则文档待决 11）。
+    groupCategory: Literal["PRIMARY", "MIDDLE"]
     schoolOrgId: Optional[str] = Field(None, min_length=1, max_length=64)
     intro: Optional[str] = None
     # ---- 声明但不持久化（冻结 Team 无对应列）----
@@ -60,7 +63,7 @@ class TeamUpdateBody(StrictSchema):
     gender: Optional[str] = Field(None, max_length=20)
     coachName: Optional[str] = Field(None, max_length=100)
     schoolOrgId: Optional[str] = Field(None, min_length=1, max_length=64)
-    groupCategory: Optional[str] = Field(None, max_length=20)
+    groupCategory: Optional[Literal["PRIMARY", "MIDDLE"]] = Field(None)  # 回传原值：同 create 无高校组
     version: int = Field(ge=0)
 
 

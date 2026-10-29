@@ -230,8 +230,9 @@ class TeamApiTests(TestCase):
         self.assertEqual(resp.status_code, 403)
         self.assertEqual(resp.json()["code"], "FORBIDDEN")
 
-    def test_get_forbidden_for_university(self):
-        """UNIVERSITY 本校范围依赖 A′-min 映射，未交付前统一范围拒绝。"""
+    def test_get_forbidden_for_university_without_org(self):
+        """UNIVERSITY 无组织绑定（空范围）→ DATA_SCOPE_DENIED（A′ 第 2 批：
+        有效范围账号见 TeamDataScopeTests 的放行/越界用例）。"""
         resp = self._get(f"{BASE}/{self.team_main.pk}", token=self.uni_token)
         self.assertEqual(resp.status_code, 403)
         self.assertEqual(resp.json()["code"], "DATA_SCOPE_DENIED")
@@ -772,7 +773,8 @@ class TeamMemberApiTests(TestCase):
         self.assertEqual(resp.json()["code"], "FORBIDDEN")
 
     def test_member_scope_denied_for_university(self):
-        """UNIVERSITY 范围依赖 A′-min 映射，未交付前统一 DATA_SCOPE_DENIED。"""
+        """UNIVERSITY 无组织绑定（空范围）→ DATA_SCOPE_DENIED（A′ 第 2 批；
+        有范围账号行为见 TeamDataScopeTests）。"""
         for resp in (
             self._get(self._mpath(self.team_main.pk), token=self.uni_token),
             self._post(
@@ -793,9 +795,9 @@ class TeamMemberApiTests(TestCase):
     def test_member_update_forbidden_for_university(self):
         """批次 B 验收保留限制③：UNIVERSITY 独立调用 PUT members → 403。
 
-        范围依赖 A′-min 映射（未交付）→ services.member_update 入口
-        _require_admin_scope 拒绝（先于版本校验与写操作）；合法 version
-        正常提交以排除"缺/错版本"干扰，断言关系行零变更。
+        本夹具 uni 无组织绑定（空范围）→ services.member_update 入口
+        _require_admin_scope 拒绝（A′ 第 2 批，先于版本校验与写操作）；
+        合法 version 正常提交以排除"缺/错版本"干扰，断言关系行零变更。
         """
         version = self._mver(self.member_a)
         resp = self._put(
@@ -880,7 +882,7 @@ class TeamMemberApiTests(TestCase):
         from apps.common.permissions import operation_roles
 
         # 文档角色表含 CITY，与 memberList 登记口径对齐（不含 CITY）；
-        # 数据范围一期仅 ADMIN，该差异无实际访问影响（批次 D-2 验收记录）
+        # 数据范围经 A′ 第 2 批逐对象校验，本夹具无 CITY 账号（批次 D-2 验收记录）
         self.assertEqual(
             operation_roles("memberGet"),
             ("ADMIN", "UNIVERSITY", "TEAM", "PROVINCE_REVIEWER"),
@@ -1282,3 +1284,361 @@ class TeamMemberApiTests(TestCase):
                 ).exists(),
                 action,
             )
+
+
+class TeamDataScopeTests(TestCase):
+    """A′ 第 2 批：teams 域数据范围授权（HTTP 层 + verify_team_owner 服务层）。
+
+    组织树：ORG-P → ORG-C → ORG-SCH-A(code=SCH-A) → TEAM 节点 a1(启用) /
+            a2(停用)；ORG-SCH-B(code=SCH-B) → TEAM 节点 b1(启用)。
+    球队：team_a1(映射正常) / team_a2(节点停用→拒绝) /
+          team_nomap(无 TEAM 节点→拒绝) / team_b1(乙校)。
+    账号：全局 ADMIN / 挂市组织 ADMIN / 甲校 UNIVERSITY / 乙校 UNIVERSITY /
+          甲一队 TEAM / 无绑定 / 幽灵绑定 / 软删组织绑定（后三者空范围）。
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.admin_global = Account.objects.create(
+            id=new_account_id(), username="scope-admin-global",
+            display_name="全局管理员", roles=["ADMIN"],
+            password=make_password("admin-pass-123"), enabled=True,
+        )
+        cls.uni_a = Account.objects.create(
+            id=new_account_id(), username="scope-uni-a",
+            display_name="甲校端", roles=["UNIVERSITY"],
+            password=make_password("uni-pass-123"), enabled=True,
+        )
+        cls.uni_b = Account.objects.create(
+            id=new_account_id(), username="scope-uni-b",
+            display_name="乙校端", roles=["UNIVERSITY"],
+            password=make_password("uni-pass-123"), enabled=True,
+        )
+        cls.team_acc = Account.objects.create(
+            id=new_account_id(), username="scope-team-a1",
+            display_name="甲一队端", roles=["TEAM"],
+            password=make_password("team-pass-123"), enabled=True,
+        )
+        cls.no_org = Account.objects.create(
+            id=new_account_id(), username="scope-no-org",
+            display_name="无绑定校端", roles=["UNIVERSITY"],
+            password=make_password("noorg-pass-123"), enabled=True,
+        )
+        # 幽灵绑定（organization_id 指向不存在节点）无法经 FK 落库（DB 层
+        # 参照完整性），改为服务级用例：test_ghost_binding_denied_service_level。
+
+        # ---- 组织树（两校并列，TEAM 节点 code=team_no，A′ 映射）----
+        org_prov = Organization.objects.create(
+            id=new_organization_id(), name="范围省", org_type="PROVINCE", code="ORG-P-SCOPE"
+        )
+        org_city = Organization.objects.create(
+            id=new_organization_id(), name="范围市", org_type="CITY",
+            code="ORG-C-SCOPE", parent=org_prov,
+        )
+        cls.org_city = org_city
+        cls.org_school_a = Organization.objects.create(
+            id=new_organization_id(), name="甲校组织", org_type="SCHOOL",
+            code="SCH-SCOPE-A", parent=org_city,
+        )
+        cls.org_school_b = Organization.objects.create(
+            id=new_organization_id(), name="乙校组织", org_type="SCHOOL",
+            code="SCH-SCOPE-B", parent=org_city,
+        )
+        cls.org_team_a1 = Organization.objects.create(
+            id=new_organization_id(), name="甲一队组织", org_type="TEAM",
+            code="T202688880001", parent=cls.org_school_a,
+        )
+        cls.org_team_a2 = Organization.objects.create(
+            id=new_organization_id(), name="甲二队组织", org_type="TEAM",
+            code="T202688880002", parent=cls.org_school_a, enabled=False,
+        )  # 停用 TEAM 节点 → 对应球队范围拒绝
+        Organization.objects.create(
+            id=new_organization_id(), name="乙一队组织", org_type="TEAM",
+            code="T202688880003", parent=cls.org_school_b,
+        )
+        org_softed = Organization.objects.create(
+            id=new_organization_id(), name="软删校组织", org_type="SCHOOL",
+            code="SCH-SCOPE-DEAD", parent=org_city,
+            deleted_at=timezone.now(),
+        )
+        cls.soft_acc = Account.objects.create(
+            id=new_account_id(), username="scope-soft-org",
+            display_name="软删绑定", roles=["UNIVERSITY"],
+            password=make_password("soft-pass-123"), enabled=True,
+            organization_id=org_softed.pk,
+        )
+        cls.admin_city = Account.objects.create(
+            id=new_account_id(), username="scope-admin-org",
+            display_name="甲校管理员", roles=["ADMIN"],
+            password=make_password("admin-pass-123"), enabled=True,
+            organization_id=cls.org_school_a.pk,
+        )  # 挂组织 ADMIN：仅甲校子树（乙校=子树外对照）
+
+        for acc, org in (
+            (cls.uni_a, cls.org_school_a), (cls.uni_b, cls.org_school_b),
+            (cls.team_acc, cls.org_team_a1),
+        ):
+            acc.organization_id = org.pk
+            acc.save()
+
+        # ---- 学校主档（create_team 链 _resolve_school 反查 School.code=org.code）----
+        region_scope = Region.objects.create(name="范围省Region", code="980000", level=1)
+        School.objects.create(
+            name="甲校主档", code="SCH-SCOPE-A", school_type="PRIMARY", region=region_scope
+        )
+        School.objects.create(
+            name="乙校主档", code="SCH-SCOPE-B", school_type="PRIMARY", region=region_scope
+        )
+
+        # ---- 球队（team_no 与 TEAM 节点 code 一一对应；nomap 无节点）----
+        cls.team_a1 = Team.objects.create(
+            team_no="T202688880001", name="甲一队", category_code="PRIMARY"
+        )
+        cls.team_a2 = Team.objects.create(
+            team_no="T202688880002", name="甲二队", category_code="PRIMARY"
+        )
+        cls.team_nomap = Team.objects.create(
+            team_no="T202688880009", name="无映射队", category_code="PRIMARY"
+        )
+        cls.team_b1 = Team.objects.create(
+            team_no="T202688880003", name="乙一队", category_code="PRIMARY"
+        )
+
+        # ---- 甲一队现役成员（member 目标校验用例）----
+        cls.ath_x = _athlete(201, "范围小明")
+        cls.member_x = TeamMember.objects.create(
+            team=cls.team_a1, person=cls.ath_x, jersey_number=10,
+            joined_at=date(2026, 3, 1),
+        )
+
+        cls.admin_global_token = _token(cls.admin_global)
+        cls.admin_city_token = _token(cls.admin_city)
+        cls.uni_a_token = _token(cls.uni_a)
+        cls.uni_b_token = _token(cls.uni_b)
+        cls.team_token = _token(cls.team_acc)
+        cls.no_org_token = _token(cls.no_org)
+        cls.soft_token = _token(cls.soft_acc)
+
+    # ------------------------------------------------------------ helpers
+
+    @staticmethod
+    def _auth(token):
+        return {"HTTP_AUTHORIZATION": f"Bearer {token}"} if token else {}
+
+    def _get(self, path, token=None, query=None):
+        return self.client.get(path, data=query or {}, **self._auth(token))
+
+    def _post(self, path, payload, token=None):
+        return self.client.post(
+            path, data=json.dumps(payload), content_type="application/json",
+            **self._auth(token),
+        )
+
+    def _put(self, path, payload, token=None):
+        return self.client.put(
+            path, data=json.dumps(payload), content_type="application/json",
+            **self._auth(token),
+        )
+
+    def _delete(self, path, token=None, version=None):
+        url = f"{path}?version={version}" if version is not None else path
+        return self.client.delete(url, **self._auth(token))
+
+    @staticmethod
+    def _list_team_nos(resp):
+        body = resp.json()["data"]
+        return sorted(item["teamNo"] for item in body["items"])
+
+    def _assert_scope_denied(self, resp):
+        """拒绝用例统一断言：403 + DATA_SCOPE_DENIED（具体错误码与状态码）。"""
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json()["code"], "DATA_SCOPE_DENIED")
+
+    # ------------------------------------------------------------ 全局 ADMIN
+
+    def test_global_admin_sees_and_reads_all_teams(self):
+        """验收1：全局 ADMIN 全库——列表含两校全部球队，可读乙校球队详情。"""
+        resp = self._get(BASE, token=self.admin_global_token)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(
+            self._list_team_nos(resp),
+            ["T202688880001", "T202688880002", "T202688880003", "T202688880009"],
+        )
+        resp = self._get(f"{BASE}/{self.team_b1.pk}", token=self.admin_global_token)
+        self.assertEqual(resp.status_code, 200)
+
+    # ------------------------------------------------------------ 挂组织 ADMIN
+
+    def test_org_admin_list_filtered_to_subtree(self):
+        """验收2+5：挂组织 ADMIN 列表仅含子树内有效 TEAM 节点球队——
+        服务端谓词过滤（停用节点/无映射/越界球队均不在查询集中）。"""
+        resp = self._get(BASE, token=self.admin_city_token)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(self._list_team_nos(resp), ["T202688880001"])
+
+    def test_org_admin_get_out_of_subtree_denied(self):
+        """验收2：挂组织 ADMIN 读子树外球队 → 403 DATA_SCOPE_DENIED。"""
+        self._assert_scope_denied(
+            self._get(f"{BASE}/{self.team_b1.pk}", token=self.admin_city_token)
+        )
+
+    def test_org_admin_get_disabled_and_missing_mapping_denied(self):
+        """验收9：TEAM 节点停用 / 映射缺失的球队一律拒绝，不意外放行。"""
+        self._assert_scope_denied(
+            self._get(f"{BASE}/{self.team_a2.pk}", token=self.admin_city_token)
+        )
+        self._assert_scope_denied(
+            self._get(f"{BASE}/{self.team_nomap.pk}", token=self.admin_city_token)
+        )
+
+    # ------------------------------------------------------------ TEAM 角色
+
+    def test_team_role_own_team_ok_cross_team_denied(self):
+        """验收3：TEAM 本队访问成功（含成员列表），跨队访问拒绝。"""
+        resp = self._get(f"{BASE}/{self.team_a1.pk}", token=self.team_token)
+        self.assertEqual(resp.status_code, 200)
+        resp = self._get(
+            f"{BASE}/{self.team_a1.pk}/members", token=self.team_token
+        )
+        self.assertEqual(resp.status_code, 200)
+        self._assert_scope_denied(
+            self._get(f"{BASE}/{self.team_b1.pk}", token=self.team_token)
+        )
+        self._assert_scope_denied(
+            self._get(f"{BASE}/{self.team_b1.pk}/members", token=self.team_token)
+        )
+
+    # ------------------------------------------------------------ UNIVERSITY
+
+    def test_university_school_scope_list_and_get(self):
+        """验收4：学校端列表仅见本校球队；跨校详情/成员拒绝。"""
+        resp = self._get(BASE, token=self.uni_a_token)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(self._list_team_nos(resp), ["T202688880001"])
+        resp = self._get(f"{BASE}/{self.team_a1.pk}", token=self.uni_a_token)
+        self.assertEqual(resp.status_code, 200)
+        self._assert_scope_denied(
+            self._get(f"{BASE}/{self.team_b1.pk}", token=self.uni_a_token)
+        )
+        self._assert_scope_denied(
+            self._get(f"{BASE}/{self.team_a1.pk}", token=self.uni_b_token)
+        )
+
+    def test_university_create_team_in_scope_ok(self):
+        """验收7正向：学校端在本校组织下建队成功（含 TEAM 节点同事务建立）。"""
+        resp = self._post(
+            BASE,
+            {"name": "甲校新队", "groupCategory": "PRIMARY",
+             "schoolOrgId": str(self.org_school_a.pk)},
+            token=self.uni_a_token,
+        )
+        self.assertEqual(resp.status_code, 200)
+        team = Team.objects.filter(name="甲校新队").first()
+        self.assertIsNotNone(team)
+        self.assertTrue(
+            Organization.objects.filter(code=team.team_no, org_type="TEAM").exists()
+        )
+
+    def test_university_create_team_out_of_scope_denied(self):
+        """验收7：学校端不能在范围外学校建队（403 且不落库）。"""
+        before = Team.objects.count()
+        self._assert_scope_denied(
+            self._post(
+                BASE,
+                {"name": "越权建队", "groupCategory": "PRIMARY",
+                 "schoolOrgId": str(self.org_school_b.pk)},
+                token=self.uni_a_token,
+            )
+        )
+        self.assertEqual(Team.objects.count(), before)
+
+    # ------------------------------------------------------------ 空范围 / 失效范围
+
+    def test_empty_scope_accounts_denied(self):
+        """验收9：无绑定 / 软删组织绑定（空范围）一律拒绝（HTTP 层）。"""
+        for token in (self.no_org_token, self.soft_token):
+            self._assert_scope_denied(self._get(BASE, token=token))
+            self._assert_scope_denied(
+                self._get(f"{BASE}/{self.team_a1.pk}", token=token)
+            )
+
+    def test_ghost_binding_denied_service_level(self):
+        """验收9：绑定组织不存在（幽灵绑定，DB 外键层无法落库）→ 服务层
+        空范围拒绝，不得放大为全库（不落库的 Account 实例模拟）。"""
+        from apps.common.errors import ApiError
+        from apps.common import scopes
+        from apps.teams.services import _require_admin_scope
+
+        ghost = Account(organization_id="ORG-GHOST-T4-SCOPE", roles=["UNIVERSITY"])
+        with self.assertRaises(ApiError) as ctx:
+            scopes.ensure_team_in_scope(ghost, self.team_a1)
+        self.assertEqual(ctx.exception.code, "DATA_SCOPE_DENIED")
+        self.assertEqual(ctx.exception.status, 403)
+        with self.assertRaises(ApiError) as ctx:
+            _require_admin_scope(ghost)
+        self.assertEqual(ctx.exception.code, "DATA_SCOPE_DENIED")
+        self.assertEqual(ctx.exception.status, 403)
+        with self.assertRaises(ApiError) as ctx:
+            scopes.ensure_org_in_scope(ghost, self.org_school_a.pk)
+        self.assertEqual(ctx.exception.code, "DATA_SCOPE_DENIED")
+        self.assertEqual(ctx.exception.status, 403)
+
+    # ------------------------------------------------------------ 成员目标校验
+
+    def test_member_ops_target_team_checked(self):
+        """验收6：member list/get/search/add/update/remove 均校验目标球队——
+        甲一队端访问乙一队（目标球队在范围外）→ 403，先于成员归属 404。"""
+        base_b = f"{BASE}/{self.team_b1.pk}/members"
+        self._assert_scope_denied(self._get(base_b, token=self.team_token))
+        self._assert_scope_denied(
+            self._get(f"{base_b}/{self.member_x.pk}", token=self.team_token)
+        )
+        self._assert_scope_denied(
+            self._post(f"{base_b}/search", {"keyword": "小"}, token=self.team_token)
+        )
+        self._assert_scope_denied(
+            self._post(base_b, {"athleteId": str(self.ath_x.pk)}, token=self.team_token)
+        )
+        self._assert_scope_denied(
+            self._put(
+                f"{base_b}/{self.member_x.pk}",
+                {"jerseyNumber": 8, "version": int(self.member_x.updated_at.timestamp() * 1_000_000)},
+                token=self.team_token,
+            )
+        )
+        self._assert_scope_denied(
+            self._delete(
+                f"{base_b}/{self.member_x.pk}",
+                token=self.team_token,
+                version=int(self.member_x.updated_at.timestamp() * 1_000_000),
+            )
+        )
+        # 状态零变更（拒绝先于写操作）
+        self.member_x.refresh_from_db()
+        self.assertEqual(self.member_x.jersey_number, 10)
+        self.assertEqual(self.member_x.status, enums.RelationStatus.CURRENT)
+
+    # ------------------------------------------------------------ 附件归属校验器
+
+    def test_verify_team_owner_scoping(self):
+        """验收8：verify_team_owner 不因本轮改动放宽跨范围访问——
+        全局 ADMIN 全库放行；挂组织/学校/球队端按 A′ 映射逐对象裁决。"""
+        from apps.common.errors import ApiError
+        from apps.teams.services import verify_team_owner
+
+        # 放行路径
+        verify_team_owner(self.admin_global, str(self.team_b1.pk))
+        verify_team_owner(self.admin_city, str(self.team_a1.pk))
+        verify_team_owner(self.uni_a, str(self.team_a1.pk))
+        # 拒绝路径：越界 / 空范围
+        for account, owner in (
+            (self.admin_city, self.team_b1),
+            (self.uni_a, self.team_b1),
+            (self.uni_b, self.team_a1),
+            (self.team_acc, self.team_b1),
+            (self.no_org, self.team_a1),
+        ):
+            with self.assertRaises(ApiError) as ctx:
+                verify_team_owner(account, str(owner.pk))
+            self.assertEqual(ctx.exception.code, "DATA_SCOPE_DENIED")
+            self.assertEqual(ctx.exception.status, 403)
