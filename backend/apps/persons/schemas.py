@@ -213,9 +213,9 @@ def person_version(person) -> int:
 class PersonCreate(StrictSchema):
     """POST /people 创建（契约对齐 PeopleManageView 新建表单 + 文档 §6.5）。
 
-    - kinds：方案C 双类别（2026-10-24 用户决策：前端多选为准，扩展档案行承载）
-      ——schema 限 1-2 项；person_category 存首项主类别，按类别建扩展档案行
-      （行存在性=类别事实源）；重复项/空值/非法值 400，不静默取首值或丢弃；
+    - kinds：一人一身份（问题 11，2026-10-30 批准收紧）——schema 限 1 项；
+      person_category 存该类别，按类别建扩展档案行（行存在性=类别事实源）；
+      重复项/空值/非法值/多项 400，不静默取首值或丢弃；
     - education：**E1 已持久化**（2026-10-27 组长批准加列 Person.education，
       可选自由文本 max_length=100，创建/更新/回显全链生效）；
     - coachCategory：前端表单会提交（PeopleManageView L130-131），
@@ -226,7 +226,7 @@ class PersonCreate(StrictSchema):
       档案最多只能存在一条空串行，与文档"可选"冲突，已列待确认）。
     """
 
-    kinds: list[str] = Field(min_length=1, max_length=2)
+    kinds: list[str] = Field(min_length=1, max_length=1)
     realName: str = Field(min_length=1, max_length=100)
     idNumber: Optional[str] = Field(
         None, min_length=18, max_length=18, pattern=r"^\d{17}[\dXx]$"
@@ -244,14 +244,17 @@ class PersonUpdate(StrictSchema):
     """PUT /people/{id} 更新（前端编辑表单不含 idNumber/phone 输入，L370 仅新建显示）。
 
     - version 必填：乐观锁（updated_at UTC 微秒派生，B4 已验证方案）；
-    - 必填字段（kinds/realName/gender/birthDate）全量替换；可选字段
-      （phone/schoolOrgId/avatarFileId/education）未传=保留原值——编辑表单
-      无手机号输入，缺省清空会造成静默数据丢失（实现口径在案）；
+    - kinds **可选**（问题 11，2026-10-30 批准方案 B）：未传=保留现有
+      身份集合（不调 _apply_kinds、不改 person_category、不生身份变更日志）；
+      传值=显式变更身份，限 1 项，按差集增删扩展档案行（移除类别有业务
+      数据 409）；realName 必填全量替换；gender/birthDate 全量替换（缺省=清空）；
+      可选字段（phone/schoolOrgId/avatarFileId/education）未传=保留原值
+      ——编辑表单无手机号输入，缺省清空会造成静默数据丢失（实现口径在案）；
       education 传值（含空串）= 覆盖写入（表单有输入框，可主动清空）；
     - idNumber 不接受：身份证变更走更正流程（文档 §9 待确认），一期不开放。
     """
 
-    kinds: list[str] = Field(min_length=1, max_length=2)
+    kinds: Optional[list[str]] = Field(None, min_length=1, max_length=1)
     realName: str = Field(min_length=1, max_length=100)
     gender: Optional[str] = Field(None, max_length=20)
     birthDate: Optional[date] = None

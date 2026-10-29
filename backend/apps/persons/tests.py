@@ -1219,19 +1219,15 @@ class PeopleWriteApiTests(TestCase):
         profile = CoachProfile.objects.get(person=person)
         self.assertIsNone(profile.coach_level)  # 数据库未被写入
 
-    def test_create_dual_kind_creates_both_profiles(self):
-        """方案C（前端多选为准）：双类别经扩展档案行承载，不静默丢弃。"""
+    def test_create_dual_kind_rejected(self):
+        """问题 11：一人一身份，新建传入两个身份 → 400 INVALID_ARGUMENT。"""
         resp = self._post(
             {"kinds": ["ATHLETE", "COACH"], "realName": "双类别", "idNumber": "110101201305015678"}
         )
-        self.assertEqual(resp.status_code, 200, resp.content)
-        data = resp.json()["data"]
-        # 合成固定 ATHLETE→COACH 顺序，与提交顺序无关
-        self.assertEqual(data["kinds"], ["ATHLETE", "COACH"])
-        person = Person.objects.get(full_name="双类别")
-        self.assertEqual(person.person_category, "ATHLETE")  # 主类别=提交首项
-        self.assertTrue(AthleteProfile.objects.filter(person=person).exists())
-        self.assertTrue(CoachProfile.objects.filter(person=person).exists())
+        self.assertEqual(resp.status_code, 400, resp.content)
+        self.assertEqual(resp.json()["code"], "INVALID_ARGUMENT")
+        # 确认未创建任何人员
+        self.assertFalse(Person.objects.filter(full_name="双类别").exists())
 
     def test_create_duplicate_kinds_rejected(self):
         resp = self._post(
@@ -1649,9 +1645,10 @@ class PeopleWriteApiTests(TestCase):
     def _get_list(self, query=None):
         return self.client.get(PEOPLE, data=query or {}, **self._auth(self.admin_token))
 
-    # ------------------------------------------------------ 方案C：类别增减
+    # ------------------------------------------------------ 问题 11：类别变更（显式移除历史双身份）
 
-    def test_update_add_kind_creates_profile(self):
+    def test_update_dual_kind_rejected(self):
+        """问题 11：更新传入两个身份 → 400 INVALID_ARGUMENT。"""
         _, person = self._create()  # ATHLETE
         from apps.persons.schemas import person_version
 
@@ -1663,15 +1660,22 @@ class PeopleWriteApiTests(TestCase):
                 "version": person_version(person),
             },
         )
-        self.assertEqual(resp.status_code, 200, resp.content)
-        self.assertEqual(resp.json()["data"]["kinds"], ["ATHLETE", "COACH"])
-        self.assertTrue(CoachProfile.objects.filter(person=person).exists())
+        self.assertEqual(resp.status_code, 400, resp.content)
+        self.assertEqual(resp.json()["code"], "INVALID_ARGUMENT")
+        # 确认未创建 CoachProfile
+        self.assertFalse(CoachProfile.objects.filter(person=person).exists())
 
     def test_update_remove_empty_kind_deletes_profile(self):
+        """问题 11：历史双身份（ORM 构造）显式移除空 Profile → 删除成功。"""
+        # 先用 API 创建 ATHLETE 人员
         resp = self._post(
-            {"kinds": ["ATHLETE", "COACH"], "realName": "双师", "idNumber": "110101201305017890"}
+            {"kinds": ["ATHLETE"], "realName": "双师", "idNumber": "110101201305017890"}
         )
         person = Person.objects.get(pk=int(resp.json()["data"]["id"]))
+        # ORM 直接构造历史双身份（模拟迁移前数据，不依赖 API 新建双身份）
+        CoachProfile.objects.create(person=person)
+        from apps.persons.services import _current_kinds
+        self.assertEqual(_current_kinds(person), ["ATHLETE", "COACH"])
         from apps.persons.schemas import person_version
 
         resp = self._put(
@@ -1689,11 +1693,13 @@ class PeopleWriteApiTests(TestCase):
         self.assertEqual(kinds_change[0]["new"], ["ATHLETE"])
 
     def test_update_remove_coach_kind_with_data_rejected_409(self):
+        """问题 11：历史双身份（ORM 构造）显式移除有数据 Profile → 409。"""
         resp = self._post(
-            {"kinds": ["ATHLETE", "COACH"], "realName": "证教练", "idNumber": "110101201305019012"}
+            {"kinds": ["ATHLETE"], "realName": "证教练", "idNumber": "110101201305019012"}
         )
         person = Person.objects.get(full_name="证教练")
-        CoachProfile.objects.filter(person=person).update(certificate_no="C2026001")
+        # ORM 构造历史双身份 + COACH 有业务数据
+        CoachProfile.objects.create(person=person, certificate_no="C2026001")
         from apps.persons.schemas import person_version
 
         person.refresh_from_db()  # queryset.update 不刷 updated_at，版本不受影响
@@ -1706,11 +1712,13 @@ class PeopleWriteApiTests(TestCase):
         self.assertTrue(CoachProfile.objects.filter(person=person).exists())
 
     def test_update_remove_athlete_kind_with_data_rejected_409(self):
+        """问题 11：历史双身份（ORM 构造）显式移除有数据 Profile → 409。"""
         resp = self._post(
-            {"kinds": ["ATHLETE", "COACH"], "realName": "学籍员", "idNumber": "110101201305023456"}
+            {"kinds": ["COACH"], "realName": "学籍员", "idNumber": "110101201305023456"}
         )
         person = Person.objects.get(full_name="学籍员")
-        AthleteProfile.objects.filter(person=person).update(student_no="G2026001")
+        # ORM 构造历史双身份 + ATHLETE 有业务数据
+        AthleteProfile.objects.create(person=person, grade_level="", student_no="G2026001")
         from apps.persons.schemas import person_version
 
         resp = self._put(
@@ -1722,18 +1730,95 @@ class PeopleWriteApiTests(TestCase):
         self.assertTrue(AthleteProfile.objects.filter(person=person).exists())
 
     def test_kind_filter_matches_profile_existence(self):
-        """kind 过滤与 kinds 合成同源：双类别人员在两种过滤下均命中。"""
+        """kind 过滤与 kinds 合成同源：ORM 构造双类别人员在两种过滤下均命中。"""
         self._create()
         resp = self._post(
-            {"kinds": ["ATHLETE", "COACH"], "realName": "兼项员", "idNumber": "110101201305034567"}
+            {"kinds": ["ATHLETE"], "realName": "兼项员", "idNumber": "110101201305034567"}
         )
         self.assertEqual(resp.status_code, 200, resp.content)
+        person = Person.objects.get(full_name="兼项员")
+        # ORM 构造历史双身份
+        CoachProfile.objects.create(person=person)
         resp = self._get_list({"kind": "ATHLETE"})
         names = [item["realName"] for item in resp.json()["data"]["items"]]
         self.assertIn("兼项员", names)
         resp = self._get_list({"kind": "COACH"})
         names = [item["realName"] for item in resp.json()["data"]["items"]]
         self.assertIn("兼项员", names)
+
+    # ------------------------------------------------------ 问题 11 方案 B：kinds 可选
+
+    def test_update_omit_kinds_keeps_dual_profiles(self):
+        """问题 11 方案 B：历史双身份人员不传 kinds 更新普通字段 → 两 Profile 均保留。"""
+        resp = self._post(
+            {"kinds": ["ATHLETE"], "realName": "双身份员", "idNumber": "110101201305044444"}
+        )
+        person = Person.objects.get(full_name="双身份员")
+        # ORM 构造历史双身份
+        CoachProfile.objects.create(person=person)
+        old_category = person.person_category
+        from apps.persons.schemas import person_version
+
+        resp = self._put(
+            person.pk,
+            {"realName": "双身份员改名", "version": person_version(person)},
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        person.refresh_from_db()
+        # 两个 Profile 均保留
+        self.assertTrue(AthleteProfile.objects.filter(person=person).exists())
+        self.assertTrue(CoachProfile.objects.filter(person=person).exists())
+        # person_category 不变
+        self.assertEqual(person.person_category, old_category)
+        # 不产生 kinds 变更日志
+        log = PersonChangeLog.objects.filter(
+            person=person, change_type=enums.ChangeType.UPDATE
+        ).order_by("-id").first()
+        kinds_changes = [c for c in (log.field_changes or []) if c["field"] == "kinds"]
+        self.assertEqual(kinds_changes, [])
+
+    def test_update_omit_kinds_keeps_single_identity(self):
+        """问题 11 方案 B：单身份人员不传 kinds → 身份保持不变。"""
+        _, person = self._create()  # ATHLETE
+        old_category = person.person_category
+        from apps.persons.schemas import person_version
+
+        resp = self._put(
+            person.pk,
+            {"realName": "单身份改名", "version": person_version(person)},
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertEqual(resp.json()["data"]["kinds"], ["ATHLETE"])
+        person.refresh_from_db()
+        self.assertEqual(person.person_category, old_category)
+        self.assertTrue(AthleteProfile.objects.filter(person=person).exists())
+        self.assertFalse(CoachProfile.objects.filter(person=person).exists())
+
+    def test_update_omit_kinds_no_spurious_identity_log(self):
+        """问题 11 方案 B：未传 kinds 时不产生虚假的身份变更日志条目。"""
+        _, person = self._create()  # ATHLETE
+        from apps.persons.schemas import person_version
+
+        resp = self._put(
+            person.pk,
+            {"realName": "测日志", "version": person_version(person)},
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        log = PersonChangeLog.objects.filter(
+            person=person, change_type=enums.ChangeType.UPDATE
+        ).order_by("-id").first()
+        fields = [c["field"] for c in (log.field_changes or [])]
+        self.assertNotIn("kinds", fields)
+        self.assertNotIn("personCategory", fields)
+
+    def test_service_layer_rejects_dual_kinds_directly(self):
+        """问题 11：服务层直接调用 _kind_list 也拒绝两个身份，不依赖 Schema。"""
+        from apps.persons.services import _kind_list
+        from apps.common.errors import ApiError, INVALID_ARGUMENT
+
+        with self.assertRaises(ApiError) as cm:
+            _kind_list(["ATHLETE", "COACH"])
+        self.assertEqual(cm.exception.code, INVALID_ARGUMENT)
 
     # ------------------------------------------------------ 头像：先传后绑
 
@@ -3272,7 +3357,7 @@ class MyProfileApiTests(TestCase):
         self.assertEqual(self.athlete.full_name, "并发一")
 
     def test_put_kinds_not_changeable_via_self(self):
-        """kinds 多选语义保持，但身份变更走管理员链路：本人提交 kinds=额外字段拒绝。"""
+        """问题 11：身份变更走管理员链路，本人提交 kinds=额外字段拒绝。"""
         from apps.persons.schemas import person_version
 
         resp = self._put(

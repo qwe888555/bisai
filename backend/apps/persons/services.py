@@ -811,16 +811,22 @@ def _gender_in(value: Optional[str], field: str) -> int:
 
 
 def _kind_list(kinds) -> list[str]:
-    """方案C（2026-10-24 用户拍板：前端多选为准）：kinds 数组 1..2 项。
+    """一人一身份（问题 11，2026-10-30 批准收紧）：kinds 数组恰好 1 项。
 
-    值域校验+去重，不静默丢弃；person_category 存主类别（首项），
+    值域校验+去重+单项校验，不静默丢弃；person_category 存该类别，
     完整类别集合由扩展档案行存在性承载（见 _apply_kinds/_synthesized_kinds）。
     """
     if not isinstance(kinds, list) or not kinds:
         raise ApiError(
             INVALID_ARGUMENT,
-            "kinds 必填（1-2 项）",
+            "kinds 必填（1 项）",
             field_errors([("kinds", "至少一项")]),
+        )
+    if len(kinds) > 1:
+        raise ApiError(
+            INVALID_ARGUMENT,
+            "kinds 仅允许一项（一人一身份）",
+            field_errors([("kinds", "只能选择一个身份类别")]),
         )
     unknown = [k for k in kinds if k not in enums.PersonCategory.values]
     if unknown:
@@ -1120,10 +1126,13 @@ def update_person(person_id: str, payload: dict, account):
     """
     person = get_person(person_id, account)
     ensure_version(person, payload["version"])
-    kind_list = _kind_list(payload.get("kinds"))
+    # 问题 11 方案 B：kinds 可选。未传=保留现有身份（不调 _apply_kinds、
+    # 不改 person_category、不生身份变更日志）；传值=显式变更身份（限 1 项）。
+    raw_kinds = payload.get("kinds")
+    kind_list = _kind_list(raw_kinds) if raw_kinds is not None else None
     old_kinds = _current_kinds(person)
     gender_value = _gender_in(payload.get("gender"), "gender")
-    primary_category = kind_list[0]
+    primary_category = kind_list[0] if kind_list is not None else person.person_category
 
     changes: list[dict] = []
 
@@ -1146,9 +1155,11 @@ def update_person(person_id: str, payload: dict, account):
         track("birthDate", person.birth_date, payload.get("birthDate"))
         person.birth_date = payload.get("birthDate")
 
-        track("kinds", old_kinds, kind_list)
-        track("personCategory", person.person_category, primary_category)
-        person.person_category = primary_category
+        # 问题 11 方案 B：仅显式传 kinds 时才记录身份变更并更新主类别
+        if kind_list is not None:
+            track("kinds", old_kinds, kind_list)
+            track("personCategory", person.person_category, primary_category)
+            person.person_category = primary_category
 
         # 可选字段：请求未传 → 保留原值（编辑表单无对应输入，缺省清空=静默丢数据）
         # 转校（schoolOrgId 已传）必须落在操作者授权范围内；未传则保持
@@ -1178,7 +1189,9 @@ def update_person(person_id: str, payload: dict, account):
         _invalidate_audit_on_key_change(person, changes)
 
         person.save()
-        _apply_kinds(person, kind_list, old_kinds)
+        # 问题 11 方案 B：仅显式传 kinds 时才执行身份增删
+        if kind_list is not None:
+            _apply_kinds(person, kind_list, old_kinds)
         if avatar:
             _bind_avatar(avatar, person)
         _log_change(
