@@ -57,6 +57,9 @@ register_operation("rosterCreate", R5)
 register_operation("rosterGet", R5)
 register_operation("rosterUpdate", R5)
 register_operation("rosterDelete", R5)
+# E-2（v7 已批准）：资格四操作仅 TEAM+UNIVERSITY 在自身数据范围内执行，
+# 不复用 R5；CITY/PROVINCE_REVIEWER 只读、ADMIN 本期不开放（未注册→403）。
+register_operation("rosterQualify", (TEAM, UNIVERSITY))
 register_operation("precheck", R5)
 register_operation("submitEnrollment", R1)
 register_operation("withdrawEnrollment", R1)
@@ -76,7 +79,11 @@ register_operation("registrationBundle", R5)
 register_operation("enrollmentExcel", R3)
 register_operation("enrollmentStats", R3)
 
+# 2026-10-28 待决 11 方案二 2a：写侧/表单配置用当前业务值（SUBJECT_TYPES 已收敛，
+# 无 UNIVERSITY）；历史列表查询需按 UNIVERSITY 筛历史行，单列历史兼容常量，
+# 仅用于 list 过滤，不回灌表单配置或写入校验。
 _SUBJECT_TYPES = tuple(item[0] for item in SUBJECT_TYPES)
+_HISTORICAL_SUBJECT_TYPES = _SUBJECT_TYPES + ("UNIVERSITY",)
 _STATUSES = tuple(item[0] for item in ENROLLMENT_STATUSES)
 _DIMENSIONS = ("CITY", "UNIVERSITY", "GROUP")
 _IMPORT_MODES = ("VALIDATE_ONLY", "APPLY_VALID_ROWS")
@@ -145,7 +152,7 @@ def enrollment_list(
         "groupId": groupId,
         "teamName": teamName,
         "cityOrgId": cityOrgId,
-        "subjectType": _enum(subjectType, _SUBJECT_TYPES, "subjectType"),
+        "subjectType": _enum(subjectType, _HISTORICAL_SUBJECT_TYPES, "subjectType"),
         "status": _enum(status, _STATUSES, "status"),
     }
     queryset = services.list_enrollments(actor, filters)
@@ -274,13 +281,22 @@ def roster_update(
     request, enrollment_id: str, roster_id: str, body: s.RosterItemUpdateIn
 ):
     actor = require("rosterUpdate")
+    # D-1（2026-10-29 批准）：换人审计摘要——旧/新 athleteId 与凭证失效
+    # 记入现有 audit_state 摘要；审计落库仍为响应后写入，非事务原子（既有边界）。
+    old = services.get_roster(actor, enrollment_id, roster_id)
     data = services.update_roster(actor, enrollment_id, roster_id, body)
+    summary = "修改名单条目"
+    if old["athleteId"] != data["athleteId"]:
+        summary = (
+            f"修改名单条目 athleteId={old['athleteId']}→{data['athleteId']}"
+            "（资格凭证已失效）"
+        )
     audit_state(
         request,
         "enrollment.roster.update",
         object_type="RosterItem",
         object_id=roster_id,
-        summary="修改名单条目",
+        summary=summary,
     )
     return ok(data)
 
@@ -304,6 +320,27 @@ def roster_delete(request, enrollment_id: str, roster_id: str, version: int):
         summary="删除名单条目",
     )
     return action_result(True, object_id, current_version)
+
+
+@router.put(
+    "/enrollments/{enrollment_id}/players/{roster_id}/qualification",
+    auth=_auth,
+    response=EnvelopeOut,
+    summary="报名名单条目资格确认（E-2：确认/驳回/剔除/撤销凭证）",
+)
+def roster_qualify(
+    request, enrollment_id: str, roster_id: str, body: s.RosterQualificationIn
+):
+    actor = require("rosterQualify")
+    data = services.qualify_roster(actor, enrollment_id, roster_id, body)
+    audit_state(
+        request,
+        "enrollment.roster.qualify",
+        object_type="RosterItem",
+        object_id=roster_id,
+        summary=f"资格操作 {body.action}",
+    )
+    return ok(data)
 
 
 # ---------------------------------------------------------------- 预检 / 提交 / 审核

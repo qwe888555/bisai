@@ -48,7 +48,11 @@ from .models import (
     Enrollment,
     EnrollmentAttachment,
     EnrollmentSnapshot,
+    QUALIFICATION_DISQUALIFIED,
+    QUALIFICATION_EXCLUDED,
+    QUALIFICATION_QUALIFIED,
     RosterItem,
+    RosterQualificationLog,
 )
 
 # ---------------------------------------------------------------- 序列化
@@ -511,15 +515,24 @@ def update_roster(actor, enrollment_id: str, roster_id: str, payload) -> dict:
             actor, enrollment, [payload.photoFileId], "ROSTER_PHOTO"
         )
 
-    item.athlete_id = payload.athleteId
-    item.athlete_name = person.get("name") or ""
-    item.masked_id_number = person.get("maskedIdNumber") or ""
-    item.jersey_number = payload.jerseyNumber
-    item.position = payload.position or ""
-    item.photo_file_id = payload.photoFileId or ""
-    item.student_status_file_ids = list(payload.studentStatusFileIds or [])
-    bump(item)
-    item.save()
+    # E-2 凭证绑定（2026-10-29 批准）：凭证对应当前球员，athleteId 实际变化
+    # 即清空 confirmed_at/confirmed_by；同一球员的无变化更新不清凭证。
+    # 不改 qualification_status、不自动 REVOKE、不删除或改写历史资格日志；
+    # 换人与凭证失效同一事务（单行 save 原子落库）。
+    athlete_changed = payload.athleteId != item.athlete_id
+    with transaction.atomic():
+        if athlete_changed:
+            item.confirmed_at = None
+            item.confirmed_by = ""
+        item.athlete_id = payload.athleteId
+        item.athlete_name = person.get("name") or ""
+        item.masked_id_number = person.get("maskedIdNumber") or ""
+        item.jersey_number = payload.jerseyNumber
+        item.position = payload.position or ""
+        item.photo_file_id = payload.photoFileId or ""
+        item.student_status_file_ids = list(payload.studentStatusFileIds or [])
+        bump(item)
+        item.save()
     return to_roster(item)
 
 
@@ -534,6 +547,129 @@ def delete_roster(
     bump(item)
     item.save()
     return item.pk, item.version
+
+
+# ---------------------------------------------------------------- E-2 资格确认
+
+
+def to_qualification(item: RosterItem) -> dict:
+    """E-2 资格操作响应：状态 + 确认凭证（双字段成对判定有效性）。"""
+    return {
+        "qualificationStatus": item.qualification_status,
+        "confirmedAt": item.confirmed_at,
+        "confirmedBy": item.confirmed_by or "",
+    }
+
+
+def _has_valid_credential(item: RosterItem) -> bool:
+    """v7：confirmed_at 与 confirmed_by 双条件同时有效，防单侧脏数据。"""
+    return item.confirmed_at is not None and bool(item.confirmed_by)
+
+
+def _append_qualification_log(
+    item: RosterItem, action: str, reason: str, operator_account_id: str
+) -> None:
+    """资格操作追加式审计日志（独立表，不写 ReviewRecord；仅 create）。"""
+    RosterQualificationLog.objects.create(
+        id=new_id("rstql"),
+        roster_item=item,
+        roster_item_id_snapshot=item.pk,
+        athlete_id=item.athlete_id,
+        action=action,
+        reason=reason or "",
+        operator_account_id=operator_account_id,
+    )
+
+
+def _reject_if_approved(status: str) -> None:
+    """D-2：APPROVED 名单禁止资格操作（统一 409 + 结构化原因）。"""
+    if status == STATUS_APPROVED:
+        raise ApiError(
+            STATE_CONFLICT,
+            "报名单已终审通过，不允许资格操作",
+            [{"field": "enrollment", "reason": "ENROLLMENT_APPROVED"}],
+        )
+
+
+def qualify_roster(actor, enrollment_id: str, roster_id: str, payload) -> dict:
+    """E-2 四种资格操作（CONFIRM/REJECT/EXCLUDE/REVOKE），v7 状态机。
+
+    - 事务 + 行锁（select_for_update）+ 乐观锁版本校验（409）；
+    - CONFIRM：非 EXCLUDED 均可（DISQUALIFIED 重新确认允许）；已有有效凭证
+      时幂等 no-op（不再追加日志）；否则写凭证 + QUALIFIED + 新日志；
+    - REJECT：→ DISQUALIFIED，清凭证，原因必填（历史驳回记录保留在日志）；
+    - EXCLUDE：→ EXCLUDED，原因必填；资格操作层不可逆（后续四操作均 409）；
+    - REVOKE：仅 QUALIFIED 且有有效凭证；清凭证不改状态值，原因必填。
+    - D-2（2026-10-29 批准）：enrollment.status == APPROVED 时四种操作全部
+      409 STATE_CONFLICT（ENROLLMENT_APPROVED），禁令优先于幂等 no-op；
+      REJECTED/WITHDRAWN 不纳入禁令（重审场景保留现状）。
+    """
+    enrollment = scope.get_enrollment(actor, enrollment_id)
+    _reject_if_approved(enrollment.status)
+    with transaction.atomic():
+        # D-2 锁内复判：防"读链判断后、终审并发通过"窗口内提交资格操作。
+        # 锁序 enrollment→roster_item 与终审 approve 链（仅锁 enrollment）一致。
+        locked = Enrollment.objects.select_for_update().get(pk=enrollment.pk)
+        _reject_if_approved(locked.status)
+        item = (
+            RosterItem.objects.select_for_update()
+            .filter(pk=roster_id, enrollment_id=enrollment.pk)
+            .first()
+        )
+        if item is None:
+            raise ApiError(NOT_FOUND)
+        check_version(item, payload.version)
+
+        action = payload.action
+        reason = (payload.reason or "").strip()
+        if action in ("REJECT", "EXCLUDE", "REVOKE") and not reason:
+            raise ApiError(
+                INVALID_ARGUMENT,
+                "该资格操作必须填写原因",
+                [{"field": "reason", "reason": "REJECT/EXCLUDE/REVOKE 必填"}],
+            )
+
+        if item.qualification_status == QUALIFICATION_EXCLUDED:
+            raise ApiError(
+                STATE_CONFLICT,
+                "名单条目已剔除，资格操作不可逆，重新纳入仅走名单编辑",
+                [{"field": "action", "reason": "EXCLUDED 不可逆"}],
+            )
+
+        if action == "CONFIRM":
+            if item.qualification_status == QUALIFICATION_QUALIFIED and _has_valid_credential(item):
+                return to_qualification(item)
+            item.qualification_status = QUALIFICATION_QUALIFIED
+            item.confirmed_at = timezone.now()
+            item.confirmed_by = actor.pk
+            log_action = "CONFIRM"
+        elif action == "REJECT":
+            item.qualification_status = QUALIFICATION_DISQUALIFIED
+            item.confirmed_at = None
+            item.confirmed_by = ""
+            log_action = "REJECT"
+        elif action == "EXCLUDE":
+            item.qualification_status = QUALIFICATION_EXCLUDED
+            item.confirmed_at = None
+            item.confirmed_by = ""
+            log_action = "EXCLUDE"
+        elif action == "REVOKE":
+            if not _has_valid_credential(item):
+                raise ApiError(
+                    STATE_CONFLICT,
+                    "当前无有效资格凭证，无法撤销",
+                    [{"field": "action", "reason": "仅限 QUALIFIED 且已确认"}],
+                )
+            item.confirmed_at = None
+            item.confirmed_by = ""
+            log_action = "REVOKE"
+        else:  # pragma: no cover - schema 层 Literal 已拦截
+            raise ApiError(INVALID_ARGUMENT, "action 取值非法")
+
+        bump(item)
+        item.save()
+        _append_qualification_log(item, log_action, reason, actor.pk)
+        return to_qualification(item)
 
 
 # ---------------------------------------------------------------- 预检 / 提交 / 撤回 / 审核

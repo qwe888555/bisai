@@ -15,7 +15,12 @@ from zoneinfo import ZoneInfo
 
 from django.utils import timezone
 
-from apps.common.errors import BUSINESS_VALIDATION_FAILED, ApiError
+from apps.common.errors import (
+    BUSINESS_VALIDATION_FAILED,
+    QUALIFICATION_NOT_CONFIRMED,
+    ApiError,
+)
+from apps.persons.services import person_audit_snapshot
 
 from .clients import event_config_client, material_client, person_client
 from .models import (
@@ -123,6 +128,27 @@ def run_precheck(enrollment) -> dict[str, Any]:
     persons: dict[str, dict] = {}
     for item in players:
         persons[item.athlete_id] = person_client.get_person(item.athlete_id)
+
+    # 0) 人员档案审核状态（P0-3 决策 A：同进程直连 persons 域；2026-10-28）。
+    # 提交阶段按批准规则仅产生 WARNING（不阻断提交）；终审阶段在
+    # double_track_issues 中以 ERROR 硬性阻断。查不到档案（含 mock 测试
+    # 替身 id、导入外键延迟）在此不加 issue，与"取不到降级"既有口径一致。
+    audit_states = person_audit_snapshot(
+        {item.athlete_id for item in active_players}
+    )
+    for item in active_players:
+        state = audit_states.get(item.athlete_id)
+        if state is not None and state["auditStatus"] != "APPROVED":
+            issues.append(
+                _issue(
+                    "QUALIFICATION_PENDING",
+                    WARNING,
+                    f"人员档案未通过学校审核（当前状态 {state['auditStatus']}），"
+                    "提交后须完成学校端审核方可最终通过",
+                    field="auditStatus",
+                    athleteId=item.athlete_id,
+                )
+            )
 
     # 1) 材料必需性（契约内两类）
     required = list(rules.get("requiredMaterialTypes") or [])
@@ -334,10 +360,69 @@ def _normalize_name(value: Optional[str]) -> str:
 
 
 def double_track_issues(enrollment) -> list[dict]:
-    """球队最终 APPROVED 的双轨合规校验（人员轨 + 球队轨）。"""
+    """球队最终 APPROVED 的双轨合规校验（人员轨 + 球队轨）。
+
+    P0-3 终审硬性重验（2026-10-28）：每次终审实时直连 persons 域取最新
+    档案审核状态，不依赖提交阶段或早先预检结果：
+    - 档案存在且 audit_status != APPROVED → ERROR（未审/待审/驳回/草稿）；
+    - 档案存在但已禁用（DISABLED）→ ERROR；
+    - 档案不存在或 id 不可解析 → ERROR；但 ENROLLMENT_MOCK_CLIENTS=true
+      的 mock 测试替身生态（athlete_id 为 per_test_* 等假 id）放行——
+      该边界仅限测试替身，真实链路必须能核验到档案（不能把 mock 通过
+      宣称为真实跨域集成已验证）；
+    - requiredMaterialTypes 声明的必需材料在终审时按报名附件重验存在性
+      （当前两类均为报名附件体系，非材料域审核对象——清单边界见报告）；
+    - E-2 资格确认硬门槛（v7，2026-10-28）：QUALIFIED 且确认凭证缺失/单侧
+      无效 → QUALIFICATION_NOT_CONFIRMED ERROR（双条件
+      confirmed_at + confirmed_by；REVOKE 后状态仍 QUALIFIED 但凭证失效，
+      终审判凭证不判状态值；无宽限期，无豁免分支）。mock 测试替身生态
+      （ENROLLMENT_MOCK_CLIENTS=true，per_test_* 名单行无凭证）放行——
+      与人员轨替身边界一致，仅限测试替身，真实链路必须先经 rosterQualify
+      人工确认。
+    """
     issues: list[dict] = []
     players = list(enrollment.players.all())
     active = [item for item in players if item.qualification_status != QUALIFICATION_EXCLUDED]
+
+    # 人员档案审核状态硬门槛（实时直连，决策 A）
+    audit_states = person_audit_snapshot({item.athlete_id for item in active})
+    for item in active:
+        state = audit_states.get(item.athlete_id)
+        if state is None:
+            from .clients import mock_enabled
+
+            if mock_enabled():
+                continue  # mock 测试替身 id：非真实链路，放行（边界已声明）
+            issues.append(
+                _issue(
+                    "PLAYER_LIMIT",
+                    ERROR,
+                    "人员档案不存在或无法核验，不能最终通过",
+                    field="auditStatus",
+                    athleteId=item.athlete_id,
+                )
+            )
+            continue
+        if state["auditStatus"] != "APPROVED":
+            issues.append(
+                _issue(
+                    "PLAYER_LIMIT",
+                    ERROR,
+                    f"人员档案未通过学校审核（当前状态 {state['auditStatus']}），不能最终通过",
+                    field="auditStatus",
+                    athleteId=item.athlete_id,
+                )
+            )
+        elif state["status"] != "ACTIVE":
+            issues.append(
+                _issue(
+                    "PLAYER_LIMIT",
+                    ERROR,
+                    "人员档案已禁用，不能最终通过",
+                    field="personStatus",
+                    athleteId=item.athlete_id,
+                )
+            )
     for item in active:
         if item.qualification_status != QUALIFICATION_QUALIFIED:
             issues.append(
@@ -349,7 +434,38 @@ def double_track_issues(enrollment) -> list[dict]:
                     athleteId=item.athlete_id,
                 )
             )
+            continue
+        # E-2 资格确认硬门槛：QUALIFIED ≠ 已确认，凭证缺失/单侧无效即阻断。
+        from .clients import mock_enabled
+
+        if not mock_enabled() and (
+            item.confirmed_at is None or not item.confirmed_by
+        ):
+            issues.append(
+                _issue(
+                    QUALIFICATION_NOT_CONFIRMED,
+                    ERROR,
+                    "名单资格尚未经人工确认，不能最终通过",
+                    field="qualificationConfirm",
+                    athleteId=item.athlete_id,
+                )
+            )
     rules = event_config_client.get_group_rules(enrollment.event_id, enrollment.group_id)
+
+    # 必需材料终审重验（存在性硬校验，不依赖早先预检缓存）
+    attachments = list(enrollment.attachments.all())
+    required = list(rules.get("requiredMaterialTypes") or [])
+    for material_type in required:
+        if not any(a.material_type == material_type for a in attachments):
+            issues.append(
+                _issue(
+                    "MISSING_MATERIAL",
+                    ERROR,
+                    f"必需材料 {material_type} 在终审时缺失",
+                    field="materialType",
+                )
+            )
+
     min_players = rules.get("minPlayers")
     if min_players is not None and len(active) < int(min_players):
         issues.append(

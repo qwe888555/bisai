@@ -32,6 +32,16 @@ TRUE_VALUES = {"1", "true", "yes", "on"}
 
 
 def mock_enabled() -> bool:
+    """mock 替身开关（环境变量直读，模块 docstring 约定）。
+
+    生产双保险（2026-10-28 加固）：DJANGO_ENV=prod 时强制 False——即使
+    ENROLLMENT_MOCK_CLIENTS 被误开或配置校验被绕过，mock 也不得成为报名
+    资格校验（人员审核状态/禁用状态/必需附件）的替身；启动期另有
+    apps.common.production.validate_production_settings 的硬校验（缺失/
+    开启/非法均拒绝启动）。两者独立生效，不可互相替代。
+    """
+    if os.environ.get("DJANGO_ENV", "dev").strip().lower() == "prod":
+        return False
     return os.environ.get("ENROLLMENT_MOCK_CLIENTS", "true").strip().lower() in TRUE_VALUES
 
 
