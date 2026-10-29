@@ -94,11 +94,55 @@ def handle_unexpected_error(request: HttpRequest, exc: Exception):
 
 
 try:  # Only present when selection is merged into the main backend.
+    from apps.common import permissions as main_permissions
     from apps.common.errors import ApiError as MainApiError
     from apps.common.errors import error_envelope as main_error_envelope
 except Exception:  # pragma: no cover - standalone deployment
+    main_permissions = None
     MainApiError = None
     main_error_envelope = None
+
+if main_permissions is not None:
+    # 管理接口权限点登记（2026-10-29 成员4专项修复）。
+    # 角色映射依据 docs/后端接口文档.md 6.20 公示 / 6.21 遴选：
+    # - 遴选评分与结果全部接口：ADMIN；
+    # - 公示管理接口（publicationList/Create/Cancel）：ADMIN / PROVINCE_REVIEWER。
+    # 未在文档单独定义的端点按同类操作归并：批量发布→publicationCreate、
+    # 公示管理详情→publicationList、结果查询/导出→selectionResults/selectionExport。
+    _P = main_permissions
+    _P.register_operation("selectionRuleList", (_P.ADMIN,))
+    _P.register_operation("selectionRuleCreate", (_P.ADMIN,))
+    _P.register_operation("selectionRuleGet", (_P.ADMIN,))
+    _P.register_operation("selectionRuleUpdate", (_P.ADMIN,))
+    _P.register_operation("selectionScoreList", (_P.ADMIN,))
+    _P.register_operation("selectionScoreCreate", (_P.ADMIN,))
+    _P.register_operation("selectionScoreGet", (_P.ADMIN,))
+    _P.register_operation("selectionScoreUpdate", (_P.ADMIN,))
+    _P.register_operation("selectionSummary", (_P.ADMIN,))
+    _P.register_operation("selectionExport", (_P.ADMIN,))
+    _P.register_operation("selectionGenerate", (_P.ADMIN,))
+    _P.register_operation("selectionResults", (_P.ADMIN,))
+    _P.register_operation("selectionResultGet", (_P.ADMIN,))
+    _P.register_operation("publicationList", (_P.ADMIN, _P.PROVINCE_REVIEWER))
+    _P.register_operation("publicationCreate", (_P.ADMIN, _P.PROVINCE_REVIEWER))
+    _P.register_operation("publicationCancel", (_P.ADMIN, _P.PROVINCE_REVIEWER))
+
+
+def _require_management(operation_id: str) -> None:
+    """管理接口守卫：复用主项目"角色→权限点→登录态"校验，fail-closed。
+
+    - 合并部署（SELECTION_AUTH_MODE=auto/main）：JWTAuth 已将账号写入线程
+      上下文，main_permissions.require() 校验登录态、启用状态与角色；
+      未登录 401 / 角色不符 403，错误经 handle_main_api_error 输出主项目
+      统一错误信封；
+    - 独立部署（无 apps.common）：fail-closed 401，匿名/演示模式不得触达
+      管理面；公开门户接口（auth=None）不受影响；
+    - 认证模式 none/demo/header 即使被误配，也因线程上下文无账号而 401，
+      不依赖 SelectionAuth 的返回值放行。
+    """
+    if main_permissions is None:
+        raise BusinessError(401, "管理接口需要接入主项目认证体系，独立部署不支持匿名管理")
+    main_permissions.require(operation_id)
 
 
 if MainApiError is not None:
@@ -173,6 +217,7 @@ def _publicity_city(request):
 # ---------------------------------------------------------------------------
 @router.get("/templates/", response=ResponseEnvelope)
 def list_templates(request):
+    _require_management("selectionRuleList")
     status = None
     status_raw = _query(request, "status")
     if status_raw is not None:
@@ -191,6 +236,7 @@ def list_templates(request):
 
 @router.post("/templates/", response=ResponseEnvelope)
 def create_template(request, payload: dict = Body(...)):
+    _require_management("selectionRuleCreate")
     return ok(
         template_service.create_template(
             payload, get_current_user_id(request)
@@ -200,11 +246,13 @@ def create_template(request, payload: dict = Body(...)):
 
 @router.get("/templates/{template_id}/", response=ResponseEnvelope)
 def get_template(request, template_id: int):
+    _require_management("selectionRuleGet")
     return ok(template_service.get_template_detail(template_id))
 
 
 @router.put("/templates/{template_id}/", response=ResponseEnvelope)
 def update_template(request, template_id: int, payload: dict = Body(...)):
+    _require_management("selectionRuleUpdate")
     return ok(
         template_service.update_template(
             template_id, payload, get_current_user_id(request)
@@ -217,6 +265,7 @@ def update_template(request, template_id: int, payload: dict = Body(...)):
 # ---------------------------------------------------------------------------
 @router.get("/scores/", response=ResponseEnvelope)
 def list_scores(request):
+    _require_management("selectionScoreList")
     event_id, group_type, score_round = _parse_score_query(request)
     page, size = parse_page(request)
     return ok(
@@ -233,6 +282,7 @@ def list_scores(request):
 
 @router.post("/scores/", response=ResponseEnvelope)
 def create_score(request, payload: dict = Body(...)):
+    _require_management("selectionScoreCreate")
     return ok(
         score_service.create_score(
             payload, get_current_user_id(request)
@@ -242,12 +292,14 @@ def create_score(request, payload: dict = Body(...)):
 
 @router.get("/scores/summary/", response=ResponseEnvelope)
 def score_summary(request):
+    _require_management("selectionSummary")
     event_id, group_type, score_round = _parse_score_query(request)
     return ok(score_service.summary(event_id, group_type, score_round))
 
 
 @router.get("/scores/export/")
 def score_export(request):
+    _require_management("selectionExport")
     event_id, group_type, score_round = _parse_score_query(request)
     return excel_service.export_scores(
         event_id, group_type, score_round
@@ -256,11 +308,13 @@ def score_export(request):
 
 @router.get("/scores/{score_id}/", response=ResponseEnvelope)
 def get_score(request, score_id: int):
+    _require_management("selectionScoreGet")
     return ok(score_service.get_score_detail(score_id))
 
 
 @router.put("/scores/{score_id}/", response=ResponseEnvelope)
 def update_score(request, score_id: int, payload: dict = Body(...)):
+    _require_management("selectionScoreUpdate")
     return ok(
         score_service.update_score(
             score_id, payload, get_current_user_id(request)
@@ -273,6 +327,7 @@ def update_score(request, score_id: int, payload: dict = Body(...)):
 # ---------------------------------------------------------------------------
 @router.post("/results/generate/", response=ResponseEnvelope)
 def generate_result(request, payload: dict = Body(...)):
+    _require_management("selectionGenerate")
     return ok(
         result_service.generate_result(
             payload, get_current_user_id(request)
@@ -282,12 +337,14 @@ def generate_result(request, payload: dict = Body(...)):
 
 @router.get("/results/latest/", response=ResponseEnvelope)
 def latest_result(request):
+    _require_management("selectionResults")
     event_id, group_type = _parse_result_query(request)
     return ok(result_service.latest_result(event_id, group_type))
 
 
 @router.get("/results/batches/", response=ResponseEnvelope)
 def result_history(request):
+    _require_management("selectionResults")
     event_id, group_type = _parse_result_query(request)
     limit = parse_int(
         _query(request, "limit"),
@@ -304,6 +361,7 @@ def result_history(request):
 
 @router.get("/results/export/")
 def result_export(request):
+    _require_management("selectionExport")
     event_id, group_type = _parse_result_query(request)
     return excel_service.export_results(event_id, group_type)
 
@@ -330,6 +388,7 @@ def list_publicity(request):
 
 @router.post("/publicity/", response=ResponseEnvelope)
 def publish_publicity(request, payload: dict = Body(...)):
+    _require_management("publicationCreate")
     return ok(
         publicity_service.publish_registration(
             payload, get_current_user_id(request)
@@ -339,6 +398,7 @@ def publish_publicity(request, payload: dict = Body(...)):
 
 @router.get("/publicity/manage/", response=ResponseEnvelope)
 def manage_publicity(request):
+    _require_management("publicationList")
     event_id = _publicity_event_id(request)
     page, size = parse_page(request)
     return ok(
@@ -359,6 +419,7 @@ def manage_publicity(request):
     "/publicity/manage/{record_id}/", response=ResponseEnvelope
 )
 def manage_publicity_detail(request, record_id: int):
+    _require_management("publicationList")
     return ok(publicity_service.get_management_detail(record_id))
 
 
@@ -376,6 +437,7 @@ def publicity_cities(request):
 
 @router.post("/publicity/batch/", response=ResponseEnvelope)
 def batch_publish_publicity(request, payload: dict = Body(...)):
+    _require_management("publicationCreate")
     return ok(
         publicity_service.batch_publish(
             payload, get_current_user_id(request)
@@ -392,6 +454,7 @@ def publicity_detail(request, record_id: int):
     "/publicity/{record_id}/cancel/", response=ResponseEnvelope
 )
 def cancel_publicity(request, record_id: int, payload: dict | None = Body(None)):
+    _require_management("publicationCancel")
     return ok(
         publicity_service.cancel_publicity(
             record_id, payload or {}, get_current_user_id(request)

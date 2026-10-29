@@ -2,6 +2,9 @@ import json
 
 from django.test import Client, TestCase, override_settings
 
+from apps.accounts.models import Account
+from apps.common.authentication import issue_access_token, make_password
+from apps.common.ids import new_account_id
 from selection.enums import PublicityType
 from selection.models import PublicityRecord
 from selection.services.publicity import mask_id_card
@@ -14,15 +17,31 @@ PUBLICITY_PATH = f"{API_PREFIX}publicity/"
 
 
 @override_settings(
-    SELECTION_AUTH_MODE="none",
+    SELECTION_AUTH_MODE="auto",
     SELECTION_ENVELOPE_MODE="native",
     SELECTION_ARCHIVE_MODE="demo",
     SELECTION_PUBLICITY_SOURCE_MODE="demo",
 )
 class PublicityApiTests(TestCase):
+    @classmethod
+    def setUpTestData(cls):
+        # 2026-10-29 成员4专项修复：公示管理接口要求 ADMIN/PROVINCE_REVIEWER 登录。
+        cls.admin = Account.objects.create(
+            id=new_account_id(),
+            username="publicity-admin",
+            display_name="公示管理员",
+            roles=["ADMIN"],
+            password=make_password("admin-pass-123"),
+            enabled=True,
+        )
+        cls.admin_token = issue_access_token(cls.admin)[0]
+
     def setUp(self):
         self.client = Client()
-        self.headers = {"HTTP_X_USER_ID": "99"}
+        self.headers = {
+            "HTTP_X_USER_ID": "99",
+            "HTTP_AUTHORIZATION": f"Bearer {self.admin_token}",
+        }
 
     # ------------------------------------------------------------------
     # Helpers
