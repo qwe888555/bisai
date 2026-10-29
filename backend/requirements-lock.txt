@@ -8,7 +8,7 @@ cffi==2.1.1
 colorama==0.4.6
 cryptography==50.0.2
 Django==5.2.18
-django-ninja==1.3.0
+django-ninja==1.7.1
 et_xmlfile==2.0.0
 gunicorn==26.2.0
 h11==0.16.0
