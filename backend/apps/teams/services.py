@@ -263,8 +263,8 @@ def create_team(data: dict, org, school, account) -> Team:
       学校/院校组织节点；幂等/复活/类型冲突 409/并发唯一约束兜底/层级校验
       复用 accounts 实现，异常上抛 → 本事务整体回滚，不产生孤立球队或孤立
       组织节点（accounts 侧不吞异常）；
-    - 忽略无承载字段：shortName/gender/campusName（schema 声明以放行前端
-      真实 payload，服务层不写入，不虚构保存结果）；
+    - 忽略无承载字段：shortName（TeamCreateBody 不含；资料列落库见 update_team）；
+      gender/campusName 自 2026-10-29 起落库（补列，见 models.Team）；
     - audit_status 用模型默认 APPROVED（Q2 审核流程不启用）；
     - 写入范围：schoolOrgId 解析出的学校组织须在账号范围内（全局管理员
       全量、TEAM 限本校父节点、其余按组织子树），否则 403 DATA_SCOPE_DENIED。
@@ -281,6 +281,9 @@ def create_team(data: dict, org, school, account) -> Team:
             flag_file_id=data.get("flagFileId"),
             logo_file_id=data.get("emblemFileId"),
             group_photo_file_id=data.get("groupPhotoFileId"),
+            # 2026-10-29 补列落库：gender/campusName（TeamCreateBody 声明字段）
+            gender=data.get("gender"),
+            campus_name=data.get("campusName"),
             status=enums.EnableStatus.ACTIVE,
         )
         # team_no 按 DDL 列注释回填：T+年份+8位id（person_no 同款；pk 全局唯一
@@ -297,9 +300,11 @@ def create_team(data: dict, org, school, account) -> Team:
 def update_team(team_id: str, payload: dict, account) -> Team:
     """PUT /teams/{id}：version 乐观锁 + 可变字段替换（exclude_unset 语义）。
 
-    可变字段：name/intro/flagFileId/emblemFileId/groupPhotoFileId（均有冻结承载）；
-    接受但忽略：schoolOrgId/groupCategory/gender/campusName/shortName/coachName
-    （前端原样回传的不可变/无承载字段，不因未变化字段导致编辑失败）。
+    可变字段：name/intro/flagFileId/emblemFileId/groupPhotoFileId（均有冻结承载）
+    + shortName/campusName/gender/coachName（2026-10-29 补列落库，保存即回显，
+    避免“保存成功但值消失”）；
+    接受但忽略：schoolOrgId/groupCategory（前端原样回传的不可变/无承载字段，
+    不因未变化字段导致编辑失败）。
     """
     from apps.persons.services import ensure_version, parse_path_id
 
@@ -314,6 +319,11 @@ def update_team(team_id: str, payload: dict, account) -> Team:
         "flagFileId": "flag_file_id",
         "emblemFileId": "logo_file_id",
         "groupPhotoFileId": "group_photo_file_id",
+        # 2026-10-29 补列落库：资料字段（保存即回显）
+        "shortName": "short_name",
+        "campusName": "campus_name",
+        "gender": "gender",
+        "coachName": "coach_name",
     }
     changed = False
     for src, dst in mapping.items():
@@ -537,3 +547,127 @@ def member_remove(team_id: str, member_id: str, version: int, account) -> TeamMe
         member.left_at = timezone.now()
         member.save()
     return member
+
+
+# ---------------------------------------------------------------- 球队教练（批次 C）
+# 契约对齐 zuqiu teamApi.coaches/addCoach/removeCoach（index.ts L136-139）与
+# TeamCoachesView 实码。category 值域以契约为准（HEAD_COACH/ASSISTANT_COACH/
+# MANAGER/OTHER），duty 冻结列透传存取（position_code 先例：冻结值域与契约
+# 不一致时不做映射，不虚构字典规则）；R4 现役主教练唯一按字面 HEAD_COACH 判定。
+
+_COACH_CATEGORIES = ("HEAD_COACH", "ASSISTANT_COACH", "MANAGER", "OTHER")
+_COACH_NOT_TEAM = "教练关系不存在或不属于该球队"
+
+
+def _coach_queryset() -> QuerySet[TeamCoach]:
+    """教练关系查询：排除软删球队/软删人员 + person 一次取齐。"""
+    return TeamCoach.objects.filter(
+        team__is_deleted=False, person__is_deleted=False
+    ).select_related("person", "team")
+
+
+def coach_list(team_id: str, filters: dict, account) -> QuerySet[TeamCoach]:
+    """GET /teams/{id}/coaches：category/reviewStatus 筛选 + 分页。
+
+    - 只返回现役（CURRENT）关系：前端无状态列、mock 移除即从列表消失，
+      历史行留库可审计（软退出语义与列表口径一致）；
+    - category 透传过滤 duty 列；reviewStatus 按人员审核状态过滤
+      （person_out 先例：直出 audit_status，关联级审核列不存在，
+      审核对象留待 D1 确认，不虚构审核流程）。
+    """
+    team = _team_or_404(team_id)
+    ensure_team_visible(account, team)
+    queryset = _coach_queryset().filter(team=team, status=enums.RelationStatus.CURRENT)
+    category = (filters.get("category") or "").strip()
+    if category:
+        queryset = queryset.filter(duty=category)
+    review = (filters.get("reviewStatus") or "").strip()
+    if review:
+        queryset = queryset.filter(person__audit_status=review)
+    return queryset.order_by("-created_at", "-id")
+
+
+def coach_add(team_id: str, payload: dict, account) -> TeamCoach:
+    """POST /teams/{id}/coaches：校验球队/教练 + 现役唯一 + R4 现役主教练唯一。
+
+    - 人员须存在、未软删且具备 COACH 身份（CoachProfile 行存在性，方案C
+      完整类别事实源，与 member_add 的 AthleteProfile 校验同源）；
+    - category 校验契约 4 值后透传落 duty 列；effectiveFrom（契约必填日期）
+      落 joined_at（生效起期的真实承载）；effectiveTo/reviewStatus 声明但
+      不应用（effectiveTo 无冻结承载列，reviewStatus 关联级审核列不存在）；
+    - 同队现役重复添加 409（R2 同款）；已有现役主教练再加 HEAD_COACH 409（R4）。
+    """
+    from datetime import date as _date
+
+    from apps.persons.models import CoachProfile, Person
+    from apps.persons.services import parse_path_id
+
+    team = _team_or_404(team_id)
+    ensure_team_visible(account, team)
+    category = (payload.get("category") or "").strip()
+    if category not in _COACH_CATEGORIES:
+        raise ApiError(
+            INVALID_ARGUMENT,
+            "教练岗位类别不合法",
+            field_errors([("category", f"取值须为 {'/'.join(_COACH_CATEGORIES)}")]),
+        )
+    raw_from = (payload.get("effectiveFrom") or "").strip()
+    try:
+        joined_at = _date.fromisoformat(raw_from)
+    except ValueError:
+        raise ApiError(
+            INVALID_ARGUMENT,
+            "生效起期格式不合法",
+            field_errors([("effectiveFrom", "须为 YYYY-MM-DD 日期")]),
+        ) from None
+    person = Person.objects.filter(
+        pk=parse_path_id(payload["coachId"], "coachId"), is_deleted=False
+    ).first()
+    if person is None:
+        raise ApiError(NOT_FOUND, "教练不存在或已删除")
+    if not CoachProfile.objects.filter(person=person).exists():
+        raise ApiError(STATE_CONFLICT, "该人员不具备教练身份，不能加入球队教练组")
+    with transaction.atomic():
+        if _coach_queryset().filter(
+            team=team, person=person, status=enums.RelationStatus.CURRENT
+        ).exists():
+            raise ApiError(STATE_CONFLICT, "该教练已是本队现役教练")
+        if category == enums.CoachDuty.HEAD_COACH and _coach_queryset().filter(
+            team=team,
+            status=enums.RelationStatus.CURRENT,
+            duty=enums.CoachDuty.HEAD_COACH,
+        ).exists():
+            raise ApiError(STATE_CONFLICT, "本队已有现役主教练（R4 现役主教练唯一）")
+        coach = TeamCoach.objects.create(
+            team=team,
+            person=person,
+            duty=category,
+            joined_at=joined_at,
+        )
+    return coach
+
+
+def coach_remove(team_id: str, coach_id: str, version: int, account) -> TeamCoach:
+    """DELETE /teams/{id}/coaches/{coach_id}?version=：软退出（CURRENT→EXITED）。
+
+    禁止物理删除（冻结模型，历史关系可审计）；version 乐观锁 + 跨球队归属
+    校验（404）；重复移出（已 EXITED）→ 409（member_remove 同款）。
+    教练关系无转队单关联（F1 方案B，team_transfer 仅运动员），不设转队阻断。
+    """
+    from apps.persons.services import ensure_version, parse_path_id
+
+    team = _team_or_404(team_id)
+    ensure_team_visible(account, team)
+    coach = _coach_queryset().filter(
+        team=team, pk=parse_path_id(coach_id, "coachId")
+    ).first()
+    if coach is None:
+        raise ApiError(NOT_FOUND, _COACH_NOT_TEAM)
+    ensure_version(coach, version)
+    if coach.status != enums.RelationStatus.CURRENT:
+        raise ApiError(STATE_CONFLICT, "该教练已离队，不能重复移出")
+    with transaction.atomic():
+        coach.status = enums.RelationStatus.EXITED
+        coach.left_at = timezone.now()
+        coach.save()
+    return coach

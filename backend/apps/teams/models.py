@@ -41,6 +41,16 @@ class Team(models.Model):
     flag_file_id = models.CharField(max_length=64, null=True, blank=True, db_comment="队旗(逻辑引用)")
     group_photo_file_id = models.CharField(max_length=64, null=True, blank=True, db_comment="合照(逻辑引用)")
     introduction = TextField(null=True, blank=True, db_comment="球队简介")
+    # ---- 球队资料展示字段（2026-10-29 补列，非 V1.4-r1 冻结列）----
+    # TeamUpdateBody 声明的简称/校区/性别/主教练此前“声明但不落库”，前端为避免
+    # “保存成功但值消失”禁用了这些字段；本次补 4 列使其真正持久化并回显。
+    # DDL 偏离说明：V1.4-r1 冻结稿无对应列，经用户要求新增可空列（纯增量、不改
+    # 既有列/约束）以承载资料字段；gender 按 position_code 先例存不透明字符串
+    # （前端值域 MALE/FEMALE/MIXED 与 Gender 整型枚举不一致，透传以免丢值）。
+    short_name = models.CharField(max_length=100, null=True, blank=True, db_comment="球队简称(资料展示)")
+    campus_name = models.CharField(max_length=100, null=True, blank=True, db_comment="校区(资料展示)")
+    gender = models.CharField(max_length=20, null=True, blank=True, db_comment="性别(字典逻辑引用,不透明字符串透传,position_code先例)")
+    coach_name = models.CharField(max_length=100, null=True, blank=True, db_comment="主教练姓名(资料展示;空则回退现役主教练关系合成值)")
     audit_status = models.CharField(
         max_length=20,
         default=enums.AuditStatus.APPROVED,

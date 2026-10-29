@@ -26,6 +26,8 @@ from django.test import TestCase
 
 from apps.accounts.models import Account
 from apps.attachments.models import FileRecord
+from apps.attachments.services import signed_url
+from apps.attachments.storage import get_storage
 from apps.common.authentication import issue_access_token, make_password
 from apps.common.ids import new_account_id
 from apps.persons.models import Person
@@ -279,3 +281,24 @@ class FileOwnershipApiTests(TestCase):
             self.province_token, meta2["id"], meta2["version"]
         )
         self.assertEqual(resp.status_code, 403, )
+
+    # ------------------------------------------------------------ 字节缺失
+
+    def test_missing_stored_bytes_returns_404_not_500(self):
+        """记录在库但物理字节缺失（演示/手工数据残留）：返回 404 而非 500。
+
+        storage.open 对缺失字节抛可识别错误，接口层转成 404 NOT_FOUND，
+        不泄漏 FileNotFoundError；授权下载与签名直链同口径。
+        """
+        meta = self._person_file(self.person_a)
+        file_id = meta["id"]
+        record = FileRecord.objects.get(pk=file_id)
+        get_storage().delete(record.storage_key)
+
+        resp = self._download(self.admin_token, file_id)
+        self.assertEqual(resp.status_code, 404, )
+        self.assertEqual(resp.json()["code"], "NOT_FOUND")
+
+        resp = self.client.get(signed_url(record)["url"])
+        self.assertEqual(resp.status_code, 404, )
+        self.assertEqual(resp.json()["code"], "NOT_FOUND")

@@ -13,6 +13,14 @@ from typing import BinaryIO, Optional
 from apps.common import conf
 
 
+class StorageNotFoundError(FileNotFoundError):
+    """记录在库但存储中不存在该 key 的物理字节。
+
+    与 size()/delete() 的 exists() 兜底一致：缺失属于可判定的"不存在"，
+    由接口层转成 404，而不是泄漏 FileNotFoundError 变成 500。
+    """
+
+
 class LocalStorage:
     """开发默认：写 STORAGE_LOCAL_ROOT 下的两级散列目录。"""
 
@@ -40,7 +48,10 @@ class LocalStorage:
         return path.stat().st_size if path.exists() else 0
 
     def open(self, key: str) -> BinaryIO:
-        return self._path(key).open("rb")
+        path = self._path(key)
+        if not path.exists():
+            raise StorageNotFoundError(key)
+        return path.open("rb")
 
     def delete(self, key: str) -> None:
         path = self._path(key)
@@ -80,7 +91,14 @@ class MinioStorage:
             return 0
 
     def open(self, key: str) -> BinaryIO:
-        return self.client.get_object(self.bucket, key)
+        from minio.error import S3Error
+
+        try:
+            return self.client.get_object(self.bucket, key)
+        except S3Error as exc:
+            if exc.code in {"NoSuchKey", "NoSuchBucket"}:
+                raise StorageNotFoundError(key) from exc
+            raise
 
     def delete(self, key: str) -> None:
         try:
