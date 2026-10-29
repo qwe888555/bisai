@@ -285,7 +285,13 @@ class TeamApiTests(TestCase):
         self.assertEqual(data["intro"], "校主力队")
         self.assertEqual(data["status"], "APPROVED")
         self.assertIsInstance(data["version"], int)
-        # 无承载/无契约键不输出（联调待办：媒体受控 url/orgId）
+        # 媒体三键 2026-10-29 成员4专项修复⑤：列→键映射
+        # flagFileId←flag_file_id、emblemFileId←logo_file_id（队徽列）、
+        # groupPhotoFileId←group_photo_file_id（夹具值见 setUpTestData L146-148）
+        self.assertEqual(data["flagFileId"], "file-flag-1")
+        self.assertEqual(data["emblemFileId"], "file-logo-1")
+        self.assertEqual(data["groupPhotoFileId"], "file-photo-1")
+        # 无承载/无契约键不输出（联调待办：媒体受控 url/orgId；fileId 已回传）
         for absent in ("orgId", "cityOrgId", "gender", "campusName", "shortName", "flagUrl"):
             self.assertNotIn(absent, data)
 

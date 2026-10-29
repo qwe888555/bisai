@@ -134,7 +134,12 @@ def team_out(team) -> dict:
     """球队输出（dict 直出，EnvelopeOut.data=Any 不进 components）。
 
     member_count/head_coach_name 由 services._annotate_team 注解提供；
-    输出不含 orgId/cityOrgId/gender/campusName/shortName/媒体 url（联调待办）。
+    输出不含 orgId/cityOrgId/gender/campusName/shortName；
+    媒体三键 2026-10-29 成员4专项修复⑤补齐（列→键映射同请求侧冻结映射）：
+    flagFileId←flag_file_id、emblemFileId←logo_file_id（列注释"队徽"）、
+    groupPhotoFileId←group_photo_file_id，前端保存后凭 fileId 走受控附件
+    下载刷新显示；url（flagUrl/emblemUrl/groupPhotoUrl）仍不输出
+    （受控下载契约无公开直链，联调待办）。
     """
     return {
         "id": str(team.pk),
@@ -146,6 +151,9 @@ def team_out(team) -> dict:
         "intro": team.introduction,
         "coachName": getattr(team, "head_coach_name", None),
         "memberCount": getattr(team, "member_count", 0),
+        "flagFileId": team.flag_file_id,
+        "emblemFileId": team.logo_file_id,
+        "groupPhotoFileId": team.group_photo_file_id,
         "status": team.audit_status,
         "version": int(team.updated_at.timestamp() * 1_000_000),
         "createdAt": team.created_at.isoformat(),
