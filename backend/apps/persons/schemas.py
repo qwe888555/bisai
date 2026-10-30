@@ -194,8 +194,12 @@ def person_version(person) -> int:
 class PersonCreate(StrictSchema):
     """POST /people 创建（契约对齐 PeopleManageView 新建表单 + 文档 §6.5）。
 
-    - kinds：方案A 一期单类别（2026-10-24 用户决策）——schema 限项数=1，
-      多类别/空值直接 400，不静默取首值或丢弃；
+    - kinds：**方案C 承载（2026-10-24 用户拍板：前端多选为准）**——schema
+      限 1-2 项，空值直接 400，不静默取首值或丢弃；主类别=提交首项
+      （person_category 单值列），完整类别集合由扩展档案行承载（合成规则
+      见 person_out 注释）；原注释"方案A 一期单类别、schema 限项数=1"与同
+      提交的 max_length=2 及服务/查询/输出三层方案C 实现矛盾，2026-10-30
+      按拍板改写本注释（零行为变更）；
     - education / coachCategory：**持久化**（2026-10-27 修订）——落扩展档案
       ext_json 预留扩展列（冻结 DDL 无独立列，不动 DDL）；回显见 person_out；
     - idNumber/phone 只写不回显，服务端加密+查重索引；一期创建服务层强制
