@@ -10,7 +10,8 @@
 - materialUpdate PUT /materials/{id}               （批次 D-3 补齐：title→remark、
   文件替换留痕、乐观锁；归属/类型不可变 → 400，审计与更新同事务）
 
-审核权限（文档 materialReview：CITY/PROVINCE_REVIEWER/ADMIN）由权限点强制；
+审核权限（2026-10-30 方案i 裁定：学校端终审——materialReview=ADMIN/UNIVERSITY，
+原文档 CITY/PROVINCE_REVIEWER 退出材料审核；列表/详情数据范围不受影响）由权限点强制；
 数据范围按材料归属对象校验（列表按可见归属过滤、详情/写操作越界 403），
 复用 persons.apply_person_scope / teams.visible_teams 既有规则。
 写操作统一 audit_state()；version 乐观锁按 B4 updated_at 微秒派生。
@@ -60,7 +61,7 @@ register_operation(
 register_operation(
     "materialCreate", (ADMIN, UNIVERSITY, TEAM, PROVINCE_REVIEWER, ATHLETE, COACH, CITY)
 )
-register_operation("materialReview", (ADMIN, PROVINCE_REVIEWER, CITY))
+register_operation("materialReview", (ADMIN, UNIVERSITY))
 register_operation(
     "materialDelete", (ADMIN, UNIVERSITY, TEAM, PROVINCE_REVIEWER, ATHLETE, COACH, CITY)
 )

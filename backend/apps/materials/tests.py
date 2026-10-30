@@ -442,15 +442,23 @@ class MaterialApiTests(TestCase):
         self.assertEqual(denied.status_code, 403)
         self.assertEqual(denied.json()["code"], "DATA_SCOPE_DENIED")
 
-    def test_review_university_forbidden_by_role(self):
-        """materialReview 契约角色不含 UNIVERSITY：角色拒绝（403 FORBIDDEN）。"""
+    def test_review_university_in_scope_success_out_of_scope_denied(self):
+        """materialReview 方案i（2026-10-30）：UNIVERSITY 本校材料可审核；
+        他校材料越界 403 DATA_SCOPE_DENIED。"""
         resp = self._post(
             f"{BASE}/{self.pm_pending.pk}/review",
             {"decision": "APPROVE", "version": self._mver(self.pm_pending)},
             token=self.uni_token,
         )
-        self.assertEqual(resp.status_code, 403)
-        self.assertEqual(resp.json()["code"], "FORBIDDEN")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["data"]["reviewStatus"], "APPROVED")
+        denied = self._post(
+            f"{BASE}/{self.pm_city_b.pk}/review",
+            {"decision": "APPROVE", "version": self._mver(self.pm_city_b)},
+            token=self.uni_token,
+        )
+        self.assertEqual(denied.status_code, 403)
+        self.assertEqual(denied.json()["code"], "DATA_SCOPE_DENIED")
 
     def test_remove_university_in_scope_success_out_of_scope_denied(self):
         """UNIVERSITY：本校材料可软删；他校材料 403 DATA_SCOPE_DENIED。"""
@@ -511,25 +519,18 @@ class MaterialApiTests(TestCase):
         self.assertEqual(denied.status_code, 403)
         self.assertEqual(denied.json()["code"], "DATA_SCOPE_DENIED")
 
-    def test_city_review_in_scope_success_out_of_scope_denied(self):
-        """materialReview 含 CITY：本市材料可审核；外市材料 403。"""
-        denied = self._post(
-            f"{BASE}/{self.pm_city_b.pk}/review",
-            {"decision": "APPROVE", "version": self._mver(self.pm_city_b)},
-            token=self.city_token,
-        )
-        self.assertEqual(denied.status_code, 403)
-        self.assertEqual(denied.json()["code"], "DATA_SCOPE_DENIED")
-        own = self._post(
+    def test_city_review_forbidden_by_role(self):
+        """materialReview 方案i：CITY 角色拒绝（403 FORBIDDEN），数据范围不再参与。"""
+        resp = self._post(
             f"{BASE}/{self.tm_other.pk}/review",
             {"decision": "APPROVE", "version": self._mver(self.tm_other)},
             token=self.city_token,
         )
-        self.assertEqual(own.status_code, 200)
-        self.assertEqual(own.json()["data"]["reviewStatus"], "APPROVED")
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json()["code"], "FORBIDDEN")
 
     def test_province_reviewer_sees_province_materials(self):
-        """PROVINCE_REVIEWER：省域组织子树内全部材料可见、可审核。"""
+        """PROVINCE_REVIEWER：省域组织子树内全部材料可见；方案i 下不再可审核。"""
         resp = self._get(BASE, token=self.prov_token)
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.json()["data"]["total"], 5)
@@ -541,8 +542,8 @@ class MaterialApiTests(TestCase):
             {"decision": "APPROVE", "version": self._mver(self.pm_city_b)},
             token=self.prov_token,
         )
-        self.assertEqual(reviewed.status_code, 200)
-        self.assertEqual(reviewed.json()["data"]["reviewStatus"], "APPROVED")
+        self.assertEqual(reviewed.status_code, 403)
+        self.assertEqual(reviewed.json()["code"], "FORBIDDEN")
 
     def test_empty_scope_lists_return_empty_not_403(self):
         """角色范围为空（未绑定组织的 UNIVERSITY/ATHLETE）：列表空态而非 403。"""
