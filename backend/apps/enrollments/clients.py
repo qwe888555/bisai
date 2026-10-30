@@ -331,7 +331,12 @@ class EventConfigClient:
         raise ApiError(DEPENDENCY_UNAVAILABLE, "赛事配置服务尚未接通，请置 ENROLLMENT_MOCK_CLIENTS=true")
 
     def get_group_rules(self, event_id: str, group_id: str) -> dict[str, Any]:
-        """组别资格参数。缺失的键表示"参数未确认"，预检归 QUALIFICATION_PENDING。"""
+        """组别资格参数。缺失的键表示"参数未确认"，预检归 QUALIFICATION_PENDING。
+
+        P0-3 D 批：非 mock 分支直连本域 EventGroup（同进程单体），返回
+        结构化规则值；confirmed 映射 EventGroup.rules_confirmed（保留
+        precheck 既有键名，不改变预检 WARNING/ERROR 逻辑）。
+        """
         if mock_enabled():
             return {
                 "minPlayers": 5,
@@ -342,9 +347,23 @@ class EventConfigClient:
                 "requiredMaterialTypes": ["STAMPED_FORM", "STUDENT_STATUS"],
                 "confirmed": True,
             }
-        from apps.common.errors import ApiError, DEPENDENCY_UNAVAILABLE
+        from apps.events import services as event_services
 
-        raise ApiError(DEPENDENCY_UNAVAILABLE, "赛事配置服务尚未接通，请置 ENROLLMENT_MOCK_CLIENTS=true")
+        # 走赛事域服务层：同时校验 event_id 与 group_id 归属，避免跨赛事读取组别
+        group = event_services.get_group(event_id, group_id)
+        return {
+            "minPlayers": group.min_players,
+            "maxPlayers": group.max_players,
+            "minGoalkeepers": group.min_goalkeepers,
+            "birthDateFrom": group.birth_date_from.isoformat()
+            if group.birth_date_from
+            else None,
+            "birthDateTo": group.birth_date_to.isoformat()
+            if group.birth_date_to
+            else None,
+            "requiredMaterialTypes": list(group.required_material_types or []),
+            "confirmed": bool(group.rules_confirmed),
+        }
 
     def get_submission_route(self, subject_type: str) -> list[str]:
         """默认契约：SCHOOL_TEAM 走市州→省级；UNIVERSITY/CITY 直省审。"""

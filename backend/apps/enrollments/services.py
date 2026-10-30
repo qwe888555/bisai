@@ -22,11 +22,14 @@ from apps.common.errors import (
     FORBIDDEN,
     INVALID_ARGUMENT,
     NOT_FOUND,
+    RULES_UNCONFIGURED,
     STATE_CONFLICT,
     ApiError,
 )
 from apps.common.ids import new_id
 from apps.common.versioning import bump, check_version
+from apps.events.models import RULES_STATUS_CONFIGURED, derive_rules_status
+from apps.persons.services import person_audit_snapshot
 
 from . import precheck, scope
 from .clients import (
@@ -210,11 +213,21 @@ def to_summary(enrollment: Enrollment) -> dict:
 
 def to_detail(enrollment: Enrollment) -> dict:
     data = to_summary(enrollment)
-    data["players"] = [to_roster(item) for item in enrollment.players.all()]
+    roster = list(enrollment.players.all())
+    data["players"] = [to_roster(item) for item in roster]
     data["attachments"] = [
         to_attachment(item) for item in enrollment.attachments.all()
     ]
     data["latestReviewReason"] = _latest_review_reason(enrollment)
+    # P0-3：实时人员审核状态（只读展示）；终审判断仍由
+    # double_track_issues 在审核事务内实时复验，本字段不参与任何判断。
+    audit_states = person_audit_snapshot({str(item.athlete_id) for item in roster})
+    data["currentAuditStatuses"] = {
+        str(item.athlete_id): (audit_states.get(str(item.athlete_id)) or {}).get(
+            "auditStatus"
+        )
+        for item in roster
+    }
     return data
 
 
@@ -597,6 +610,9 @@ def qualify_roster(actor, enrollment_id: str, roster_id: str, payload) -> dict:
     - 事务 + 行锁（select_for_update）+ 乐观锁版本校验（409）；
     - CONFIRM：非 EXCLUDED 均可（DISQUALIFIED 重新确认允许）；已有有效凭证
       时幂等 no-op（不再追加日志）；否则写凭证 + QUALIFIED + 新日志；
+    - P0-3 D 批：CONFIRM 幂等 no-op 之后、写凭证之前，校验组别资格规则
+      状态为 CONFIGURED，否则 422 RULES_UNCONFIGURED；REJECT/EXCLUDE/
+      REVOKE 不做该校验；组别不存在时 NOT_FOUND 原样传播；
     - REJECT：→ DISQUALIFIED，清凭证，原因必填（历史驳回记录保留在日志）；
     - EXCLUDE：→ EXCLUDED，原因必填；资格操作层不可逆（后续四操作均 409）；
     - REVOKE：仅 QUALIFIED 且有有效凭证；清凭证不改状态值，原因必填。
@@ -637,8 +653,21 @@ def qualify_roster(actor, enrollment_id: str, roster_id: str, payload) -> dict:
             )
 
         if action == "CONFIRM":
+            # 幂等 no-op 优先：已有有效凭证时不重复校验规则，直接返回当前状态。
             if item.qualification_status == QUALIFICATION_QUALIFIED and _has_valid_credential(item):
                 return to_qualification(item)
+            # P0-3 D 批：规则未配置/未确认时禁止写入资格凭证。
+            # 仅 CONFIRM 受此前置校验约束，REJECT / EXCLUDE / REVOKE 不受影响。
+            rules = event_config_client.get_group_rules(
+                enrollment.event_id, enrollment.group_id
+            )
+            rules_status = derive_rules_status(
+                min_players=rules.get("minPlayers"),
+                max_players=rules.get("maxPlayers"),
+                rules_confirmed=bool(rules.get("confirmed")),
+            )
+            if rules_status != RULES_STATUS_CONFIGURED:
+                raise ApiError(RULES_UNCONFIGURED)
             item.qualification_status = QUALIFICATION_QUALIFIED
             item.confirmed_at = timezone.now()
             item.confirmed_by = actor.pk
@@ -683,8 +712,12 @@ def precheck_enrollment(actor, enrollment_id: str, version: int) -> dict:
 
 def build_snapshot_payload(enrollment: Enrollment) -> dict:
     team = team_client.get_team(enrollment.team_id)
+    roster = list(enrollment.players.all())
+    # P0-3：提交时冻结人员审核状态，仅供快照展示，不参与终审判断
+    # （终审仍由 double_track_issues 实时查询）。查不到的 id 记为 None。
+    audit_states = person_audit_snapshot({str(item.athlete_id) for item in roster})
     players: list[dict] = []
-    for item in enrollment.players.all():
+    for item in roster:
         person = person_client.get_person(item.athlete_id)
         players.append(
             {
@@ -694,6 +727,9 @@ def build_snapshot_payload(enrollment: Enrollment) -> dict:
                 "gender": person.get("gender"),
                 "birthDate": person.get("birthDate"),
                 "maskedStudentNumber": person.get("maskedStudentNumber"),
+                "auditStatus": (audit_states.get(str(item.athlete_id)) or {}).get(
+                    "auditStatus"
+                ),
             }
         )
     coach_ids = list(team.get("coachIds") or [])
@@ -707,6 +743,8 @@ def build_snapshot_payload(enrollment: Enrollment) -> dict:
         "attachments": [
             to_attachment(item) for item in enrollment.attachments.all()
         ],
+        # 明确标注：以上 auditStatus 为提交时冻结值，仅供展示
+        "displayOnlyFields": ["players[].auditStatus"],
     }
     # 快照落 JSONField：datetime 等先转 ISO 字符串，冻结后不再变化
     return json.loads(json.dumps(payload, cls=DjangoJSONEncoder))

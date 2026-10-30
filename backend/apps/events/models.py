@@ -85,7 +85,14 @@ class Event(SoftDeleteVersionedModel):
 
 
 class EventGroup(SoftDeleteVersionedModel):
-    """赛事组别：学段 + 性别 + 名额/年龄/上场人数限制。"""
+    """赛事组别：学段 + 性别 + 名额/年龄/上场人数限制。
+
+    P0-3 D 批：资格规则结构化字段（min_players / min_goalkeepers /
+    birth_date_from / birth_date_to）与独立的 rules_confirmed。
+    rules_status 不持久化，由 derive_rules_status 按两态派生
+    （UNCONFIGURED / CONFIGURED）；NOT_APPLICABLE 本期不实现。
+    min_age / max_age 保留，不与出生日期边界自动换算。
+    """
 
     id = models.CharField(primary_key=True, max_length=64)
     event = models.ForeignKey(
@@ -103,6 +110,23 @@ class EventGroup(SoftDeleteVersionedModel):
     max_age = models.PositiveSmallIntegerField(null=True, blank=True)
     max_players = models.PositiveSmallIntegerField()
     required_material_types = models.JSONField(default=list)
+    # P0-3 资格规则结构化值列（可空；为空表示该项未配置）
+    min_players = models.PositiveSmallIntegerField(
+        null=True, blank=True, db_comment="名单人数下限"
+    )
+    min_goalkeepers = models.PositiveSmallIntegerField(
+        null=True, blank=True, db_comment="守门员人数下限"
+    )
+    birth_date_from = models.DateField(
+        null=True, blank=True, db_comment="出生日期下限(含)"
+    )
+    birth_date_to = models.DateField(
+        null=True, blank=True, db_comment="出生日期上限(含)"
+    )
+    # 独立的规则确认标志，不与人员/报名/赛事审核状态混用
+    rules_confirmed = models.BooleanField(
+        default=False, db_comment="组别资格规则是否经业务确认"
+    )
 
     class Meta:
         db_table = "events_event_group"
@@ -113,6 +137,32 @@ class EventGroup(SoftDeleteVersionedModel):
 
     def __str__(self) -> str:  # pragma: no cover
         return f"{self.name}@{self.event_id}"
+
+
+# ---------------------------------------------------------------- 资格规则状态派生
+
+RULES_STATUS_UNCONFIGURED = "UNCONFIGURED"
+RULES_STATUS_CONFIGURED = "CONFIGURED"
+
+
+def derive_rules_status(
+    *,
+    min_players,
+    max_players,
+    rules_confirmed: bool,
+) -> str:
+    """按两态派生规则状态：UNCONFIGURED / CONFIGURED。
+
+    - UNCONFIGURED：rules_confirmed=False，或 min_players / max_players 任一为空；
+    - CONFIGURED：rules_confirmed=True 且 min_players、max_players 均非空。
+    min_goalkeepers / birth_date_from / birth_date_to 为可选增强，不影响核心状态。
+    NOT_APPLICABLE 本期不实现，不通过 NULL 推断。
+    """
+    if not rules_confirmed:
+        return RULES_STATUS_UNCONFIGURED
+    if min_players is None or max_players is None:
+        return RULES_STATUS_UNCONFIGURED
+    return RULES_STATUS_CONFIGURED
 
 # ---------------------------------------------------------------- 比赛对阵与事件
 

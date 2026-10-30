@@ -145,6 +145,11 @@ def create_group(event_id: str, data: dict) -> EventGroup:
         max_age=data.get("maxAge"),
         max_players=data["maxPlayers"],
         required_material_types=list(data.get("requiredMaterialTypes") or []),
+        min_players=data.get("minPlayers"),
+        min_goalkeepers=data.get("minGoalkeepers"),
+        birth_date_from=data.get("birthDateFrom"),
+        birth_date_to=data.get("birthDateTo"),
+        rules_confirmed=bool(data.get("rulesConfirmed", False)),
     )
 
 
@@ -167,6 +172,13 @@ def update_group(event_id: str, group_id: str, data: dict) -> EventGroup:
     group.max_age = data.get("maxAge")
     group.max_players = data["maxPlayers"]
     group.required_material_types = list(data.get("requiredMaterialTypes") or [])
+    group.min_players = data.get("minPlayers")
+    group.min_goalkeepers = data.get("minGoalkeepers")
+    group.birth_date_from = data.get("birthDateFrom")
+    group.birth_date_to = data.get("birthDateTo")
+    # 仅在显式提供时改动确认状态（None 表示本次未提交该字段）
+    if data.get("rulesConfirmed") is not None:
+        group.rules_confirmed = bool(data["rulesConfirmed"])
     bump(group)
     group.save()
     return group
