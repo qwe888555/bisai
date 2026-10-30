@@ -58,11 +58,16 @@ class InitBaseDataTests(TestCase):
         self.assertEqual(DictType.objects.count(), len(DICT_TYPES))
 
     def test_missing_csv_skips_explicitly(self):
-        for phase in ("regions", "schools", "dict_items", "material_types"):
+        """regions/schools/dict_items 无 CSV 一律跳过不编造。
+
+        material_types 自 P1-10 方案A（2026-10-30）起有默认路径回退，
+        单独由 MaterialTypesDefaultCsvTests 覆盖，不再列入本断言。
+        """
+        for phase in ("regions", "schools", "dict_items"):
             out = self.call_cmd(phase=phase, execute=True)
             self.assertIn("[跳过] 缺少", out, msg=phase)
         self.assertEqual(Region.objects.count() + School.objects.count()
-                         + DictItem.objects.count() + MaterialType.objects.count(), 0)
+                         + DictItem.objects.count(), 0)
 
     # ------------------------------------------------------------ 区划
 
@@ -221,6 +226,90 @@ class InitBaseDataTests(TestCase):
         self.assertIn("新增=0", out2)
         self.assertIn("跳过=13", out2)
         self.assertEqual(MaterialType.objects.count(), 13)
+
+
+class MaterialTypesDefaultCsvTests(TestCase):
+    """P1-10 材料类型默认路径回退（2026-10-30 方案A，用户批准）。
+
+    定案要求：新环境不因未手动传 --material-csv 而无法初始化材料类型；
+    重复执行零重复；不覆盖管理员已维护的有效配置；显式参数优先于默认路径。
+
+    运行方式与 InitBaseDataTests 相同（内存 SQLite，不触碰 MySQL）。
+    """
+
+    EXPECTED_13 = {
+        "STUDENT_STATUS", "EDUCATION", "ATHLETE_CERTIFICATE", "AWARD",
+        "COMPETITION", "COACHING_RECORD", "TRAINING_RECORD",
+        "TEACHER_LICENSE", "COACH_LICENSE", "OTHER",
+        "TRAINING_PLAN", "TEAM_HONOR", "MATCH_RECORD",
+    }
+
+    def call_cmd(self, *args, **kwargs) -> str:
+        out = StringIO()
+        call_command("init_base_data", *args, stdout=out, **kwargs)
+        return out.getvalue()
+
+    def test_default_fallback_preview_reports_source_writes_nothing(self):
+        out = self.call_cmd(phase="material_types")  # 无 --material-csv、无 --execute
+        self.assertIn("默认路径（已签发 13 类清单）", out)
+        self.assertIn("docs", out)  # 数据源行展示默认路径
+        self.assertEqual(MaterialType.objects.count(), 0)  # 预览不写入
+
+    def test_default_fallback_execute_creates_13(self):
+        out = self.call_cmd(phase="material_types", execute=True)
+        self.assertIn("默认路径（已签发 13 类清单）", out)
+        self.assertIn("新增=13", out)
+        self.assertIn("失败=0", out)
+        self.assertEqual(MaterialType.objects.count(), 13)
+        self.assertEqual(
+            {mt.code for mt in MaterialType.objects.all()}, self.EXPECTED_13)
+
+    def test_default_fallback_rerun_idempotent(self):
+        self.call_cmd(phase="material_types", execute=True)
+        out = self.call_cmd(phase="material_types", execute=True)  # 重复执行
+        self.assertIn("新增=0", out)
+        self.assertIn("跳过=13", out)
+        self.assertEqual(MaterialType.objects.count(), 13)
+
+    def test_default_fallback_never_overwrites_admin_config(self):
+        """管理员已维护的有效配置不被默认清单覆盖（get_or_create 语义）。"""
+        self.call_cmd(phase="material_types", execute=True)
+        mt = MaterialType.objects.get(code="STUDENT_STATUS")
+        mt.name = "管理员自定义学籍证明"
+        mt.max_size_mb = 99
+        mt.save()
+        out = self.call_cmd(phase="material_types", execute=True)
+        self.assertIn("跳过=13", out)
+        refreshed = MaterialType.objects.get(code="STUDENT_STATUS")
+        self.assertEqual(refreshed.name, "管理员自定义学籍证明")
+        self.assertEqual(refreshed.max_size_mb, 99)
+
+    def test_explicit_csv_overrides_default_path(self):
+        """显式 --material-csv 优先于默认路径（不叠加两份数据源）。"""
+        path = make_csv(
+            [["birth_cert", "出生证明", "PERSON", "1", "1", "0", "jpg,pdf", "5", "", "1", ""]],
+            ["code", "name", "applies_to", "is_required", "need_audit", "allow_multiple",
+             "allowed_ext", "max_size_mb", "sort_order", "is_active", "remark"],
+        )
+        try:
+            out = self.call_cmd(phase="material_types", material_csv=path, execute=True)
+        finally:
+            os.unlink(path)
+        self.assertNotIn("默认路径", out)  # 走参数数据源
+        self.assertEqual(MaterialType.objects.count(), 1)
+        self.assertFalse(
+            MaterialType.objects.filter(code="STUDENT_STATUS").exists())
+
+    def test_default_missing_falls_back_to_skip(self):
+        """默认清单不存在时维持跳过不编造（patch 掉默认路径模拟全新裸环境）。"""
+        from unittest.mock import patch
+        from pathlib import Path as _Path
+        from apps.infra.management.commands import init_base_data as mod
+        with patch.object(mod, "DEFAULT_MATERIAL_CSV",
+                          _Path("Z:/nonexistent/material_types.csv")):
+            out = self.call_cmd(phase="material_types", execute=True)
+        self.assertIn("缺少 --material-csv 且默认清单不存在", out)
+        self.assertEqual(MaterialType.objects.count(), 0)
 
 
     # ------------------------------------------------------------ 参数与数据边界
