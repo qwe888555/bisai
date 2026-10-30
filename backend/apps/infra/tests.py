@@ -210,9 +210,11 @@ class InitBaseDataTests(TestCase):
         self.assertIn("失败=0", out)
         self.assertEqual(MaterialType.objects.count(), 13)
         self.assertEqual({mt.code for mt in MaterialType.objects.all()}, expected)
+        # 2026-10-30 集成适配：main 的 applies_to 支持逗号分隔多归属（PERSON,TEAM），
+        # 断言按多值口径判定（与 services._resolve_material_type 的 split 逻辑一致）。
         person_codes = {
             code for code, applies in MaterialType.objects.values_list("code", "applies_to")
-            if applies == "PERSON"
+            if "PERSON" in [p.strip() for p in applies.split(",") if p.strip()]
         }
         self.assertEqual(person_codes, expected - team_only)
         out2 = self.call_cmd(phase="material_types", material_csv=csv_path, execute=True)
