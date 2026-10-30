@@ -17,11 +17,17 @@
 
 from __future__ import annotations
 
+from django.contrib.auth.hashers import make_password
+from django.test import TestCase
+
+from apps.accounts.models import Account, Organization
 from apps.common import enums
+from apps.common.authentication import issue_access_token
 from apps.common.crypto import encrypt_text, lookup_hash, mask_id_number
 from apps.enrollments.models import (
     QUALIFICATION_EXCLUDED,
     EnrollmentAttachment,
+    EnrollmentSnapshot,
     RosterItem,
 )
 from apps.enrollments.tests.factories import (
@@ -33,6 +39,7 @@ from apps.enrollments.tests.factories import (
     submit,
 )
 from apps.persons.models import Person
+from apps.materials.models import MaterialType, PersonMaterial
 
 _person_seq = 0
 
@@ -315,3 +322,163 @@ def test_cross_school_isolation_on_p0_flow(client, auth):
     )
     assert direct.status_code == 403
     assert direct.json()["code"] == "DATA_SCOPE_DENIED"
+
+
+# ---------------------------------------------------------------- P0-3 快照展示
+# 口径（2026-10-30 用户授权）：快照 players[].auditStatus 为提交时冻结值，仅供
+# 展示；终审判断仍由 double_track_issues 实时查库。材料域继续方案 C 不联动。
+# 本模块其余用例为 pytest 风格（依赖 pytest-django，当前环境未安装），本类改用
+# Django TestCase 以便 manage.py test 可直接收集执行。
+
+
+def _latest_snapshot(enrollment_id: str) -> EnrollmentSnapshot:
+    return (
+        EnrollmentSnapshot.objects.filter(enrollment_id=enrollment_id)
+        .order_by("-submitted_at")
+        .first()
+    )
+
+
+class P03SnapshotDisplayTests(TestCase):
+    """P0-3：快照冻结状态与详情实时状态并存；材料域不联动（方案 C）。"""
+
+    ORGANIZATIONS = (
+        ("org_prov", None, "省教育厅", "PROVINCE", "PROV"),
+        ("org_city_01", "org_prov", "示例市州教育局", "CITY", "CITY01"),
+        ("org_city_02", "org_prov", "示例市州二教育局", "CITY", "CITY02"),
+        ("org_school_01", "org_city_01", "示例第一中学", "SCHOOL", "SCH001"),
+        ("org_school_02", "org_city_02", "示例第二中学", "SCHOOL", "SCH002"),
+        ("org_univ_01", "org_prov", "示例大学", "UNIVERSITY", "UNI001"),
+        ("org_team_01", "org_school_01", "示例第一中学男子队", "TEAM", "TEAM001"),
+        ("org_team_02", "org_school_02", "示例第二中学女子队", "TEAM", "TEAM002"),
+    )
+    ACCOUNTS = (
+        ("acc_university", "university", ["UNIVERSITY"], "org_school_01"),
+        ("acc_university2", "university2", ["UNIVERSITY"], "org_school_02"),
+        ("acc_team", "team", ["TEAM"], "org_team_01"),
+        ("acc_city", "city", ["CITY"], "org_city_01"),
+        ("acc_province", "province", ["PROVINCE_REVIEWER"], "org_prov"),
+        ("acc_admin", "admin", ["ADMIN"], "org_prov"),
+    )
+
+    @classmethod
+    def setUpTestData(cls):
+        for org_id, parent_id, name, org_type, code in cls.ORGANIZATIONS:
+            Organization.objects.create(
+                id=org_id,
+                parent_id=parent_id,
+                name=name,
+                org_type=org_type,
+                code=code,
+                enabled=True,
+            )
+        cls.headers = {}
+        for account_id, username, roles, org_id in cls.ACCOUNTS:
+            account = Account.objects.create(
+                id=account_id,
+                username=username,
+                display_name=username,
+                roles=roles,
+                organization_id=org_id,
+                password=make_password("Foot@2026"),
+                enabled=True,
+            )
+            token = issue_access_token(account)[0]
+            cls.headers[username] = {"HTTP_AUTHORIZATION": f"Bearer {token}"}
+
+    def test_snapshot_freezes_audit_status_and_detail_reads_realtime(self):
+        """提交时 PENDING 冻入快照；人员改为 APPROVED 后详情实时更新，快照不变。"""
+        school_headers = self.headers["university"]
+        enrollment_id = complete_draft(self.client, school_headers)
+        pending = make_person("快照待审球员", enums.AuditStatus.PENDING)
+        bind_player(enrollment_id, "per_test_00", pending)
+
+        assert (
+            submit(self.client, school_headers, enrollment_id, "p03-snap-submit").status_code
+            == 200
+        )
+
+        snapshot = _latest_snapshot(enrollment_id)
+        frozen_rows = {row["athleteId"]: row for row in snapshot.payload["players"]}
+        assert frozen_rows[str(pending.pk)]["auditStatus"] == enums.AuditStatus.PENDING
+        assert snapshot.payload["displayOnlyFields"] == ["players[].auditStatus"]
+
+        Person.objects.filter(pk=pending.pk).update(
+            audit_status=enums.AuditStatus.APPROVED
+        )
+        detail = get_detail(self.client, school_headers, enrollment_id)
+        assert (
+            detail["currentAuditStatuses"][str(pending.pk)]
+            == enums.AuditStatus.APPROVED
+        )
+
+        snapshot.refresh_from_db()
+        frozen_again = {row["athleteId"]: row for row in snapshot.payload["players"]}
+        assert frozen_again[str(pending.pk)]["auditStatus"] == enums.AuditStatus.PENDING
+
+    def test_legacy_snapshot_without_audit_status_still_readable(self):
+        """历史快照缺 auditStatus（旧结构）：读取不报错，按缺失处理，不回填。"""
+        school_headers = self.headers["university"]
+        enrollment_id = complete_draft(self.client, school_headers)
+        approved = make_person("历史快照球员", enums.AuditStatus.APPROVED)
+        bind_player(enrollment_id, "per_test_00", approved)
+        assert (
+            submit(self.client, school_headers, enrollment_id, "p03-legacy-submit").status_code
+            == 200
+        )
+
+        snapshot = _latest_snapshot(enrollment_id)
+        legacy_payload = dict(snapshot.payload)
+        legacy_payload.pop("displayOnlyFields", None)
+        legacy_payload["players"] = [
+            {key: value for key, value in row.items() if key != "auditStatus"}
+            for row in legacy_payload["players"]
+        ]
+        EnrollmentSnapshot.objects.filter(pk=snapshot.pk).update(payload=legacy_payload)
+
+        response = self.client.get(
+            f"{BASE}/enrollments/{enrollment_id}/snapshots/{snapshot.pk}",
+            **school_headers,
+        )
+        assert response.status_code == 200, response.json()
+        rows = response.json()["data"]["players"]
+        assert all("auditStatus" not in row for row in rows)
+        assert {row["athleteId"] for row in rows} >= {str(approved.pk)}
+
+    def test_rejected_material_does_not_block_province_review(self):
+        """方案 C：材料域审核结果（REJECTED）不参与报名资格判断与终审阻断。"""
+        school_headers = self.headers["university"]
+        city_headers = self.headers["city"]
+        province_headers = self.headers["province"]
+        enrollment_id = complete_draft(self.client, school_headers)
+        persons = []
+        for index in range(5):
+            approved = make_person(f"材料驳回球员{index}", enums.AuditStatus.APPROVED)
+            bind_player(enrollment_id, f"per_test_{index:02d}", approved)
+            persons.append(approved)
+
+        material_type = MaterialType.objects.create(
+            code="P03_REJECTED_CASE", name="报名前置材料（测试）", applies_to="PERSON"
+        )
+        PersonMaterial.objects.create(
+            person=persons[0],
+            type=material_type,
+            file_id="file_p03_rejected",
+            file_name="cert.pdf",
+            status=enums.MaterialStatus.REJECTED,
+            audit_remark="材料驳回",
+        )
+
+        assert (
+            submit(self.client, school_headers, enrollment_id, "p03-mat-submit").status_code
+            == 200
+        )
+        assert (
+            review(self.client, city_headers, enrollment_id, "APPROVE", "p03-mat-city").status_code
+            == 200
+        )
+        result = review(
+            self.client, province_headers, enrollment_id, "APPROVE", "p03-mat-prov"
+        )
+        assert result.status_code == 200, result.json()
+        assert result.json()["data"]["status"] == "APPROVED"
