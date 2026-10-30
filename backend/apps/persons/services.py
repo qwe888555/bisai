@@ -429,6 +429,15 @@ def people_queryset() -> QuerySet:
                 AthleteProfile.objects.filter(person=OuterRef("pk"))
             ),
             coach_profile_exists=Exists(CoachProfile.objects.filter(person=OuterRef("pk"))),
+            # P1-7 证书只读派生（免 N+1；仅 COACH 输出，仅供展示、不参与判断）
+            coach_certificate_no_val=Subquery(
+                CoachProfile.objects.filter(person=OuterRef("pk")).values("certificate_no")[:1]
+            ),
+            coach_certificate_expire_val=Subquery(
+                CoachProfile.objects.filter(person=OuterRef("pk")).values(
+                    "certificate_expire_date"
+                )[:1]
+            ),
             # schoolOrgId 输出（A′-min）：School.code → 组织节点主键（免 N+1；
             # Organization.code 唯一，至多一命中）
             school_org_id_val=Subquery(

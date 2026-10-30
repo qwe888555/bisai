@@ -12,6 +12,7 @@ from datetime import date
 from typing import Literal, Optional
 
 from django.core.exceptions import ObjectDoesNotExist
+from django.utils import timezone
 from pydantic import Field
 
 from apps.common import crypto
@@ -378,7 +379,7 @@ def person_out(person) -> dict:
     """
     student_no = getattr(person, "student_no_val", None)
     kinds = _synthesized_kinds(person)
-    return {
+    data = {
         "id": str(person.pk),
         "kinds": kinds,
         "realName": person.full_name,
@@ -398,3 +399,28 @@ def person_out(person) -> dict:
         "version": person_version(person),
         "createdAt": person.created_at,
     }
+    if "COACH" in kinds:
+        # P1-7：教练证书有效期只读派生，仅供展示；不得作为资格审核结论，
+        # 不改变 audit_status，不参与报名门槛。服务端日期口径统一取 localdate()。
+        if hasattr(person, "coach_certificate_no_val"):
+            certificate_no = person.coach_certificate_no_val
+            expire_date = person.coach_certificate_expire_val
+        else:
+            try:
+                coach = person.coach_profile
+            except ObjectDoesNotExist:
+                coach = None
+            certificate_no = coach.certificate_no if coach else None
+            expire_date = coach.certificate_expire_date if coach else None
+        if expire_date is None:
+            validity = "UNSET"
+        elif expire_date >= timezone.localdate():
+            validity = "VALID"
+        else:
+            validity = "EXPIRED"
+        data["certificateNo"] = certificate_no
+        data["certificateExpireDate"] = (
+            expire_date.isoformat() if expire_date else None
+        )
+        data["certificateValidity"] = validity
+    return data

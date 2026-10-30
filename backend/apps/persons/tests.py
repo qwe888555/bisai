@@ -11,7 +11,7 @@
 from __future__ import annotations
 
 import json
-from datetime import date
+from datetime import date, timedelta
 
 from django.test import TestCase
 from django.utils import timezone
@@ -808,6 +808,76 @@ class PersonCoachDutiesTests(TestCase):
                 joined_at=date(2026, 2, 2),
             ).duty_other
         )
+
+    # ------------------------------------------------ P1-7 教练证书有效期只读派生
+    # 口径（2026-10-30 用户授权）：仅 COACH 输出；证书有效期仅供展示，
+    # 不改 audit_status、不参与报名门槛。日期边界统一取 timezone.localdate()：
+    # expire == today → VALID；expire < today → EXPIRED；空 → UNSET。
+
+    def _set_certificate(self, person, expire_date, certificate_no="C2026001"):
+        CoachProfile.objects.filter(person=person).update(
+            certificate_no=certificate_no, certificate_expire_date=expire_date
+        )
+
+    def _row_by_name(self, full_name):
+        data = self._list_items()
+        return {row["realName"]: row for row in data["items"]}[full_name]
+
+    def test_certificate_validity_valid_when_expire_after_today(self):
+        expire = timezone.localdate() + timedelta(days=1)
+        self._set_certificate(self.free_coach, expire)
+        row = self._row_by_name(self.free_coach.full_name)
+        self.assertEqual(row["certificateNo"], "C2026001")
+        self.assertEqual(row["certificateExpireDate"], expire.isoformat())
+        self.assertEqual(row["certificateValidity"], "VALID")
+
+    def test_certificate_validity_boundary_expire_today_is_valid(self):
+        today = timezone.localdate()
+        self._set_certificate(self.free_coach, today)
+        row = self._row_by_name(self.free_coach.full_name)
+        self.assertEqual(row["certificateExpireDate"], today.isoformat())
+        self.assertEqual(row["certificateValidity"], "VALID")
+
+    def test_certificate_validity_expired_when_expire_before_today(self):
+        expire = timezone.localdate() - timedelta(days=1)
+        self._set_certificate(self.free_coach, expire)
+        row = self._row_by_name(self.free_coach.full_name)
+        self.assertEqual(row["certificateValidity"], "EXPIRED")
+
+    def test_certificate_validity_unset_when_expire_missing(self):
+        row = self._row_by_name(self.free_coach.full_name)
+        self.assertIsNone(row["certificateNo"])
+        self.assertIsNone(row["certificateExpireDate"])
+        self.assertEqual(row["certificateValidity"], "UNSET")
+
+    def test_certificate_fields_absent_for_non_coach(self):
+        athlete = Person.objects.create(
+            person_no="P202600000099",
+            full_name="仅运动员证书隔离",
+            id_card_cipher=encrypt_text("110101201401019876"),
+            id_card_hash=lookup_hash("110101201401019876"),
+            id_card_masked=mask_id_number("110101201401019876"),
+            person_category=enums.PersonCategory.ATHLETE,
+            audit_status=enums.AuditStatus.APPROVED,
+        )
+        AthleteProfile.objects.create(person=athlete, student_no="G2026000099")
+        row = self._row_by_name(athlete.full_name)
+        self.assertNotIn("certificateNo", row)
+        self.assertNotIn("certificateExpireDate", row)
+        self.assertNotIn("certificateValidity", row)
+
+    def test_expired_certificate_does_not_change_audit_status(self):
+        self._set_certificate(
+            self.free_coach, timezone.localdate() - timedelta(days=30)
+        )
+        detail = self._get(
+            f"{PEOPLE}/{self.free_coach.pk}", token=self.admin_token
+        )
+        self.assertEqual(detail.status_code, 200)
+        self.assertEqual(detail.json()["data"]["certificateValidity"], "EXPIRED")
+        self.assertEqual(detail.json()["data"]["reviewStatus"], "APPROVED")
+        self.free_coach.refresh_from_db()
+        self.assertEqual(self.free_coach.audit_status, "APPROVED")
 
 
 class PeopleApiTests(TestCase):
