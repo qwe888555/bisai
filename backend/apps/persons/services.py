@@ -34,6 +34,7 @@ from apps.common.errors import (
     ApiError,
     field_errors,
 )
+from apps.common.permissions import assert_not_self_review
 from apps.accounts.models import Organization
 from apps.persons.models import (
     AthleteProfile,
@@ -1403,34 +1404,46 @@ def review_person(person_id: str, payload: dict, account):
             DATA_SCOPE_DENIED,
             "当前账号无有效组织范围，禁止审核人员档案",
         )
-    person = (
-        people_queryset()
-        .filter(pk=parse_path_id(person_id), school__code__in=codes)
-        .first()
-    )
-    if person is None:
-        raise ApiError(NOT_FOUND)
-    ensure_version(person, payload["version"])
-    current = person.audit_status
-    if current != enums.AuditStatus.PENDING:
-        raise ApiError(
-            STATE_CONFLICT,
-            f"档案当前状态为 {current}，仅待审核（PENDING）档案可处理",
-        )
-    decision = payload["decision"]
-    reason = (payload.get("reason") or "").strip()
-    if decision == "REJECT" and not reason:
-        raise ApiError(
-            INVALID_ARGUMENT,
-            "驳回档案必须填写审核意见",
-            [{"field": "reason", "reason": "REJECT 时必填"}],
-        )
-    person.audit_status = (
-        enums.AuditStatus.APPROVED
-        if decision == "APPROVE"
-        else enums.AuditStatus.REJECTED
-    )
+    # P1-5 防自审：对象读取、版本校验、状态校验、自审审计校验、状态变更与留痕
+    # 全部在同一事务内执行，select_for_update 锁定待审核人员行，防止并发
+    # 创建/修改与审核之间的 TOCTOU 竞态。
     with transaction.atomic():
+        person = (
+            people_queryset()
+            .select_for_update()
+            .filter(pk=parse_path_id(person_id), school__code__in=codes)
+            .first()
+        )
+        if person is None:
+            raise ApiError(NOT_FOUND)
+        ensure_version(person, payload["version"])
+        current = person.audit_status
+        if current != enums.AuditStatus.PENDING:
+            raise ApiError(
+                STATE_CONFLICT,
+                f"档案当前状态为 {current}，仅待审核（PENDING）档案可处理",
+            )
+        # 防自审：纳入 person.create / person.update / person.self_update；
+        # person.self_confirm 仅改 audit_status，不作为创建或修改证据。
+        assert_not_self_review(
+            account,
+            "Person",
+            str(person.pk),
+            ("person.create", "person.update", "person.self_update"),
+        )
+        decision = payload["decision"]
+        reason = (payload.get("reason") or "").strip()
+        if decision == "REJECT" and not reason:
+            raise ApiError(
+                INVALID_ARGUMENT,
+                "驳回档案必须填写审核意见",
+                [{"field": "reason", "reason": "REJECT 时必填"}],
+            )
+        person.audit_status = (
+            enums.AuditStatus.APPROVED
+            if decision == "APPROVE"
+            else enums.AuditStatus.REJECTED
+        )
         person.save()
         _log_change(
             person,

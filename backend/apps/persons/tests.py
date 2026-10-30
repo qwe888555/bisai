@@ -2769,6 +2769,19 @@ class PersonReviewTests(TestCase):
             4, "界外丁", "110101201401014444", cls.school_b, enums.AuditStatus.PENDING
         )
 
+        # P1-5 防自审：直接 DB 创建的人员无 AuditLog，需补录创建审计记录
+        # （操作人为 admin，非审核人 uni_a），否则自审校验因无审计证据而阻断。
+        for person in (cls.p_pending_a, cls.p_draft_a, cls.p_approved_a, cls.p_pending_b):
+            AuditLog.objects.create(
+                id=f"log-p-review-{person.pk}",
+                log_type="OPERATION",
+                operator_account_id=str(cls.admin.pk),
+                action="person.create",
+                object_type="Person",
+                object_id=str(person.pk),
+                outcome="SUCCESS",
+            )
+
     @staticmethod
     def _auth(token):
         return {"HTTP_AUTHORIZATION": f"Bearer {token}"} if token else {}
@@ -2919,6 +2932,118 @@ class PersonReviewTests(TestCase):
         self.assertEqual(resp.status_code, 403)
         self.assertEqual(resp.json()["code"], "DATA_SCOPE_DENIED")
         self.assertFalse(self._audit_log(self.p_pending_a).exists())
+
+    # ------------------------------------------------------------ P1-5 防自审
+
+    def _set_creator_audit(self, person, action, operator_account_id):
+        """覆盖/补录一条人员创建/修改审计记录（用于自审场景构造）。"""
+        AuditLog.objects.filter(
+            object_type="Person", object_id=str(person.pk), action=action
+        ).delete()
+        AuditLog.objects.create(
+            id=f"log-p-self-{person.pk}-{action}",
+            log_type="OPERATION",
+            operator_account_id=str(operator_account_id),
+            action=action,
+            object_type="Person",
+            object_id=str(person.pk),
+            outcome="SUCCESS",
+        )
+
+    def test_self_review_blocked_when_creator_is_reviewer(self):
+        """同账号 person.create 后由该账号审核 → 403，状态/留痕零变更。"""
+        self._set_creator_audit(self.p_pending_a, "person.create", self.uni_a.pk)
+        before = self._audit_log(self.p_pending_a).count()
+        resp = self._post(
+            f"{PEOPLE}/{self.p_pending_a.pk}/review",
+            self._body(self.p_pending_a),
+            token=self.uni_a_token,
+        )
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json()["code"], "FORBIDDEN")
+        self.p_pending_a.refresh_from_db()
+        self.assertEqual(self.p_pending_a.audit_status, enums.AuditStatus.PENDING)
+        self.assertEqual(self._audit_log(self.p_pending_a).count(), before)
+
+    def test_self_review_blocked_when_updater_is_reviewer(self):
+        """同账号 person.update 后由该账号审核 → 403。"""
+        self._set_creator_audit(self.p_pending_a, "person.update", self.uni_a.pk)
+        resp = self._post(
+            f"{PEOPLE}/{self.p_pending_a.pk}/review",
+            self._body(self.p_pending_a),
+            token=self.uni_a_token,
+        )
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json()["code"], "FORBIDDEN")
+
+    def test_self_review_blocked_when_self_updater_is_reviewer(self):
+        """同账号 person.self_update 后由该账号审核 → 403。"""
+        self._set_creator_audit(self.p_pending_a, "person.self_update", self.uni_a.pk)
+        resp = self._post(
+            f"{PEOPLE}/{self.p_pending_a.pk}/review",
+            self._body(self.p_pending_a),
+            token=self.uni_a_token,
+        )
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json()["code"], "FORBIDDEN")
+
+    def test_self_review_allowed_when_only_self_confirm(self):
+        """person.self_confirm 不纳入自审判定：他人 create + 审核人 self_confirm
+        时审核 → 200（self_confirm 不算修改证据，不触发自审阻断）。"""
+        # 保留原 person.create（operator=admin），追加一条审核人本人的 self_confirm
+        AuditLog.objects.create(
+            id=f"log-p-confirm-{self.p_pending_a.pk}",
+            log_type="OPERATION",
+            operator_account_id=str(self.uni_a.pk),
+            action="person.self_confirm",
+            object_type="Person",
+            object_id=str(self.p_pending_a.pk),
+            outcome="SUCCESS",
+        )
+        resp = self._post(
+            f"{PEOPLE}/{self.p_pending_a.pk}/review",
+            self._body(self.p_pending_a),
+            token=self.uni_a_token,
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.p_pending_a.refresh_from_db()
+        self.assertEqual(self.p_pending_a.audit_status, enums.AuditStatus.APPROVED)
+
+    def test_review_blocked_without_audit_log(self):
+        """无任何成功创建/修改审计记录 → 403 阻断（不自动放行）。"""
+        AuditLog.objects.filter(
+            object_type="Person", object_id=str(self.p_pending_a.pk)
+        ).delete()
+        resp = self._post(
+            f"{PEOPLE}/{self.p_pending_a.pk}/review",
+            self._body(self.p_pending_a),
+            token=self.uni_a_token,
+        )
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json()["code"], "FORBIDDEN")
+        self.p_pending_a.refresh_from_db()
+        self.assertEqual(self.p_pending_a.audit_status, enums.AuditStatus.PENDING)
+
+    def test_self_review_blocked_for_multi_role_account(self):
+        """同账号拥有 ADMIN+UNIVERSITY 双角色，自己创建后自己审核 → 403。"""
+        multi = Account.objects.create(
+            id=new_account_id(),
+            username="p-review-multi",
+            display_name="双角色账号",
+            roles=["ADMIN", "UNIVERSITY"],
+            password=make_password("multi-pass-123"),
+            enabled=True,
+            organization_id="ORG-RSA",
+        )
+        multi_token = issue_access_token(multi)[0]
+        self._set_creator_audit(self.p_pending_a, "person.create", multi.pk)
+        resp = self._post(
+            f"{PEOPLE}/{self.p_pending_a.pk}/review",
+            self._body(self.p_pending_a),
+            token=multi_token,
+        )
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json()["code"], "FORBIDDEN")
 
 
 class MyProfileApiTests(TestCase):
@@ -4279,6 +4404,18 @@ class P0UnifiedFlowTests(TestCase):
         AthleteProfile.objects.create(person=cls.p_approved_own)
         cls.own_user = make_account("p0-own", ["ATHLETE"], cls.p_approved_own)
         cls.own_token = issue_access_token(cls.own_user)[0]
+
+        # P1-5 防自审：补录创建审计记录（操作人为 admin，非审核人 uni）。
+        for person in (cls.p_rejected, cls.p_approved, cls.p_approved_own):
+            AuditLog.objects.create(
+                id=f"log-p0-{person.pk}",
+                log_type="OPERATION",
+                operator_account_id=str(cls.admin.pk),
+                action="person.create",
+                object_type="Person",
+                object_id=str(person.pk),
+                outcome="SUCCESS",
+            )
 
     @staticmethod
     def _auth(token):

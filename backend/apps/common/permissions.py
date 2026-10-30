@@ -242,3 +242,44 @@ def require(operation_id: str) -> Optional[object]:
 
 def current_account() -> Optional[object]:
     return get_current_account()
+
+
+# ---------------------------------------------------------------- 防自审（P1-5）
+
+
+def assert_not_self_review(
+    account, object_type: str, object_id: str, actions: tuple[str, ...]
+) -> None:
+    """防自审校验：当前账号不得审核自己创建或修改的对象。
+
+    业务依据（2026-10-30 P1-5 裁定）：
+    - 同一账号创建或修改过的人员档案、材料，不得由该账号审核；
+      账号拥有多个角色（如 ADMIN+UNIVERSITY）也不改变该规则——
+      匹配键为 operator_account_id（账号主键），与角色无关。
+    - person.self_confirm 不作为创建或修改证据（仅改 audit_status）。
+    - material.remove 不纳入（软删后对象不可审核）。
+    - 无法找到对应的成功创建或修改 AuditLog 时，保持阻断，不自动放行。
+
+    判定逻辑（查询 AuditLog.accounts_audit_log）：
+    - 无任何成功创建/修改记录 → 阻断（缺乏审计证据，无法排除自审）；
+    - 存在当前账号的创建/修改记录 → 阻断（自审）；
+    - 仅存在其他账号的记录 → 放行。
+
+    阻断仅表示缺乏足够审计证据或存在自审嫌疑，错误信息不宣称已证明发生自审。
+    依赖 AuditLog 由 AuditMiddleware 在响应后写入；业务提交与审计写入非同一
+    事务的缺口为已知风险（本轮不改造 AuditMiddleware）。
+    """
+    from apps.accounts.models import AuditLog  # 延迟导入：accounts.models 不依赖本模块
+
+    operators = set(
+        AuditLog.objects.filter(
+            object_type=object_type,
+            object_id=object_id,
+            action__in=actions,
+            outcome="SUCCESS",
+        ).values_list("operator_account_id", flat=True)
+    )
+    if not operators:
+        raise ApiError(FORBIDDEN, "当前账号无权审核该记录")
+    if str(account.pk) in operators:
+        raise ApiError(FORBIDDEN, "当前账号无权审核该记录")
