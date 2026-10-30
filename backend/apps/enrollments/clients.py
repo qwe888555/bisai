@@ -133,6 +133,87 @@ _TEAM_SEED: dict[str, dict[str, Any]] = {
 }
 
 
+def _level2_region(region):
+    """沿 parent 上溯到 level==2（市州）区划；到顶仍找不到时返回原区划。"""
+    seen = 0
+    current = region
+    while current is not None and current.level != 2 and seen < 6:
+        current = current.parent
+        seen += 1
+    return current or region
+
+
+def _city_org_ancestor(team):
+    """沿组织树上溯：球队的学校/球队 org 节点 → 最近的 CITY 祖先节点。"""
+    from apps.accounts.models import Organization
+
+    codes = []
+    school = getattr(team, "school", None)
+    if school is not None and school.code:
+        codes.append(school.code)
+    if getattr(team, "team_no", ""):
+        codes.append(team.team_no)
+    for code in codes:
+        node = Organization.objects.filter(code=code).first()
+        seen = 0
+        while node is not None and seen < 8:
+            if node.org_type == "CITY":
+                return node
+            node = node.parent
+            seen += 1
+    return None
+
+
+def _city_org_for(team) -> tuple[str, str]:
+    """解析球队所属市州组织，返回 (cityOrgId, cityName)。
+
+    Team.region 可空且种子数据常指向区县（level 3），故三级回退：
+    1. region（或缺失时回退 school.region）按 code/name 反查 CITY 组织；
+    2. 沿 region.parent 上溯到 level==2 再反查；
+    3. 沿组织树（school/team org 节点）上溯找 CITY 祖先。
+    全部失败返回 ("", "")，由调用方按空串处理（org 角色将被 403 提示补归属）。
+    """
+    from apps.accounts.models import Organization
+
+    region = getattr(team, "region", None)
+    if region is None:
+        school = getattr(team, "school", None)
+        region = getattr(school, "region", None) if school else None
+    if region is None:
+        return "", ""
+
+    def lookup(reg):
+        org = (
+            Organization.objects.filter(org_type="CITY", code=reg.code).first()
+            or Organization.objects.filter(org_type="CITY", name=reg.name).first()
+        )
+        if org is not None:
+            return org
+        # 市州组织名常带机关后缀（如"示例市州教育局"↔区划"示例市州"），
+        # 且 code 未必用区划码（远程库为 CITY01），做归一化后缀匹配兜底
+        def strip_suffix(name: str) -> str:
+            for suffix in ("教育和体育局", "教育局", "体育局"):
+                if name.endswith(suffix) and len(name) > len(suffix):
+                    return name[: -len(suffix)]
+            return name
+
+        for candidate in Organization.objects.filter(org_type="CITY"):
+            if strip_suffix(candidate.name) == reg.name:
+                return candidate
+        return None
+
+    city_region = _level2_region(region)
+    city_org = lookup(region)
+    if city_org is None and city_region.pk != region.pk:
+        city_org = lookup(city_region)
+    if city_org is None:
+        city_org = _city_org_ancestor(team)
+    if city_org is None:
+        return "", (city_region.name if city_region else "")
+    city_name = city_region.name if city_region and city_region.level == 2 else city_org.name
+    return str(city_org.pk), city_name
+
+
 class TeamClient:
     @staticmethod
     def _real_team(team_id: str) -> Optional[dict[str, Any]]:
@@ -145,15 +226,7 @@ class TeamClient:
             if team is None:
                 return None
             school = team.school
-            region = team.region
-            city_org = None
-            if region is not None:
-                city_org = (
-                    Organization.objects.filter(org_type="CITY")
-                    .filter(code=region.code)
-                    .first()
-                    or Organization.objects.filter(org_type="CITY", name=region.name).first()
-                )
+            city_org_id, city_name = _city_org_for(team)
             school_org = None
             if school is not None and school.code:
                 school_org = Organization.objects.filter(code=school.code).first()
@@ -167,8 +240,8 @@ class TeamClient:
                 "id": str(team.pk),
                 "name": team.name,
                 "orgId": school_org.pk if school_org else (str(school.pk) if school else ""),
-                "cityOrgId": city_org.pk if city_org else "",
-                "cityName": region.name if region else "",
+                "cityOrgId": city_org_id,
+                "cityName": city_name,
                 "schoolCode": (school.code if school and school.code else ""),
                 "schoolName": school.name if school else "",
                 "coachIds": coach_ids,
@@ -210,7 +283,7 @@ class TeamClient:
             raise ApiError(NOT_FOUND, "球队主档不存在")
         org = Organization.objects.filter(code=team.team_no).first()
         school = team.school
-        region = team.region
+        city_org_id, city_name = _city_org_for(team)
         coach_ids = list(
             TeamCoach.objects.filter(team=team, status="CURRENT").values_list(
                 "person_id", flat=True
@@ -220,8 +293,8 @@ class TeamClient:
             "id": str(team.pk),
             "name": team.name,
             "orgId": str(org.pk) if org else str(team.pk),
-            "cityOrgId": "",
-            "cityName": region.name if region else "",
+            "cityOrgId": city_org_id,
+            "cityName": city_name,
             "schoolCode": school.code if school else "",
             "schoolName": school.name if school else "",
             "coachIds": [str(pk) for pk in coach_ids],
@@ -354,28 +427,8 @@ _BASE_DATE = date(2010, 1, 1)
 
 
 class PersonClient:
-    def get_person(self, athlete_id: str) -> dict[str, Any]:
-        if not athlete_id:
-            from apps.common.errors import INVALID_ARGUMENT, ApiError
-
-            raise ApiError(INVALID_ARGUMENT, "缺少运动员 ID")
-        if mock_enabled():
-            tail = _suffix(athlete_id)
-            return {
-                "id": athlete_id,
-                "name": f"运动员{tail[:2]}",
-                "maskedIdNumber": mask_id_number(f"11010120100101{tail[:4]}"),
-                "gender": "MALE",
-                "birthDate": _BASE_DATE.isoformat(),
-                "maskedStudentNumber": mask_student_number(f"ST{tail}0001"),
-                "hasIdConflict": False,
-                "banned": False,
-            }
-        from apps.common.errors import ApiError, NOT_FOUND
-
-        person = _resolve_person(athlete_id)
-        if person is None:
-            raise ApiError(NOT_FOUND, "运动员主档不存在，请先在人员系统建档")
+    @staticmethod
+    def _person_payload(person) -> dict[str, Any]:
         student_no = ""
         try:
             student_no = person.athlete_profile.student_no or ""
@@ -391,6 +444,32 @@ class PersonClient:
             "hasIdConflict": False,
             "banned": False,
         }
+
+    def get_person(self, athlete_id: str) -> dict[str, Any]:
+        if not athlete_id:
+            from apps.common.errors import INVALID_ARGUMENT, ApiError
+
+            raise ApiError(INVALID_ARGUMENT, "缺少运动员 ID")
+        person = _resolve_person(athlete_id)
+        if person is not None:
+            return self._person_payload(person)
+        if mock_enabled():
+            # 真实主档查不到才回退演示数据；假名用 ID 派生数字，
+            # 避免十六进制尾串（运动员0e）冒充真实姓名。
+            tail = _suffix(athlete_id)
+            return {
+                "id": athlete_id,
+                "name": f"运动员{int(tail[:4], 16):04d}",
+                "maskedIdNumber": mask_id_number(f"11010120100101{tail[:4]}"),
+                "gender": "MALE",
+                "birthDate": _BASE_DATE.isoformat(),
+                "maskedStudentNumber": mask_student_number(f"ST{tail}0001"),
+                "hasIdConflict": False,
+                "banned": False,
+            }
+        from apps.common.errors import ApiError, NOT_FOUND
+
+        raise ApiError(NOT_FOUND, "运动员主档不存在，请先在人员系统建档")
 
     def get_persons(self, athlete_ids: list[str]) -> dict[str, dict[str, Any]]:
         return {athlete_id: self.get_person(athlete_id) for athlete_id in athlete_ids}

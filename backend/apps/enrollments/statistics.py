@@ -1,10 +1,14 @@
-"""报名统计（市州 / 高校 / 组别）。
+"""报名统计（市州 / 学校 / 组别）。
 
 口径（默认实现，TODO 确认项#11）：
 - 数据源：非软删除、status ∉ {DRAFT, WITHDRAWN}；
 - 去重键：每个 (teamId, groupId) 取 submission_no 最大、created_at 最新的一条；
 - teamCount = 去重后球队数；athleteCount = 这些报名的 roster_item 合计（不含 EXCLUDED）；
-- pending/approved/rejected 按该报名当前状态分桶。
+- enrollmentCount = 去重后报名条数（解释"球队按组别重复计数"的口径差）；
+- pending/approved/rejected 按该报名当前状态分桶；
+- 维度：CITY 按市州组织、SCHOOL（别名 UNIVERSITY，兼容旧前端）按学校、
+  GROUP 按赛事组别——均不按 subject_type 过滤，否则市州端（全部
+  SCHOOL_TEAM）调 dimension=UNIVERSITY 恒返回空。
 聚合用 values().annotate()，不做逐条查询。
 """
 
@@ -56,8 +60,8 @@ def enrollment_statistics(
         queryset = queryset.filter(city_org_id=city_org_id)
     if group_id:
         queryset = queryset.filter(group_id=group_id)
-    if dimension == "UNIVERSITY":
-        queryset = queryset.filter(subject_type="UNIVERSITY")
+    # UNIVERSITY 是历史前端取值，等价于按学校的 SCHOOL 维度；
+    # 均不按 subject_type 过滤——市州端数据全是 SCHOOL_TEAM，过滤即空列表
 
     ordered = queryset.order_by(
         "team_id", "group_id", "-submission_no", "-created_at", "-id"
@@ -91,6 +95,7 @@ def enrollment_statistics(
                 "label": label,
                 "teamCount": 0,
                 "athleteCount": 0,
+                "enrollmentCount": 0,
                 "pendingCount": 0,
                 "approvedCount": 0,
                 "rejectedCount": 0,
@@ -98,6 +103,7 @@ def enrollment_statistics(
             },
         )
         row["_teams"].add(enrollment.team_id)
+        row["enrollmentCount"] += 1
         row["athleteCount"] += counts.get(enrollment.pk, 0)
         if enrollment.status in {STATUS_PENDING_CITY, STATUS_PENDING_PROVINCE}:
             row["pendingCount"] += 1
@@ -119,8 +125,14 @@ def _group_key(dimension: str, enrollment: Enrollment) -> tuple[str, str]:
         org_id = enrollment.city_org_id or ""
         names = _organization_names([org_id])
         return org_id, names.get(org_id) or org_id or "未分配市州"
-    if dimension == "UNIVERSITY":
+    if dimension in ("UNIVERSITY", "SCHOOL"):
+        # 按学校分组（原按 team_id 分组导致"每队一行"，看不出学校汇总）
         team = team_client.get_team(enrollment.team_id)
+        school_code = team.get("schoolCode") or ""
+        if school_code:
+            return f"sch:{school_code}", (
+                team.get("schoolName") or school_code
+            )
         return enrollment.team_id, team.get("name") or enrollment.team_id
     group = event_config_client.get_group(enrollment.event_id, enrollment.group_id)
     return enrollment.group_id, group.get("name") or enrollment.group_id

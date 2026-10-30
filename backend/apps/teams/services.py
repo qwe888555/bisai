@@ -272,11 +272,19 @@ def create_team(data: dict, org, school, account) -> Team:
     from apps.accounts.services import ensure_business_org
 
     _ensure_create_org_scope(account, org)
+    # 归属落库：球队 region 取学校区划沿 parent 上溯的市州（level 2），
+    # 供报名 cityOrgId 解析与市州端数据隔离使用；上溯不到保留学校区县原值
+    region = school.region if school.region_id else None
+    hops = 0
+    while region is not None and region.level != 2 and region.parent_id and hops < 6:
+        region = region.parent
+        hops += 1
     with transaction.atomic():
         team = Team.objects.create(
             name=data["name"],
             category_code=data["groupCategory"],
             school=school,
+            region=region,
             introduction=data.get("intro"),
             flag_file_id=data.get("flagFileId"),
             logo_file_id=data.get("emblemFileId"),

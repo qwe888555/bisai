@@ -11,6 +11,7 @@ from typing import Any, Optional
 
 from django.core.serializers.json import DjangoJSONEncoder
 from django.db import transaction
+from django.db.models import Count
 from django.utils import timezone
 
 from apps.common.crypto import encrypt_text, mask_phone, normalize_phone
@@ -170,7 +171,18 @@ def _local_team_display(team_id: str) -> dict:
     }
 
 
-def to_summary(enrollment: Enrollment) -> dict:
+def _resolve_player_count(enrollment: Enrollment, player_count: Optional[int]) -> int:
+    if player_count is not None:
+        return int(player_count)
+    annotated = getattr(enrollment, "player_count", None)
+    if annotated is not None:
+        return int(annotated)
+    return enrollment.players.count()
+
+
+def to_summary(
+    enrollment: Enrollment, player_count: Optional[int] = None
+) -> dict:
     team = team_client.get_team(enrollment.team_id)
     local_team = _local_team_display(enrollment.team_id)
     event_name, group_name = _event_display_names(enrollment)
@@ -196,6 +208,7 @@ def to_summary(enrollment: Enrollment) -> dict:
         "submissionNo": int(enrollment.submission_no or 0),
         "contactName": enrollment.contact_name,
         "maskedContactPhone": enrollment.contact_phone_masked,
+        "playerCount": _resolve_player_count(enrollment, player_count),
         "editable": enrollment.editable,
         "snapshotId": snapshot.pk if snapshot else None,
         "version": int(enrollment.version or 0),
@@ -205,8 +218,9 @@ def to_summary(enrollment: Enrollment) -> dict:
 
 
 def to_detail(enrollment: Enrollment) -> dict:
-    data = to_summary(enrollment)
-    data["players"] = [to_roster(item) for item in enrollment.players.all()]
+    players = [to_roster(item) for item in enrollment.players.all()]
+    data = to_summary(enrollment, player_count=len(players))
+    data["players"] = players
     data["attachments"] = [
         to_attachment(item) for item in enrollment.attachments.all()
     ]
@@ -327,7 +341,10 @@ def _locked_enrollment(actor, enrollment_id: str) -> Enrollment:
 def list_enrollments(actor, filters: Optional[dict] = None):
     queryset = scope.scoped_queryset(actor, Enrollment.objects.all())
     queryset = scope.apply_filters(queryset, filters)
-    return queryset.order_by("-created_at", "id")
+    # 列表响应补 playerCount（审核工作台"球员"列），避免逐行 N+1
+    return queryset.annotate(
+        player_count=Count("players", distinct=True)
+    ).order_by("-created_at", "id")
 
 
 def get_enrollment(actor, enrollment_id: str) -> dict:
@@ -563,7 +580,7 @@ def build_snapshot_payload(enrollment: Enrollment) -> dict:
     coach_ids = list(team.get("coachIds") or [])
     coaches = [team_client.get_coach(coach_id) for coach_id in coach_ids]
     payload = {
-        "enrollment": to_summary(enrollment),
+        "enrollment": to_summary(enrollment, player_count=len(players)),
         "team": team,
         "players": players,
         "coachIds": coach_ids,
@@ -606,6 +623,13 @@ def submit_enrollment(actor, enrollment_id: str, version: int) -> dict:
 
     from_status = enrollment.status
     enrollment.submission_no = int(enrollment.submission_no or 0) + 1
+    # 归属回填：提交时以球队主档最新 cityOrgId 为准，修历史空值，
+    # 保证市州端按 cityOrgId 过滤能查到本条报名
+    refreshed_city = (team_client.get_team(enrollment.team_id) or {}).get(
+        "cityOrgId"
+    ) or ""
+    if refreshed_city and refreshed_city != enrollment.city_org_id:
+        enrollment.city_org_id = refreshed_city
     # 快照记录提交后的状态，避免从快照看到“草稿/已驳回”
     enrollment.status = _submitted_status(enrollment.subject_type)
     payload = build_snapshot_payload(enrollment)

@@ -82,7 +82,8 @@ register_operation("enrollmentStats", R3)
 
 _SUBJECT_TYPES = tuple(item[0] for item in SUBJECT_TYPES)
 _STATUSES = tuple(item[0] for item in ENROLLMENT_STATUSES)
-_DIMENSIONS = ("CITY", "UNIVERSITY", "GROUP")
+# UNIVERSITY 为历史前端取值，后端等价按学校（SCHOOL）分组，见 statistics.py
+_DIMENSIONS = ("CITY", "SCHOOL", "UNIVERSITY", "GROUP")
 _IMPORT_MODES = ("VALIDATE_ONLY", "APPLY_VALID_ROWS")
 
 
