@@ -1,7 +1,10 @@
 """材料域接口（django-ninja）：/materials。
 
 前端契约（zuqiu 快照 api/index.ts materialApi L127-133 + 5 个消费页面）：
-- materialList  GET  /materials                    （page/pageSize/ownerType?/ownerId?）
+- materialList  GET  /materials                    （page/pageSize/ownerType?/ownerId?
+                                                   + status?/needAudit?/keyword? #9）
+- auditHistory GET /materials/{id}/audit-logs      （2026-10-30 #9 补齐：审核历史只读，
+  权限复用 materialGet，可见口径与详情一致）
 - materialCreate POST /materials                  （body 全字段，StrictSchema 多传 400）
 - materialReview POST /materials/{id}/review      （body {decision, reason?, version}）
 - materialDelete DELETE /materials/{id}?version=  （软删）
@@ -74,10 +77,20 @@ def material_list(
     pageSize: Optional[int] = Query(None, ge=1, le=100),
     ownerType: Optional[str] = None,
     ownerId: Optional[str] = None,
+    status: Optional[str] = None,
+    needAudit: Optional[bool] = None,
+    keyword: Optional[str] = Query(None, max_length=50),
 ):
     account = require("materialList")
     rows = services.material_list(
-        {"ownerType": ownerType, "ownerId": ownerId}, account
+        {
+            "ownerType": ownerType,
+            "ownerId": ownerId,
+            "status": status,
+            "needAudit": needAudit,
+            "keyword": keyword,
+        },
+        account,
     )
     # 行为 (material, kind) 元组（多态），先物化再走 paginate_list
     # （paginate 的 count 探测对 list 误判 list.count()，故不直接用 paginate）
@@ -92,6 +105,19 @@ def material_get(request, material_id: str):
     account = require("materialGet")
     material, kind = services.material_get(material_id, account)
     return ok(s.material_out(material, kind))
+
+
+@router.get(
+    "/materials/{material_id}/audit-logs",
+    auth=_auth,
+    response=EnvelopeOut,
+    summary="材料审核历史",
+)
+def material_audit_logs(request, material_id: str):
+    """审核历史只读（2026-10-30 问题#9）：权限与可见口径复用材料详情。"""
+    account = require("materialGet")
+    logs = services.material_audit_logs(material_id, account)
+    return ok([s.audit_log_out(log) for log in logs])
 
 
 @router.put(

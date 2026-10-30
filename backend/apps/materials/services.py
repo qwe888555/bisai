@@ -208,12 +208,37 @@ def _parse_owner_id(raw) -> int:
 
 # ---------------------------------------------------------------- 列表
 
+def _apply_list_filters(queryset, filters: dict):
+    """列表过滤（2026-10-30 问题#9 待审队列）：status/needAudit/keyword 可选组合。
+
+    叠加在 visible_materials 数据范围之后，不改变可见性规则；
+    status 非法枚举 400；keyword 匹配 file_name/remark（icontains，NULL 不命中）。
+    """
+    status = filters.get("status") or None
+    if status is not None:
+        if status not in enums.MaterialStatus.values:
+            raise ApiError(
+                INVALID_ARGUMENT,
+                "status 仅支持 PENDING/APPROVED/REJECTED",
+                [{"field": "status", "reason": "不在枚举范围内"}],
+            )
+        queryset = queryset.filter(status=status)
+    need_audit = filters.get("needAudit")
+    if need_audit is not None:
+        queryset = queryset.filter(type__need_audit=bool(need_audit))
+    keyword = (filters.get("keyword") or "").strip()
+    if keyword:
+        queryset = queryset.filter(Q(file_name__icontains=keyword) | Q(remark__icontains=keyword))
+    return queryset
+
+
 def material_list(filters: dict, account) -> list:
     """材料列表（软删排除；ownerType/ownerId 可选，缺省为全局跨两表列表）。
 
     无 ownerType 时（Dashboard 统计）合并两张同构材料表按创建时间倒序；
     数据量增长后应改为归一化视图/联合查询（联调注记）。
     数据范围按可见归属过滤（visible_materials），越界归属返回空结果而非 403。
+    可选过滤：status/needAudit/keyword（2026-10-30 问题#9 待审队列），见 _apply_list_filters。
     返回 (items, kind) 元组列表，供序列化层携带多态 kind。
     """
     owner_type = filters.get("ownerType")
@@ -234,18 +259,20 @@ def material_list(filters: dict, account) -> list:
             )
         owner_pk = _parse_owner_id(owner_id)
         kind = owner_type
-        rows = (
+        rows = _apply_list_filters(
             visible_materials(account, _active_queryset(kind))
             .select_related("person" if kind == "PERSON" else "team", "type")
-            .filter(**({"person_id": owner_pk} if kind == "PERSON" else {"team_id": owner_pk}))
-            .order_by("-created_at", "-id")
-        )
+            .filter(**({"person_id": owner_pk} if kind == "PERSON" else {"team_id": owner_pk})),
+            filters,
+        ).order_by("-created_at", "-id")
         return [(m, kind) for m in rows]
-    person_rows = visible_materials(account, _active_queryset("PERSON")).select_related(
-        "person", "type"
+    person_rows = _apply_list_filters(
+        visible_materials(account, _active_queryset("PERSON")).select_related("person", "type"),
+        filters,
     )
-    team_rows = visible_materials(account, _active_queryset("TEAM")).select_related(
-        "team", "type"
+    team_rows = _apply_list_filters(
+        visible_materials(account, _active_queryset("TEAM")).select_related("team", "type"),
+        filters,
     )
     merged = sorted(
         chain(person_rows, team_rows),
@@ -410,6 +437,24 @@ def material_get(material_id: str, account) -> tuple:
     material, kind = _get_material_any(parse_path_id(material_id, "materialId"))
     _ensure_material_visible(account, material, kind)
     return material, kind
+
+
+def material_audit_logs(material_id: str, account) -> list:
+    """材料审核历史（2026-10-30 问题#9 补齐）：只读 append-only 日志。
+
+    口径与 material_get 完全一致（多态双表解析 + 数据范围越界 403 +
+    软删/缺失 404 + 双表同 id 409）；按 created_at 升序返回。
+    auditor 底座账号 ID 映射未定，写入恒空（与模型注释一致）。
+    """
+    from apps.persons.services import parse_path_id
+
+    material, kind = _get_material_any(parse_path_id(material_id, "materialId"))
+    _ensure_material_visible(account, material, kind)
+    return list(
+        MaterialAuditLog.objects.filter(material_kind=kind, material_id=material.pk).order_by(
+            "created_at", "id"
+        )
+    )
 
 
 # ---------------------------------------------------------------- 更新

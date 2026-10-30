@@ -851,6 +851,64 @@ class MaterialApiTests(TestCase):
         )
         self.assertEqual(resp.status_code, 404)
 
+    # --------------------------------- 列表过滤与审核历史（2026-10-30 #9）
+
+    def test_list_filter_status_pending_queue(self):
+        """status 过滤：PENDING 即待审队列；REJECTED 空态而非报错。"""
+        resp = self._get(BASE, token=self.admin_token, query={"status": "PENDING"})
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()["data"]
+        self.assertEqual(body["total"], 4)  # pm_pending + tm_pending + tm_other + pm_city_b
+        self.assertTrue(all(item["reviewStatus"] == "PENDING" for item in body["items"]))
+        approved = self._get(BASE, token=self.admin_token, query={"status": "APPROVED"})
+        self.assertEqual(approved.json()["data"]["total"], 1)  # pm_approved
+        rejected = self._get(BASE, token=self.admin_token, query={"status": "REJECTED"})
+        self.assertEqual(rejected.json()["data"]["total"], 0)
+
+    def test_list_filter_status_invalid_400(self):
+        resp = self._get(BASE, token=self.admin_token, query={"status": "FOO"})
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.json()["code"], "INVALID_ARGUMENT")
+
+    def test_list_filter_need_audit_and_keyword(self):
+        """needAudit 过滤 + keyword 匹配 file_name/remark；可与 status 组合。"""
+        resp = self._get(BASE, token=self.admin_token, query={"needAudit": "true"})
+        self.assertEqual(resp.json()["data"]["total"], 5)  # 种子材料类型均需审核
+        resp = self._get(BASE, token=self.admin_token, query={"needAudit": "false"})
+        self.assertEqual(resp.json()["data"]["total"], 0)
+        resp = self._get(BASE, token=self.admin_token, query={"keyword": "甲的证书"})
+        self.assertEqual(resp.json()["data"]["total"], 1)  # pm_pending remark
+        resp = self._get(BASE, token=self.admin_token, query={"keyword": "已绑"})
+        self.assertEqual(resp.json()["data"]["total"], 3)  # file_name 含"已绑"
+        combined = self._get(
+            BASE, token=self.admin_token, query={"status": "PENDING", "keyword": "已绑"}
+        )
+        self.assertEqual(combined.json()["data"]["total"], 2)
+
+    def test_audit_logs_history_and_scope(self):
+        """审核历史：审核产生 append-only 日志；越界 403；缺失 404。"""
+        self._post(
+            f"{BASE}/{self.pm_pending.pk}/review",
+            {"decision": "APPROVE", "version": self._mver(self.pm_pending)},
+            token=self.admin_token,
+        )
+        resp = self._get(f"{BASE}/{self.pm_pending.pk}/audit-logs", token=self.admin_token)
+        self.assertEqual(resp.status_code, 200)
+        logs = resp.json()["data"]
+        self.assertEqual(len(logs), 1)
+        self.assertEqual(logs[0]["materialKind"], "PERSON")
+        self.assertEqual(logs[0]["fromStatus"], "PENDING")
+        self.assertEqual(logs[0]["toStatus"], "APPROVED")
+        self.assertEqual(logs[0]["comment"], "")
+        self.assertIsNone(logs[0]["auditor"])
+        empty = self._get(f"{BASE}/{self.pm_city_b.pk}/audit-logs", token=self.admin_token)
+        self.assertEqual(empty.json()["data"], [])  # 未审核 → 空历史
+        denied = self._get(f"{BASE}/{self.pm_city_b.pk}/audit-logs", token=self.uni_token)
+        self.assertEqual(denied.status_code, 403)
+        self.assertEqual(denied.json()["code"], "DATA_SCOPE_DENIED")
+        missing = self._get(f"{BASE}/999999/audit-logs", token=self.admin_token)
+        self.assertEqual(missing.status_code, 404)
+
     # ------------------------------------------------------------ 软删
 
     def test_remove_soft_deletes(self):

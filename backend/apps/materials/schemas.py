@@ -104,3 +104,15 @@ def material_out(material, kind: str) -> dict:
         "version": material_version(material),
         "createdAt": material.created_at.isoformat() if material.created_at else None,
     }
+
+
+def audit_log_out(log) -> dict:
+    """MaterialAuditLog → 审核历史条目（2026-10-30 问题#9，append-only 只读）。"""
+    return {
+        "materialKind": log.material_kind,
+        "fromStatus": log.from_status,
+        "toStatus": log.to_status,
+        "auditor": log.auditor,  # 底座账号 ID 映射未定，写入恒空
+        "comment": log.comment or "",
+        "createdAt": log.created_at.isoformat() if log.created_at else None,
+    }
