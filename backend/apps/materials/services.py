@@ -52,7 +52,7 @@ from apps.common.errors import (
     STATE_CONFLICT,
     ApiError,
 )
-from apps.common.permissions import ADMIN, TEAM, UNIVERSITY
+from apps.common.permissions import ADMIN, TEAM, UNIVERSITY, assert_not_self_review
 from apps.common.scopes import scope_org_codes
 from apps.materials.models import (
     MaterialAuditLog,
@@ -330,6 +330,148 @@ def material_list(filters: dict, account) -> list:
     return [(m, "PERSON" if isinstance(m, PersonMaterial) else "TEAM") for m in merged]
 
 
+# ---------------------------------------------------------------- 阶段 1 批量查询
+
+def material_batch_query(owner_type, owner_ids, type_codes, account) -> dict:
+    """阶段 1：多归属多类型材料批量查询（只读，不替换 material_list）。
+
+    入参契约（见《材料域阶段 1 完整契约清单》）：
+    - owner_type: 仅 "PERSON"/"TEAM"（大小写敏感），非法 → 400 INVALID_ARGUMENT
+    - owner_ids: list 或 tuple，元素必须为正整数；拒绝 bool/浮点数/数字字符串；
+      任一非法元素整体 400 拒绝（不跳过）；去重保序；不增加额外业务上限。
+    - type_codes: list 或 tuple；逐元素 strip()，空串丢弃，去重保序；
+      规范化后无有效码 → 400 INVALID_ARGUMENT。
+    - 批量类型预检：不存在 / applies_to 不匹配 → 400，problems 数组按输入顺序，
+      每条 {"field":"type_codes","value":"<原始输入值>","reason":"<原因>"}。
+    - 返回 {"items":[...8字段...], "missing_owner_ids":[...]}。
+      items 字段：owner_id(int)、material_id、type_code、status、need_audit、
+      allow_multiple、file_id、updated_at(ISO8601 isoformat)。
+      排序：owner_id ASC → type_code ASC → updated_at DESC → material_id DESC。
+      missing_owner_ids：输入归属 ID 中无有效材料记录者，按去重后输入顺序。
+    - MaterialType.is_active=False 的历史材料仍可查询（不增加 is_active 过滤）。
+    - 数据范围复用 _material_scope / _ensure_owner_in_scope；异常向上传播。
+    """
+    # 1. owner_type 校验
+    if owner_type not in ("PERSON", "TEAM"):
+        raise ApiError(
+            INVALID_ARGUMENT,
+            "ownerType 仅支持 PERSON/TEAM",
+            [{"field": "ownerType", "reason": "不在枚举范围内"}],
+        )
+
+    # 2. owner_ids 校验：接受 list/tuple，正整数，拒绝 bool/浮点数/数字字符串
+    if not isinstance(owner_ids, (list, tuple)):
+        raise ApiError(INVALID_ARGUMENT, "ownerIds 必须为列表或元组")
+    parsed_ids = []
+    seen_ids = set()
+    for raw in owner_ids:
+        if isinstance(raw, bool) or isinstance(raw, float) or isinstance(raw, str):
+            raise ApiError(INVALID_ARGUMENT, "ownerIds 元素必须为正整数")
+        if not isinstance(raw, int) or raw <= 0:
+            raise ApiError(INVALID_ARGUMENT, "ownerIds 元素必须为正整数")
+        if raw not in seen_ids:
+            seen_ids.add(raw)
+            parsed_ids.append(raw)
+    if not parsed_ids:
+        raise ApiError(INVALID_ARGUMENT, "ownerIds 不能为空")
+
+    # 3. type_codes 校验：strip、空串丢弃、去重保序
+    if not isinstance(type_codes, (list, tuple)):
+        raise ApiError(INVALID_ARGUMENT, "typeCodes 必须为列表或元组")
+    seen_codes = set()
+    normalized_codes = []  # [(原始输入值, 规范化后码)]
+    for orig in type_codes:
+        stripped = str(orig).strip()
+        if not stripped:
+            continue
+        if stripped in seen_codes:
+            continue
+        seen_codes.add(stripped)
+        normalized_codes.append((orig, stripped))
+    if not normalized_codes:
+        raise ApiError(INVALID_ARGUMENT, "typeCodes 不能为空")
+
+    # 4. 批量类型预检：存在性 + applies_to 匹配（不检查 is_active，历史材料可查）
+    problems = []
+    valid_types = {}  # code -> MaterialType
+    for orig, code in normalized_codes:
+        mtype = MaterialType.objects.filter(code=code).first()
+        if mtype is None:
+            problems.append({
+                "field": "type_codes",
+                "value": orig,
+                "reason": f"材料类型 {code} 不存在",
+            })
+            continue
+        if mtype.applies_to != owner_type:
+            problems.append({
+                "field": "type_codes",
+                "value": orig,
+                "reason": f"材料类型 {code} 不适用于 {owner_type} 归属",
+            })
+            continue
+        valid_types[code] = mtype
+    if problems:
+        raise ApiError(INVALID_ARGUMENT, "材料类型校验失败", problems)
+
+    # 5. 数据范围：解析归属对象并校验范围
+    scope = _material_scope(account)
+    OwnerModel = Person if owner_type == "PERSON" else Team
+    owners = OwnerModel.objects.filter(pk__in=parsed_ids, is_deleted=False)
+    owner_map = {o.pk: o for o in owners}
+    for oid in parsed_ids:
+        owner = owner_map.get(oid)
+        if owner is not None:
+            _ensure_owner_in_scope(owner, scope)
+
+    # 6. 查询材料（不增加 type__is_active 过滤；is_active=False 历史材料可查）
+    MaterialModel = PersonMaterial if owner_type == "PERSON" else TeamMaterial
+    owner_field = "person_id" if owner_type == "PERSON" else "team_id"
+    valid_codes = list(valid_types.keys())
+    materials_qs = (
+        MaterialModel.objects.filter(
+            is_deleted=False,
+            **{f"{owner_field}__in": parsed_ids},
+            type__code__in=valid_codes,
+        )
+        .select_related("type")
+    )
+    materials_qs = _apply_scope(materials_qs, owner_type, scope)
+
+    # 7. 排序：owner_id ASC → type_code ASC → updated_at DESC → material_id DESC
+    material_rows = sorted(
+        materials_qs,
+        key=lambda m: (
+            getattr(m, owner_field),
+            m.type.code,
+            -m.updated_at.timestamp() if m.updated_at else 0,
+            -m.pk,
+        ),
+    )
+
+    # 8. 构建 items（恰好 8 字段）
+    items = []
+    owner_ids_with_materials = set()
+    for m in material_rows:
+        oid = getattr(m, owner_field)
+        owner_ids_with_materials.add(oid)
+        items.append({
+            "owner_id": oid,
+            "material_id": m.pk,
+            "type_code": m.type.code,
+            "status": m.status,
+            "need_audit": m.type.need_audit,
+            "allow_multiple": m.type.allow_multiple,
+            "file_id": m.file_id,
+            "updated_at": m.updated_at.isoformat() if m.updated_at else None,
+        })
+
+    # 9. missing_owner_ids：无有效材料记录的归属 ID，按去重后输入顺序
+    missing_owner_ids = [oid for oid in parsed_ids if oid not in owner_ids_with_materials]
+
+    return {"items": items, "missing_owner_ids": missing_owner_ids}
+
+
 # ---------------------------------------------------------------- 创建
 
 def material_create(payload: dict, account) -> tuple:
@@ -405,40 +547,71 @@ def material_review(material_id: str, payload: dict, account) -> tuple:
     """审核：仅 PENDING 可处理；APPROVE/REJECT → APPROVED/REJECTED + 审核历史。
 
     前端 body 无归属类型字段，多态由 _get_material_any 双表解析。
+
+    P1-5 防自审：对象加锁读取、版本校验、状态校验、自审审计校验、状态变更与
+    留痕全部在同一事务内执行，select_for_update 锁定待审核材料行。
     """
     scope = _material_scope(account)
     from apps.persons.services import ensure_version, parse_path_id
 
+    # 多态解析 + 数据范围在事务外完成（不写库）；事务内重新加锁读取，
+    # 避免在未加锁的对象上做状态判断。
     material, kind = _get_material_any(parse_path_id(material_id, "materialId"))
     _ensure_owner_in_scope(
         material.person if kind == "PERSON" else material.team, scope
     )
-    ensure_version(material, payload["version"])
-    if material.status != enums.MaterialStatus.PENDING:
-        raise ApiError(
-            STATE_CONFLICT,
-            f"材料当前状态为 {material.status}，仅待审核（PENDING）材料可处理",
-        )
-    decision = payload["decision"]
-    reason = (payload.get("reason") or "").strip()
-    if decision == "REJECT" and not reason:
-        raise ApiError(
-            INVALID_ARGUMENT,
-            "驳回材料必须填写审核意见",
-            [{"field": "reason", "reason": "REJECT 时必填"}],
-        )
-    from_status = material.status
-    material.status = (
-        enums.MaterialStatus.APPROVED
-        if decision == "APPROVE"
-        else enums.MaterialStatus.REJECTED
-    )
-    material.audit_remark = reason
-    # audited_by 为"逻辑引用"列恒空：底座账号 ID 映射未定（同 persons 先例）
-    material.audited_at = timezone.now()
-    # 状态变更与审核留痕同一事务：日志落库失败 → 状态/版本整体回滚到审核前，
-    # 不留下"已改状态、无留痕"的半完成审核结果
     with transaction.atomic():
+        # 按归属类型重新加锁读取，保留 select_related 供后续字段访问
+        if kind == "PERSON":
+            locked = (
+                PersonMaterial.objects.select_for_update()
+                .select_related("person", "type")
+                .filter(pk=material.pk, is_deleted=False)
+                .first()
+            )
+        else:
+            locked = (
+                TeamMaterial.objects.select_for_update()
+                .select_related("team", "type")
+                .filter(pk=material.pk, is_deleted=False)
+                .first()
+            )
+        if locked is None:
+            raise ApiError(NOT_FOUND, "材料不存在或已删除")
+        material = locked
+        ensure_version(material, payload["version"])
+        if material.status != enums.MaterialStatus.PENDING:
+            raise ApiError(
+                STATE_CONFLICT,
+                f"材料当前状态为 {material.status}，仅待审核（PENDING）材料可处理",
+            )
+        # 防自审：纳入 material.create / material.update；
+        # material.remove 不纳入（软删后材料不可审核）。
+        assert_not_self_review(
+            account,
+            "Material",
+            f"{kind}:{material.pk}",
+            ("material.create", "material.update"),
+        )
+        decision = payload["decision"]
+        reason = (payload.get("reason") or "").strip()
+        if decision == "REJECT" and not reason:
+            raise ApiError(
+                INVALID_ARGUMENT,
+                "驳回材料必须填写审核意见",
+                [{"field": "reason", "reason": "REJECT 时必填"}],
+            )
+        from_status = material.status
+        material.status = (
+            enums.MaterialStatus.APPROVED
+            if decision == "APPROVE"
+            else enums.MaterialStatus.REJECTED
+        )
+        material.audit_remark = reason
+        # audited_by 为"逻辑引用"列恒空：底座账号 ID 映射未定（同 persons 先例）
+        material.audited_at = timezone.now()
+        # 状态变更与审核留痕同一事务：日志落库失败 → 状态/版本整体回滚到审核前，
+        # 不留下"已改状态、无留痕"的半完成审核结果
         material.save()
         MaterialAuditLog.objects.create(
             material_kind=kind,
