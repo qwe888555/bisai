@@ -332,24 +332,11 @@ def material_list(filters: dict, account) -> list:
 
 # ---------------------------------------------------------------- 阶段 1 批量查询
 
-def material_batch_query(owner_type, owner_ids, type_codes, account) -> dict:
-    """阶段 1：多归属多类型材料批量查询（只读，不替换 material_list）。
+def _validate_batch_query_args(owner_type, owner_ids, type_codes) -> tuple:
+    """批量查询入参校验（步骤1-4），返回 (parsed_ids, valid_types)。
 
-    入参契约（见《材料域阶段 1 完整契约清单》）：
-    - owner_type: 仅 "PERSON"/"TEAM"（大小写敏感），非法 → 400 INVALID_ARGUMENT
-    - owner_ids: list 或 tuple，元素必须为正整数；拒绝 bool/浮点数/数字字符串；
-      任一非法元素整体 400 拒绝（不跳过）；去重保序；不增加额外业务上限。
-    - type_codes: list 或 tuple；逐元素 strip()，空串丢弃，去重保序；
-      规范化后无有效码 → 400 INVALID_ARGUMENT。
-    - 批量类型预检：不存在 / applies_to 不匹配 → 400，problems 数组按输入顺序，
-      每条 {"field":"type_codes","value":"<原始输入值>","reason":"<原因>"}。
-    - 返回 {"items":[...8字段...], "missing_owner_ids":[...]}。
-      items 字段：owner_id(int)、material_id、type_code、status、need_audit、
-      allow_multiple、file_id、updated_at(ISO8601 isoformat)。
-      排序：owner_id ASC → type_code ASC → updated_at DESC → material_id DESC。
-      missing_owner_ids：输入归属 ID 中无有效材料记录者，按去重后输入顺序。
-    - MaterialType.is_active=False 的历史材料仍可查询（不增加 is_active 过滤）。
-    - 数据范围复用 _material_scope / _ensure_owner_in_scope；异常向上传播。
+    供 material_batch_query（账号级）与 material_batch_query_internal
+    （系统级）共用；校验契约见 material_batch_query docstring。
     """
     # 1. owner_type 校验
     if owner_type not in ("PERSON", "TEAM"):
@@ -413,30 +400,26 @@ def material_batch_query(owner_type, owner_ids, type_codes, account) -> dict:
         valid_types[code] = mtype
     if problems:
         raise ApiError(INVALID_ARGUMENT, "材料类型校验失败", problems)
+    return parsed_ids, valid_types
 
-    # 5. 数据范围：解析归属对象并校验范围
-    scope = _material_scope(account)
-    OwnerModel = Person if owner_type == "PERSON" else Team
-    owners = OwnerModel.objects.filter(pk__in=parsed_ids, is_deleted=False)
-    owner_map = {o.pk: o for o in owners}
-    for oid in parsed_ids:
-        owner = owner_map.get(oid)
-        if owner is not None:
-            _ensure_owner_in_scope(owner, scope)
 
+def _batch_query_materials(parsed_ids: list, valid_types: dict, owner_type: str, scope=None) -> dict:
+    """批量查询主体（步骤6-9），返回 items + missing_owner_ids。
+
+    scope 传 None 时为系统级查询（不叠加数据范围）；账号级入口传
+    _material_scope(account) 结果以保持原行为。
+    """
     # 6. 查询材料（不增加 type__is_active 过滤；is_active=False 历史材料可查）
     MaterialModel = PersonMaterial if owner_type == "PERSON" else TeamMaterial
     owner_field = "person_id" if owner_type == "PERSON" else "team_id"
     valid_codes = list(valid_types.keys())
-    materials_qs = (
-        MaterialModel.objects.filter(
-            is_deleted=False,
-            **{f"{owner_field}__in": parsed_ids},
-            type__code__in=valid_codes,
-        )
-        .select_related("type")
-    )
-    materials_qs = _apply_scope(materials_qs, owner_type, scope)
+    materials_qs = MaterialModel.objects.filter(
+        is_deleted=False,
+        **{f"{owner_field}__in": parsed_ids},
+        type__code__in=valid_codes,
+    ).select_related("type")
+    if scope is not None:
+        materials_qs = _apply_scope(materials_qs, owner_type, scope)
 
     # 7. 排序：owner_id ASC → type_code ASC → updated_at DESC → material_id DESC
     material_rows = sorted(
@@ -470,6 +453,52 @@ def material_batch_query(owner_type, owner_ids, type_codes, account) -> dict:
     missing_owner_ids = [oid for oid in parsed_ids if oid not in owner_ids_with_materials]
 
     return {"items": items, "missing_owner_ids": missing_owner_ids}
+
+
+def material_batch_query_internal(owner_type, owner_ids, type_codes) -> dict:
+    """阶段 1 系统级批量查询（只读，无账号数据范围）。
+
+    与 material_batch_query 的差异：不做 _material_scope / 归属范围校验，
+    供无请求账号的系统级校验使用（报名预检/终审；persons 域
+    person_audit_snapshot 同款先例）。入参校验、类型预检、items/排序/
+    missing_owner_ids 契约与账号级完全一致。
+    """
+    parsed_ids, valid_types = _validate_batch_query_args(owner_type, owner_ids, type_codes)
+    return _batch_query_materials(parsed_ids, valid_types, owner_type)
+
+
+def material_batch_query(owner_type, owner_ids, type_codes, account) -> dict:
+    """阶段 1：多归属多类型材料批量查询（只读，不替换 material_list）。
+
+    入参契约（见《材料域阶段 1 完整契约清单》）：
+    - owner_type: 仅 "PERSON"/"TEAM"（大小写敏感），非法 → 400 INVALID_ARGUMENT
+    - owner_ids: list 或 tuple，元素必须为正整数；拒绝 bool/浮点数/数字字符串；
+      任一非法元素整体 400 拒绝（不跳过）；去重保序；不增加额外业务上限。
+    - type_codes: list 或 tuple；逐元素 strip()，空串丢弃，去重保序；
+      规范化后无有效码 → 400 INVALID_ARGUMENT。
+    - 批量类型预检：不存在 / applies_to 不匹配 → 400，problems 数组按输入顺序，
+      每条 {"field":"type_codes","value":"<原始输入值>","reason":"<原因>"}。
+    - 返回 {"items":[...8字段...], "missing_owner_ids":[...]}。
+      items 字段：owner_id(int)、material_id、type_code、status、need_audit、
+      allow_multiple、file_id、updated_at(ISO8601 isoformat)。
+      排序：owner_id ASC → type_code ASC → updated_at DESC → material_id DESC。
+      missing_owner_ids：输入归属 ID 中无有效材料记录者，按去重后输入顺序。
+    - MaterialType.is_active=False 的历史材料仍可查询（不增加 is_active 过滤）。
+    - 数据范围复用 _material_scope / _ensure_owner_in_scope；异常向上传播。
+    """
+    parsed_ids, valid_types = _validate_batch_query_args(owner_type, owner_ids, type_codes)
+
+    # 5. 数据范围：解析归属对象并校验范围
+    scope = _material_scope(account)
+    OwnerModel = Person if owner_type == "PERSON" else Team
+    owners = OwnerModel.objects.filter(pk__in=parsed_ids, is_deleted=False)
+    owner_map = {o.pk: o for o in owners}
+    for oid in parsed_ids:
+        owner = owner_map.get(oid)
+        if owner is not None:
+            _ensure_owner_in_scope(owner, scope)
+
+    return _batch_query_materials(parsed_ids, valid_types, owner_type, scope)
 
 
 # ---------------------------------------------------------------- 创建
