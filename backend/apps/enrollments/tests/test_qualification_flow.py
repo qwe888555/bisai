@@ -879,3 +879,64 @@ def test_rejected_and_withdrawn_still_operable(client, auth):
     assert _qualify(
         client, school, enrollment_id, item.pk, "CONFIRM", _version(item.pk)
     ).status_code == 200  # 幂等 no-op 200（已有有效凭证）
+
+
+# ---------------------------------------------------------------- 状态守护（2026-10-31）
+
+
+def test_no_action_writes_pending_verification(client, auth):
+    """回归守护（非完备性证明）：静态核查确认全仓唯一资格状态写入入口
+    是 qualify_roster，其四操作均不产生 PENDING_VERIFICATION；本用例
+    守护该入口的四条合法路径与新建行默认值不被回归破坏，不宣称证明
+    "系统在任何路径下都不会写入该状态"（导入/未来新增写入点需另行
+    守护）。"""
+    school = auth("university")
+    enrollment_id = complete_draft(client, school, players=6)
+    items = _items(enrollment_id)
+    assert {i.qualification_status for i in items} == {QUALIFICATION_QUALIFIED}
+
+    first, second = items[0], items[1]
+    assert _qualify(
+        client, school, enrollment_id, first.pk, "REJECT", _version(first.pk), "驳回"
+    ).status_code == 200
+    assert _qualify(
+        client, school, enrollment_id, first.pk, "CONFIRM", _version(first.pk)
+    ).status_code == 200
+    assert _qualify(
+        client, school, enrollment_id, first.pk, "REVOKE", _version(first.pk), "撤销"
+    ).status_code == 200
+    assert _qualify(
+        client, school, enrollment_id, second.pk, "EXCLUDE", _version(second.pk), "剔除"
+    ).status_code == 200
+
+    statuses = set(
+        RosterItem.objects.filter(enrollment_id=enrollment_id).values_list(
+            "qualification_status", flat=True
+        )
+    )
+    assert "PENDING_VERIFICATION" not in statuses
+    assert statuses <= {QUALIFICATION_QUALIFIED, QUALIFICATION_DISQUALIFIED, QUALIFICATION_EXCLUDED}
+
+
+def test_final_review_message_for_disqualified(client, auth):
+    """DISQUALIFIED 终审消息明确指向"资格不符（已被驳回）"，阻断不变。"""
+    school = auth("university")
+    enrollment_id = complete_draft(client, school)
+    item = _item(enrollment_id)
+    assert _qualify(
+        client, school, enrollment_id, item.pk, "REJECT", _version(item.pk), "资格材料不符"
+    ).status_code == 200
+
+    from apps.enrollments import precheck
+
+    issues = precheck.double_track_issues(Enrollment.objects.get(pk=enrollment_id))
+    hit = [
+        i
+        for i in issues
+        if i.get("athleteId") == item.athlete_id
+        and i.get("field") == "qualificationStatus"
+    ]
+    assert hit, issues
+    assert hit[0]["severity"] == "ERROR"
+    assert "资格不符" in hit[0]["message"]
+    assert "已被驳回" in hit[0]["message"]

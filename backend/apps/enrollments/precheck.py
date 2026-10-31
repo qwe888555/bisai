@@ -25,6 +25,7 @@ from apps.persons.services import person_audit_snapshot
 from .clients import event_config_client, material_client, person_client
 from .models import (
     ACTIVE_STATUSES,
+    QUALIFICATION_DISQUALIFIED,
     QUALIFICATION_EXCLUDED,
     QUALIFICATION_QUALIFIED,
     RosterItem,
@@ -450,11 +451,18 @@ def double_track_issues(enrollment) -> list[dict]:
             )
     for item in active:
         if item.qualification_status != QUALIFICATION_QUALIFIED:
+            # 消息按状态区分（2026-10-31）：DISQUALIFIED 为人工驳回结果，
+            # 出口是重新确认（CONFIRM）或先 EXCLUDE 剔除名单；其余非
+            # QUALIFIED 状态维持原口径。阻断行为不变（均 ERROR）。
+            if item.qualification_status == QUALIFICATION_DISQUALIFIED:
+                message = "存在资格不符（已被驳回）的人员，不能最终通过"
+            else:
+                message = "存在未完成资格核实的人员，不能最终通过"
             issues.append(
                 _issue(
                     "PLAYER_LIMIT",
                     ERROR,
-                    "存在未完成资格核实的人员，不能最终通过",
+                    message,
                     field="qualificationStatus",
                     athleteId=item.athlete_id,
                 )
