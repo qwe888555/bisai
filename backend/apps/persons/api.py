@@ -444,8 +444,14 @@ def people_search(request, body: s.PersonSearchBody):
     "/people/{person_id}", auth=_auth, response=EnvelopeOut, summary="人员档案详情"
 )
 def people_get(request, person_id: str):
+    """详情在 person_out 基础上追加只读派生字段 coachQualification
+    （问题#7，2026-10-31 裁定：仅 GET /people/{id} 输出，列表/搜索契约
+    不扩散；四态语义见 services.coach_qualification）。"""
     account = require("personGet")
-    return ok(s.person_out(services.get_person(person_id, account)))
+    person = services.get_person(person_id, account)
+    data = s.person_out(person)
+    data["coachQualification"] = services.coach_qualification(person)
+    return ok(data)
 
 
 # 写操作权限点按契约文档登记（personCreate/personUpdate/personDelete：

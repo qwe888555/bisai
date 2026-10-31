@@ -17,6 +17,7 @@ from __future__ import annotations
 from datetime import date, datetime
 from typing import Optional
 
+from django.core.exceptions import ObjectDoesNotExist
 from django.db import transaction
 from django.db.models import Count, Exists, JSONField, OuterRef, Q, QuerySet, Subquery
 from django.utils import timezone
@@ -617,6 +618,36 @@ def get_person(person_id: str, account):
     if obj is None:
         raise ApiError(NOT_FOUND)
     return obj
+
+
+def coach_qualification(person) -> str:
+    """教练资格派生（问题#7，2026-10-31 裁定 + 2026-10-31 二轮修正）：四态只读派生。
+
+    零落库零迁移，不新增第五种状态：
+    - MISSING：无教练扩展档案行（非教练/未建教练档案），或证书编号与
+      有效期均未登记（certificate_no 与 certificate_expire_date 皆空）；
+    - UNKNOWN：证书信息不完整——有证书编号但未登记有效期，或仅有有效期
+      而未登记证书编号（二轮修正：原先"有日期无证号"归 MISSING，
+      按裁定改为 UNKNOWN，视为证书信息不完整而非无证书）；
+    - VALID / EXPIRED：证书编号已登记，以当前业务日期为基准
+      （settings.TIME_ZONE=Asia/Shanghai，timezone.localdate() 随配置生效）：
+      certificate_expire_date >= 今日 → VALID（有效期至当日含当日有效，
+      次日零点起过期），< 今日 → EXPIRED；
+    - 派生字段只读：不新增数据库字段、不写 CoachProfile、不参与
+      audit_status 与报名资格（enrollments.qualification_status）逻辑。
+    """
+    try:
+        profile = person.coach_profile
+    except ObjectDoesNotExist:
+        return "MISSING"
+    cert_no = (profile.certificate_no or "").strip()
+    expire = profile.certificate_expire_date
+    if not cert_no:
+        # 证号+有效期皆空=无证书 MISSING；仅有有效期=信息不完整 UNKNOWN
+        return "UNKNOWN" if expire is not None else "MISSING"
+    if expire is None:
+        return "UNKNOWN"
+    return "VALID" if expire >= timezone.localdate() else "EXPIRED"
 
 
 def get_own_person(person_id: str):
