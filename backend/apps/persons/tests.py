@@ -3927,6 +3927,140 @@ class CoachQualificationTests(TestCase):
             self.assertNotIn("coachQualification", item)
 
 
+class PersonCoachAffiliationTests(TestCase):
+    """主档归属回归（问题#8，2026-10-31 裁定）：Person.school 为人员主档
+    学校及审核归属；TeamCoach 跨校关联不改变主档归属，他校学校端账号
+    不能因跨校执教关系访问该教练档案。不涉及 TeamCoach CRUD 行为变更。
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        province = Region.objects.create(name="戊省", code="980000", level=1)
+        cls.city = Region.objects.create(
+            name="戊市甲", code="980100", level=2, parent=province
+        )
+        cls.school_a = School.objects.create(
+            name="戊甲一小", code="SCH-980100-801", school_type="PRIMARY", region=cls.city
+        )
+        cls.school_b = School.objects.create(
+            name="戊乙一小", code="SCH-980100-802", school_type="PRIMARY", region=cls.city
+        )
+        cls.org_school_a = Organization.objects.create(
+            id=new_organization_id(),
+            name="戊甲一小组织",
+            org_type="SCHOOL",
+            code=cls.school_a.code,
+        )
+        cls.org_school_b = Organization.objects.create(
+            id=new_organization_id(),
+            name="戊乙一小组织",
+            org_type="SCHOOL",
+            code=cls.school_b.code,
+        )
+        cls.team_b = Team.objects.create(
+            team_no="T202600000901",
+            name="戊乙一队",
+            category_code="PRIMARY",
+            school=cls.school_b,
+            region=cls.city,
+        )
+        cls.coach = Person.objects.create(
+            person_no="P202600000902",
+            full_name="戊教练",
+            school=cls.school_a,
+            id_card_cipher=encrypt_text("110101198501019811"),
+            id_card_hash=lookup_hash("110101198501019811"),
+            id_card_masked=mask_id_number("110101198501019811"),
+            person_category=enums.PersonCategory.COACH,
+            audit_status=enums.AuditStatus.APPROVED,
+        )
+        CoachProfile.objects.create(person=cls.coach)
+        cls.uni_a = Account.objects.create(
+            id=new_account_id(),
+            username="aff-uni-a",
+            roles=["UNIVERSITY"],
+            organization=cls.org_school_a,
+            password=make_password("aff-pass-123"),
+            enabled=True,
+        )
+        cls.uni_b = Account.objects.create(
+            id=new_account_id(),
+            username="aff-uni-b",
+            roles=["UNIVERSITY"],
+            organization=cls.org_school_b,
+            password=make_password("aff-pass-123"),
+            enabled=True,
+        )
+        cls.uni_a_token = issue_access_token(cls.uni_a)[0]
+        cls.uni_b_token = issue_access_token(cls.uni_b)[0]
+
+    def _get(self, person_id, token):
+        return self.client.get(
+            f"{PEOPLE}/{person_id}",
+            **{"HTTP_AUTHORIZATION": f"Bearer {token}"},
+        )
+
+    def test_other_school_cannot_access_cross_affiliated_coach_profile(self):
+        """他校学校端账号不能访问跨校执教教练的档案（主档归属收敛访问范围）。
+
+        教练主档在 school_a，TeamCoach 关联 school_b 球队；school_b 端账号
+        详情 404（get_person 口径：范围外不存在），school_a 端账号正常。
+        """
+        TeamCoach.objects.create(
+            team=self.team_b,
+            person=self.coach,
+            duty=enums.CoachDuty.HEAD_COACH,
+            joined_at=date(2026, 3, 1),
+        )
+        resp_b = self._get(self.coach.pk, self.uni_b_token)
+        self.assertEqual(resp_b.status_code, 404)
+        self.assertEqual(resp_b.json()["code"], "NOT_FOUND")
+
+        resp_a = self._get(self.coach.pk, self.uni_a_token)
+        self.assertEqual(resp_a.status_code, 200, resp_a.content)
+        self.assertEqual(resp_a.json()["data"]["schoolName"], "戊甲一小")
+
+    def test_cross_school_teamcoach_does_not_change_master_school(self):
+        """TeamCoach 跨校关联不改变人员主档归属：person.school 保持 school_a。
+
+        同时验证审核归属随主档：school_b 端无法写入该教练档案（403 范围校验）。
+        """
+        from apps.persons.schemas import person_version
+
+        TeamCoach.objects.create(
+            team=self.team_b,
+            person=self.coach,
+            duty=enums.CoachDuty.ASSISTANT_COACH,
+            joined_at=date(2026, 3, 2),
+        )
+        self.coach.refresh_from_db()
+        self.assertEqual(self.coach.school_id, self.school_a.pk)
+        # 输出层同步验证主档归属未漂移
+        resp = self._get(self.coach.pk, self.uni_a_token)
+        self.assertEqual(resp.status_code, 200, resp.content)
+        data = resp.json()["data"]
+        self.assertEqual(data["schoolName"], "戊甲一小")
+        self.assertEqual(data["kinds"], ["COACH"])
+        # 审核归属随主档：school_b 端写链被数据范围拦截
+        resp_b = self.client.put(
+            f"{PEOPLE}/{self.coach.pk}",
+            data=json.dumps(
+                {
+                    "kinds": ["COACH"],
+                    "realName": "戊教练改",
+                    "version": person_version(self.coach),
+                }
+            ),
+            content_type="application/json",
+            **{"HTTP_AUTHORIZATION": f"Bearer {self.uni_b_token}"},
+        )
+        self.assertEqual(resp_b.status_code, 403)
+        self.assertEqual(resp_b.json()["code"], "DATA_SCOPE_DENIED")
+        self.coach.refresh_from_db()
+        self.assertEqual(self.coach.full_name, "戊教练")
+        self.assertEqual(self.coach.school_id, self.school_a.pk)
+
+
 class AuditTransactionConsistencyTests(TestCase):
     """审计事务一致性（风险5 修订方案，2026-10-31 有条件批准）T1-T3。
 
