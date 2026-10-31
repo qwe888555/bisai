@@ -463,14 +463,12 @@ register_operation("personReview", (UNIVERSITY, ADMIN))
 @router.post("/people", auth=_auth, response=EnvelopeOut, summary="创建人员档案")
 def people_create(request, body: s.PersonCreate):
     account = require("personCreate")
+    # 风险5 修订（2026-10-31 有条件批准）：审计声明前置（服务层成功返回前
+    # 无法预知 object_id）——服务层事务内写 SUCCESS 审计并在此撤销声明防
+    # 中间件重复；服务层异常时不撤销，中间件按原行为落 FAILURE（无 object_id）。
+    audit_state(request, "person.create", object_type="Person", summary="创建人员档案")
     person = services.create_person(body.model_dump(), account)
-    audit_state(
-        request,
-        "person.create",
-        object_type="Person",
-        object_id=str(person.pk),
-        summary=f"创建人员 {person.full_name}({person.person_no})",
-    )
+    audit_state(request, None)
     return ok(s.person_out(person))
 
 
@@ -606,14 +604,14 @@ def my_profile_confirm(request, body: s.ProfileConfirmation):
     person_id = _own_person_id(account)
     if not person_id:
         raise ApiError(PROFILE_BINDING_REQUIRED)
-    person = services.confirm_own_person(person_id, body.version)
+    # 风险5 修订：审计声明前置（object_id 服务层成功前不可预知）——服务层
+    # 事务内写 SUCCESS 审计，成功返回后撤销声明防中间件重复；异常不撤销，
+    # 中间件按原行为落 FAILURE。account 入参供 operator_account_id 取值。
     audit_state(
-        request,
-        "person.self_confirm",
-        object_type="Person",
-        object_id=str(person.pk),
-        summary=f"本人确认档案 {person.full_name}",
+        request, "person.self_confirm", object_type="Person", summary="本人确认档案"
     )
+    person = services.confirm_own_person(person_id, body.version, account)
+    audit_state(request, None)
     return ok(s.person_out(person))
 
 

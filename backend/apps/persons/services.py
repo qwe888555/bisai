@@ -27,6 +27,7 @@ from apps.common.errors import (
     BUSINESS_VALIDATION_FAILED,
     DATA_SCOPE_DENIED,
     DUPLICATE_RESOURCE,
+    FORBIDDEN,
     INVALID_ARGUMENT,
     NOT_FOUND,
     PROFILE_BINDING_REQUIRED,
@@ -36,8 +37,9 @@ from apps.common.errors import (
     field_errors,
 )
 from apps.common.permissions import ATHLETE, COACH, TEAM
+from apps.common.ids import new_id
 from apps.common.scopes import account_org_code, is_global_admin, visible_school_codes
-from apps.accounts.models import Account, Organization
+from apps.accounts.models import Account, AuditLog, Organization
 from apps.notices.models import push_message
 from apps.persons.models import (
     AthleteProfile,
@@ -971,6 +973,13 @@ def create_person(payload: dict, account):
         if avatar:
             _bind_avatar(avatar, person)
         _log_change(person, enums.ChangeType.CREATE, None)
+        # 风险5：person.create 审计与建档同事务（字段对齐中间件 _write 实码）
+        _audit_in_transaction(
+            "person.create",
+            person.pk,
+            getattr(account, "pk", "") or "",
+            f"创建人员 {person.full_name}({person.person_no})",
+        )
     return person
 
 
@@ -1327,7 +1336,7 @@ def update_own_person(person_id: str, payload: dict):
     return people_queryset().filter(pk=person.pk).first()
 
 
-def confirm_own_person(person_id: str, version: int):
+def confirm_own_person(person_id: str, version: int, account):
     """POST /me/profile-confirmation：本人确认档案，提交进入复核。
 
     语义依据链：create_person 初值 audit_status=DRAFT（本模块写链）+ 前端
@@ -1346,20 +1355,43 @@ def confirm_own_person(person_id: str, version: int):
       不强制"先修改过档案"——系统无法可靠判定实质修改，原 B3 未决项就此定稿）；
       PENDING → 幂等成功（前端按钮该状态可点，重复提交无副作用：状态不变、
       不重复写 ChangeLog；实现选择在案）；
-    - 留痕：状态变化写 _log_change（audit_status old/new）；审计走 API 层。
+    - 风险5 修订（2026-10-31 有条件批准）：绑定解析与全部校验移入
+      transaction.atomic 并对 Person 行 select_for_update 锁行重查——
+      获锁后重检绑定（未绑定/软删→403）、版本号、状态机；与 review_person
+      锁同一行，构成"提交先提交、审核后获锁"的串行顺序（MySQL REPEATABLE
+      READ 下审核事务对 AuditLog 的首次读发生在获锁之后，快照必含最新已
+      提交审计；SQLite 无行锁语义，验证边界见测试与报告）；
+    - 审计事务化（风险5）：atomic 内经 _audit_in_transaction 写
+      person.self_confirm SUCCESS 审计，与 Person/PersonChangeLog 同连接
+      同事务；幂等重复确认同样写 SUCCESS 审计，语义=请求成功处理而非状态
+      变化（2026-10-31 裁定保留）；API 层成功返回后
+      audit_state(request, None) 撤销中间件声明防重复，服务层异常不撤销。
+    - 留痕：状态变化写 _log_change（audit_status old/new）。
     """
-    person = people_queryset().filter(pk=parse_path_id(person_id)).first()
-    if person is None:
-        raise ApiError(PROFILE_BINDING_REQUIRED)
-    ensure_version(person, version)
-    current = person.audit_status
-    if current == enums.AuditStatus.APPROVED:
-        raise ApiError(STATE_CONFLICT, "档案已复核，无需重复确认")
-    if current == enums.AuditStatus.PENDING:
-        return person  # 幂等：已处于待复核，无状态变化
-    # REJECTED 落到此处=驳回后重提（问题#2 裁定 c）：再次确认即回 PENDING
-    resubmit = current == enums.AuditStatus.REJECTED
     with transaction.atomic():
+        person = (
+            people_queryset()
+            .select_for_update()
+            .filter(pk=parse_path_id(person_id))
+            .first()
+        )
+        if person is None:
+            raise ApiError(PROFILE_BINDING_REQUIRED)
+        ensure_version(person, version)
+        current = person.audit_status
+        if current == enums.AuditStatus.APPROVED:
+            raise ApiError(STATE_CONFLICT, "档案已复核，无需重复确认")
+        if current == enums.AuditStatus.PENDING:
+            # 幂等：已处于待复核，无状态变化（审计仍记请求成功，不写 ChangeLog）
+            _audit_in_transaction(
+                "person.self_confirm",
+                person.pk,
+                getattr(account, "pk", "") or "",
+                f"本人确认档案 {person.full_name}",
+            )
+            return person
+        # REJECTED 落到此处=驳回后重提（问题#2 裁定 c）：再次确认即回 PENDING
+        resubmit = current == enums.AuditStatus.REJECTED
         person.audit_status = enums.AuditStatus.PENDING
         person.save()
         _log_change(
@@ -1374,8 +1406,87 @@ def confirm_own_person(person_id: str, version: int):
             ],
             reason="本人确认档案（驳回后重提）" if resubmit else "本人确认档案",
         )
+        _audit_in_transaction(
+            "person.self_confirm",
+            person.pk,
+            getattr(account, "pk", "") or "",
+            f"本人确认档案 {person.full_name}",
+        )
     # 重查取 save 后的 updated_at（派生 version 与持久化结果一致）
     return people_queryset().filter(pk=person.pk).first()
+
+
+def _audit_in_transaction(action: str, person_pk, operator_account_id: str, summary: str) -> None:
+    """服务层事务内审计（风险5 修订方案，2026-10-31 有条件批准）。
+
+    与业务写链同一数据库连接、同一 atomic 块：AuditLog 与 Person/
+    PersonChangeLog 同生共死——审计写失败向外抛异常、业务整体回滚，
+    消除"业务成功、审计丢失"的静默窗口（原 AuditMiddleware._write 在
+    get_response 返回后另起写入且整体 try/except 吞错）。
+    字段赋值对齐 AuditMiddleware._write 实码（common/middleware.py
+    L163-172，非推测）：id=new_id("log")、log_type="OPERATION"（中间件
+    默认值）、action/object_type/object_id 截断口径一致、summary 直出
+    （中间件同样不截断）、outcome 由响应码映射——事务内业务成立恒 SUCCESS。
+    中间件防重复：API 层在服务层成功返回后 audit_state(request, None)
+    撤销本请求的审计声明，_write 首行守卫（action 为空即跳过）自然生效
+    ——零通用模块修改、无 ContextVar；服务层异常时不撤销，中间件按原
+    行为落 FAILURE。action/object_type/object_id 与 _assert_not_self_review
+    查询口径逐字一致（"person.create"/"person.self_confirm" + "Person"）。
+    """
+    AuditLog.objects.create(
+        id=new_id("log"),
+        log_type="OPERATION",
+        operator_account_id=operator_account_id,
+        action=action[:100],
+        object_type="Person",
+        object_id=str(person_pk)[:64],
+        summary=summary or "",
+        outcome="SUCCESS",
+    )
+
+
+def _assert_not_self_review(person, account) -> None:
+    """防自审自批（问题#5，2026-10-31 裁定）：禁止审核自己创建或最近一次提交的档案。
+
+    追溯口径（AuditLog 只读查询，不新增表/字段/迁移）：
+    - 入口覆盖（裁定核实项①②）：person.create（POST /people，API 层
+      audit_state）为唯一建档入口；person.self_confirm（POST
+      /me/profile-confirmation）为唯一 DRAFT/REJECTED→PENDING 提交入口，
+      驳回后重提走同一入口（services.confirm_own_person）；seed 脚本直造
+      数据不经 API、无审计日志（属缺日志场景，见下）；
+    - 查询限定（裁定核实项③）：object_type="Person" + object_id=人员ID +
+      outcome="SUCCESS"（失败请求审计落 FAILURE，不构成创建/提交事实），
+      三条件同时命中方计入；
+    - 最近一次提交（裁定核实项④）：created_at 倒序取首条（AuditLog.id 为
+      随机 uuid 非时间序，不可作排序键）；PENDING 幂等重复确认同样落
+      SUCCESS 日志，但操作者恒为档案绑定本人，与最近一次提交者同向，不漏判；
+    - 缺日志处理（裁定核实项⑤）：查无创建/提交记录时无法确立可比较的
+      操作者身份，不做拦截——这是"无证据可判"，不是绕过：数据范围
+      （_get_person_for_write）、状态机、乐观锁与本函数之后的事务
+      PersonChangeLog(AUDIT) 行保护全部保留；
+    - 仅作用于人员档案审批（review_person），不扩展到材料审核。
+    """
+    entries = AuditLog.objects.filter(
+        object_type="Person",
+        object_id=str(person.pk),
+        outcome="SUCCESS",
+    ).filter(Q(action="person.create") | Q(action="person.self_confirm"))
+    creator_id = (
+        entries.filter(action="person.create")
+        .order_by("-created_at")
+        .values_list("operator_account_id", flat=True)
+        .first()
+    )
+    last_submitter_id = (
+        entries.filter(action="person.self_confirm")
+        .order_by("-created_at")
+        .values_list("operator_account_id", flat=True)
+        .first()
+    )
+    account_id = getattr(account, "pk", "") or ""
+    # account_id 非空才比较：日志 operator 缺失（空串）不得与空值账号互相命中
+    if account_id and account_id in (creator_id, last_submitter_id):
+        raise ApiError(FORBIDDEN, "不得审核自己创建或提交的人员档案")
 
 
 def review_person(person_id: str, payload: dict, account):
@@ -1388,35 +1499,59 @@ def review_person(person_id: str, payload: dict, account):
     - 状态机（裁定 b）：仅 PENDING 可审——DRAFT 须本人先确认（409），
       APPROVED/REJECTED 终态（409）；REJECTED 重提=本人再次确认回 PENDING；
     - REJECT 必填原因（400，同 material_review）；
+    - 防自审自批（问题#5，2026-10-31 裁定）：仅 PENDING 进入实质审批时校验
+      "审核者 ≠ 创建者 且 ≠ 最近一次提交者"（_assert_not_self_review，
+      403 FORBIDDEN），ADMIN 走同一入口同受限制；状态机之后校验，
+      DRAFT/终态仍按 409 口径返回，已有行为不变；
     - 状态变更与 PersonChangeLog(AUDIT) 同事务：日志落库失败整体回滚，
-      不留"已改状态、无留痕"的半完成审批（同 material_review）；审计走 API 层。
+      不留"已改状态、无留痕"的半完成审批（同 material_review）；审批自身
+      审计（person.review）仍走 API 层，与自审判定无依赖；
+    - 风险5 修订（2026-10-31 有条件批准）：对象解析与全部校验移入
+      transaction.atomic 并对 Person 行 select_for_update 锁行——获锁后
+      重检软删/存在（404）、数据范围（403，内联 _get_person_for_write
+      原口径）、版本号（409）、状态机（409），错误码优先级与原实现一致；
+      _assert_not_self_review 在获锁之后首次读取 AuditLog（裁定第 5 条：
+      锁前不得读自审依据）——MySQL REPEATABLE READ 下快照此时才建立，
+      必含获锁前已提交的最新提交审计，与 confirm_own_person 的行锁构成
+      "提交先提交、审核后获锁"的串行顺序；SQLite 无行锁语义，验证边界
+      见测试类说明与报告。
     """
-    person = _get_person_for_write(person_id, account)
-    ensure_version(person, payload["version"])
-    current = person.audit_status
-    if current == enums.AuditStatus.DRAFT:
-        raise ApiError(
-            STATE_CONFLICT, "档案未经本人确认，须先由本人提交复核后方可审批"
-        )
-    if current != enums.AuditStatus.PENDING:
-        raise ApiError(
-            STATE_CONFLICT,
-            f"档案当前状态为 {current}，仅待复核（PENDING）档案可审批",
-        )
-    decision = payload["decision"]
-    reason = (payload.get("reason") or "").strip()
-    if decision == "REJECT" and not reason:
-        raise ApiError(
-            INVALID_ARGUMENT,
-            "驳回档案必须填写审核意见",
-            field_errors([("reason", "REJECT 时必填")]),
-        )
-    target = (
-        enums.AuditStatus.APPROVED
-        if decision == "APPROVE"
-        else enums.AuditStatus.REJECTED
-    )
     with transaction.atomic():
+        person = (
+            people_queryset()
+            .select_for_update()
+            .filter(pk=parse_path_id(person_id))
+            .first()
+        )
+        if person is None:
+            raise ApiError(NOT_FOUND)
+        if not apply_person_scope(Person.objects.filter(pk=person.pk), account).exists():
+            raise ApiError(DATA_SCOPE_DENIED, "人员不在当前账号数据范围内")
+        ensure_version(person, payload["version"])
+        current = person.audit_status
+        if current == enums.AuditStatus.DRAFT:
+            raise ApiError(
+                STATE_CONFLICT, "档案未经本人确认，须先由本人提交复核后方可审批"
+            )
+        if current != enums.AuditStatus.PENDING:
+            raise ApiError(
+                STATE_CONFLICT,
+                f"档案当前状态为 {current}，仅待复核（PENDING）档案可审批",
+            )
+        _assert_not_self_review(person, account)
+        decision = payload["decision"]
+        reason = (payload.get("reason") or "").strip()
+        if decision == "REJECT" and not reason:
+            raise ApiError(
+                INVALID_ARGUMENT,
+                "驳回档案必须填写审核意见",
+                field_errors([("reason", "REJECT 时必填")]),
+            )
+        target = (
+            enums.AuditStatus.APPROVED
+            if decision == "APPROVE"
+            else enums.AuditStatus.REJECTED
+        )
         person.audit_status = target
         person.save()
         _log_change(
