@@ -2934,6 +2934,10 @@ class PersonReviewTests(TestCase):
         self.assertFalse(self._audit_log(self.p_pending_a).exists())
 
     # ------------------------------------------------------------ P1-5 防自审
+    # （2026-10-31 裁定 B 口径移植）：证据=person.create（创建人）+
+    # person.self_confirm（最近一次提交人，created_at 倒序取首条，仅 SUCCESS）；
+    # person.update / person.self_update 不构成证据；缺日志=无可比较操作者
+    # 身份，放行（数据范围/状态机/乐观锁仍生效）。
 
     def _set_creator_audit(self, person, action, operator_account_id):
         """覆盖/补录一条人员创建/修改审计记录（用于自审场景构造）。"""
@@ -2965,32 +2969,35 @@ class PersonReviewTests(TestCase):
         self.assertEqual(self.p_pending_a.audit_status, enums.AuditStatus.PENDING)
         self.assertEqual(self._audit_log(self.p_pending_a).count(), before)
 
-    def test_self_review_blocked_when_updater_is_reviewer(self):
-        """同账号 person.update 后由该账号审核 → 403。"""
+    def test_self_review_allowed_when_updater_is_reviewer(self):
+        """person.update 不构成自审证据（B 口径）：他人 create + 审核人本人
+        update 过该档案 → 审核 200 放行。"""
         self._set_creator_audit(self.p_pending_a, "person.update", self.uni_a.pk)
         resp = self._post(
             f"{PEOPLE}/{self.p_pending_a.pk}/review",
             self._body(self.p_pending_a),
             token=self.uni_a_token,
         )
-        self.assertEqual(resp.status_code, 403)
-        self.assertEqual(resp.json()["code"], "FORBIDDEN")
+        self.assertEqual(resp.status_code, 200)
+        self.p_pending_a.refresh_from_db()
+        self.assertEqual(self.p_pending_a.audit_status, enums.AuditStatus.APPROVED)
 
-    def test_self_review_blocked_when_self_updater_is_reviewer(self):
-        """同账号 person.self_update 后由该账号审核 → 403。"""
+    def test_self_review_allowed_when_self_updater_is_reviewer(self):
+        """person.self_update 不构成自审证据（B 口径）：审核人本人
+        self_update 过该档案 → 审核 200 放行。"""
         self._set_creator_audit(self.p_pending_a, "person.self_update", self.uni_a.pk)
         resp = self._post(
             f"{PEOPLE}/{self.p_pending_a.pk}/review",
             self._body(self.p_pending_a),
             token=self.uni_a_token,
         )
-        self.assertEqual(resp.status_code, 403)
-        self.assertEqual(resp.json()["code"], "FORBIDDEN")
+        self.assertEqual(resp.status_code, 200)
+        self.p_pending_a.refresh_from_db()
+        self.assertEqual(self.p_pending_a.audit_status, enums.AuditStatus.APPROVED)
 
-    def test_self_review_allowed_when_only_self_confirm(self):
-        """person.self_confirm 不纳入自审判定：他人 create + 审核人 self_confirm
-        时审核 → 200（self_confirm 不算修改证据，不触发自审阻断）。"""
-        # 保留原 person.create（operator=admin），追加一条审核人本人的 self_confirm
+    def test_self_review_blocked_when_latest_submitter_is_reviewer(self):
+        """person.self_confirm 构成提交证据（B 口径）：他人 create + 审核人
+        最近一次 self_confirm → 审核 403。"""
         AuditLog.objects.create(
             id=f"log-p-confirm-{self.p_pending_a.pk}",
             log_type="OPERATION",
@@ -3005,12 +3012,14 @@ class PersonReviewTests(TestCase):
             self._body(self.p_pending_a),
             token=self.uni_a_token,
         )
-        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json()["code"], "FORBIDDEN")
         self.p_pending_a.refresh_from_db()
-        self.assertEqual(self.p_pending_a.audit_status, enums.AuditStatus.APPROVED)
+        self.assertEqual(self.p_pending_a.audit_status, enums.AuditStatus.PENDING)
 
-    def test_review_blocked_without_audit_log(self):
-        """无任何成功创建/修改审计记录 → 403 阻断（不自动放行）。"""
+    def test_self_review_allowed_without_audit_log(self):
+        """无任何创建/提交审计记录 → 放行 200（B 口径：缺日志=无可比较
+        操作者身份，属"无证据可判"而非绕过）。"""
         AuditLog.objects.filter(
             object_type="Person", object_id=str(self.p_pending_a.pk)
         ).delete()
@@ -3019,10 +3028,43 @@ class PersonReviewTests(TestCase):
             self._body(self.p_pending_a),
             token=self.uni_a_token,
         )
-        self.assertEqual(resp.status_code, 403)
-        self.assertEqual(resp.json()["code"], "FORBIDDEN")
+        self.assertEqual(resp.status_code, 200)
         self.p_pending_a.refresh_from_db()
-        self.assertEqual(self.p_pending_a.audit_status, enums.AuditStatus.PENDING)
+        self.assertEqual(self.p_pending_a.audit_status, enums.AuditStatus.APPROVED)
+
+    def test_self_review_uses_latest_submitter_only(self):
+        """多次提交取最近一次：早期 uni_a self_confirm + 最新 admin
+        self_confirm → uni_a 审核 200 放行（早期提交不构成证据）。"""
+        AuditLog.objects.create(
+            id=f"log-p-confirm-early-{self.p_pending_a.pk}",
+            log_type="OPERATION",
+            operator_account_id=str(self.uni_a.pk),
+            action="person.self_confirm",
+            object_type="Person",
+            object_id=str(self.p_pending_a.pk),
+            outcome="SUCCESS",
+        )
+        # 时序保证：早期条目 created_at 提前（AuditLog.id 为随机 uuid，不可作排序键）
+        AuditLog.objects.filter(
+            id=f"log-p-confirm-early-{self.p_pending_a.pk}"
+        ).update(created_at=timezone.now() - timedelta(minutes=5))
+        AuditLog.objects.create(
+            id=f"log-p-confirm-latest-{self.p_pending_a.pk}",
+            log_type="OPERATION",
+            operator_account_id=str(self.admin.pk),
+            action="person.self_confirm",
+            object_type="Person",
+            object_id=str(self.p_pending_a.pk),
+            outcome="SUCCESS",
+        )
+        resp = self._post(
+            f"{PEOPLE}/{self.p_pending_a.pk}/review",
+            self._body(self.p_pending_a),
+            token=self.uni_a_token,
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.p_pending_a.refresh_from_db()
+        self.assertEqual(self.p_pending_a.audit_status, enums.AuditStatus.APPROVED)
 
     def test_self_review_blocked_for_multi_role_account(self):
         """同账号拥有 ADMIN+UNIVERSITY 双角色，自己创建后自己审核 → 403。"""
