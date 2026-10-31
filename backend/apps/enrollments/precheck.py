@@ -150,28 +150,33 @@ def run_precheck(enrollment) -> dict[str, Any]:
                 )
             )
 
-    # 1) 材料必需性（契约内两类）
+    # 1) 材料必需性（全量遍历 requiredMaterialTypes，方案 B 2026-10-31）：
+    #    两类报名附件承载类型缺失 → MISSING_MATERIAL ERROR 阻断提交（原口径）；
+    #    未知类型（无效配置，无报名附件承载无法核验）→ QUALIFICATION_PENDING
+    #    WARNING 软提示待人工核对，不臆造缺失、不阻断提交。
     required = list(rules.get("requiredMaterialTypes") or [])
-    has_stamped = any(a.material_type == "STAMPED_FORM" for a in attachments)
-    has_student = any(a.material_type == "STUDENT_STATUS" for a in attachments) or any(
-        (item.student_status_file_ids or []) for item in players
-    )
     for material_type in required:
-        if material_type == "STAMPED_FORM" and not has_stamped:
+        evidence = _material_evidence(material_type, attachments, players)
+        if evidence is None:
             issues.append(
                 _issue(
-                    "MISSING_MATERIAL",
-                    ERROR,
-                    "缺少球队报名表与名单（盖章）材料",
+                    "QUALIFICATION_PENDING",
+                    WARNING,
+                    f"必需材料类型 {material_type} 不在报名附件体系内，"
+                    "配置无效，待人工核对",
                     field="materialType",
                 )
             )
-        elif material_type == "STUDENT_STATUS" and not has_student:
+        elif not evidence:
+            if material_type == "STAMPED_FORM":
+                message = "缺少球队报名表与名单（盖章）材料"
+            else:
+                message = "缺少学籍证明材料"
             issues.append(
                 _issue(
                     "MISSING_MATERIAL",
                     ERROR,
-                    "缺少学籍证明材料",
+                    message,
                     field="materialType",
                 )
             )
@@ -355,6 +360,24 @@ def run_precheck(enrollment) -> dict[str, Any]:
     }
 
 
+def _material_evidence(
+    material_type: str, attachments: list, players: list
+) -> Optional[bool]:
+    """必需材料的报名附件证据判定（提交预检与终审重验共享口径）。
+
+    返回 True/False 表示证据齐备与否；None 表示该类型不在报名附件体系
+    内（无效/未知配置，本域数据无法核验）。STUDENT_STATUS 同时认可报名
+    附件与名单行 student_status_file_ids 两种承载。
+    """
+    if material_type == "STAMPED_FORM":
+        return any(a.material_type == "STAMPED_FORM" for a in attachments)
+    if material_type == "STUDENT_STATUS":
+        return any(a.material_type == "STUDENT_STATUS" for a in attachments) or any(
+            (item.student_status_file_ids or []) for item in players
+        )
+    return None
+
+
 def _normalize_name(value: Optional[str]) -> str:
     return "".join((value or "").split())
 
@@ -370,8 +393,10 @@ def double_track_issues(enrollment) -> list[dict]:
       的 mock 测试替身生态（athlete_id 为 per_test_* 等假 id）放行——
       该边界仅限测试替身，真实链路必须能核验到档案（不能把 mock 通过
       宣称为真实跨域集成已验证）；
-    - requiredMaterialTypes 声明的必需材料在终审时按报名附件重验存在性
-      （当前两类均为报名附件体系，非材料域审核对象——清单边界见报告）；
+    - requiredMaterialTypes 声明的必需材料在终审时按共享证据口径
+      （_material_evidence）重验存在性：STUDENT_STATUS 认可报名附件与
+      名单行 student_status_file_ids，与提交预检一致（当前两类均为报名
+      附件体系，非材料域审核对象——清单边界见报告）；
     - E-2 资格确认硬门槛（v7，2026-10-28）：QUALIFIED 且确认凭证缺失/单侧
       无效 → QUALIFICATION_NOT_CONFIRMED ERROR（双条件
       confirmed_at + confirmed_by；REVOKE 后状态仍 QUALIFIED 但凭证失效，
@@ -452,11 +477,26 @@ def double_track_issues(enrollment) -> list[dict]:
             )
     rules = event_config_client.get_group_rules(enrollment.event_id, enrollment.group_id)
 
-    # 必需材料终审重验（存在性硬校验，不依赖早先预检缓存）
+    # 必需材料终审重验（存在性硬校验，不依赖早先预检缓存）。
+    # 与提交预检共享 _material_evidence 口径（方案 B 2026-10-31）：
+    # STUDENT_STATUS 同时认可报名附件与名单行 student_status_file_ids
+    # （修复两侧比对差异）；未知类型无报名附件承载、无法核验，按
+    # fail-closed ERROR 处理（终审不得放行无法核验的必需项）。
     attachments = list(enrollment.attachments.all())
     required = list(rules.get("requiredMaterialTypes") or [])
     for material_type in required:
-        if not any(a.material_type == material_type for a in attachments):
+        evidence = _material_evidence(material_type, attachments, players)
+        if evidence is None:
+            issues.append(
+                _issue(
+                    "MISSING_MATERIAL",
+                    ERROR,
+                    f"必需材料 {material_type} 不在报名附件体系内，"
+                    "配置无效，不能最终通过",
+                    field="materialType",
+                )
+            )
+        elif not evidence:
             issues.append(
                 _issue(
                     "MISSING_MATERIAL",
