@@ -1205,12 +1205,12 @@ def confirm_own_person(person_id: str, version: int):
       "只有已验证绑定的本人可确认"；错误码/状态映射/默认消息均已在
       common/errors 预留——与 myProfileGet 的 404 口径不同，按各自文档定稿）；
     - version 必填乐观锁（文档 ProfileConfirmation，同 /people 写链规则）；
-    - 状态分支：
+    - 状态分支（REJECTED 重提为问题#2 2026-10-31 裁定 c）：
       DRAFT → PENDING（提交复核）；
       APPROVED → 409 STATE_CONFLICT（前端按钮 disabled=reviewStatus==='APPROVED'，
       重复确认无业务意义）；
-      REJECTED → 409（驳回后本人能否自行重新提交待业务确认，保守拒绝，
-      待管理员链路；未决项在契约清单 B3 在案）；
+      REJECTED → PENDING（驳回后本人再次确认=重提，闭环"驳回→修改→重提→再审"；
+      不强制"先修改过档案"——系统无法可靠判定实质修改，原 B3 未决项就此定稿）；
       PENDING → 幂等成功（前端按钮该状态可点，重复提交无副作用：状态不变、
       不重复写 ChangeLog；实现选择在案）；
     - 留痕：状态变化写 _log_change（audit_status old/new）；审计走 API 层。
@@ -1222,10 +1222,10 @@ def confirm_own_person(person_id: str, version: int):
     current = person.audit_status
     if current == enums.AuditStatus.APPROVED:
         raise ApiError(STATE_CONFLICT, "档案已复核，无需重复确认")
-    if current == enums.AuditStatus.REJECTED:
-        raise ApiError(STATE_CONFLICT, "档案已被驳回，请联系管理员处理")
     if current == enums.AuditStatus.PENDING:
         return person  # 幂等：已处于待复核，无状态变化
+    # REJECTED 落到此处=驳回后重提（问题#2 裁定 c）：再次确认即回 PENDING
+    resubmit = current == enums.AuditStatus.REJECTED
     with transaction.atomic():
         person.audit_status = enums.AuditStatus.PENDING
         person.save()
@@ -1239,7 +1239,58 @@ def confirm_own_person(person_id: str, version: int):
                     "new": enums.AuditStatus.PENDING.value,
                 }
             ],
-            reason="本人确认档案",
+            reason="本人确认档案（驳回后重提）" if resubmit else "本人确认档案",
+        )
+    # 重查取 save 后的 updated_at（派生 version 与持久化结果一致）
+    return people_queryset().filter(pk=person.pk).first()
+
+
+def review_person(person_id: str, payload: dict, account):
+    """POST /people/{id}/review：学校端档案审批（问题#2，2026-10-31 裁定 a/b/c）。
+
+    - 权限：personReview=(UNIVERSITY, ADMIN)，与材料审核方案 i 同口径，
+      市州/省不参与档案审批（避免两级重复审）；
+    - 数据范围：_get_person_for_write（404/403 口径，学校端仅本校组织子树）；
+    - version 必填乐观锁（缺失/非法=400，不匹配=409）；
+    - 状态机（裁定 b）：仅 PENDING 可审——DRAFT 须本人先确认（409），
+      APPROVED/REJECTED 终态（409）；REJECTED 重提=本人再次确认回 PENDING；
+    - REJECT 必填原因（400，同 material_review）；
+    - 状态变更与 PersonChangeLog(AUDIT) 同事务：日志落库失败整体回滚，
+      不留"已改状态、无留痕"的半完成审批（同 material_review）；审计走 API 层。
+    """
+    person = _get_person_for_write(person_id, account)
+    ensure_version(person, payload["version"])
+    current = person.audit_status
+    if current == enums.AuditStatus.DRAFT:
+        raise ApiError(
+            STATE_CONFLICT, "档案未经本人确认，须先由本人提交复核后方可审批"
+        )
+    if current != enums.AuditStatus.PENDING:
+        raise ApiError(
+            STATE_CONFLICT,
+            f"档案当前状态为 {current}，仅待复核（PENDING）档案可审批",
+        )
+    decision = payload["decision"]
+    reason = (payload.get("reason") or "").strip()
+    if decision == "REJECT" and not reason:
+        raise ApiError(
+            INVALID_ARGUMENT,
+            "驳回档案必须填写审核意见",
+            field_errors([("reason", "REJECT 时必填")]),
+        )
+    target = (
+        enums.AuditStatus.APPROVED
+        if decision == "APPROVE"
+        else enums.AuditStatus.REJECTED
+    )
+    with transaction.atomic():
+        person.audit_status = target
+        person.save()
+        _log_change(
+            person,
+            enums.ChangeType.AUDIT,
+            [{"field": "audit_status", "old": str(current), "new": target.value}],
+            reason=reason or "审批通过",
         )
     # 重查取 save 后的 updated_at（派生 version 与持久化结果一致）
     return people_queryset().filter(pk=person.pk).first()

@@ -455,6 +455,9 @@ def people_get(request, person_id: str):
 register_operation("personCreate", (TEAM, UNIVERSITY, CITY, PROVINCE_REVIEWER, ADMIN))
 register_operation("personUpdate", (TEAM, UNIVERSITY, CITY, PROVINCE_REVIEWER, ADMIN))
 register_operation("personDelete", (TEAM, UNIVERSITY, CITY, PROVINCE_REVIEWER, ADMIN))
+# 档案审批（问题#2，2026-10-31 裁定 a）：学校端+ADMIN，市州/省不参与
+# （与材料审核方案 i 同口径，避免两级重复审）；数据范围服务层二次校验。
+register_operation("personReview", (UNIVERSITY, ADMIN))
 
 
 @router.post("/people", auth=_auth, response=EnvelopeOut, summary="创建人员档案")
@@ -507,6 +510,22 @@ def people_delete(request, person_id: str, version: Optional[int] = Query(None, 
         summary="删除人员档案（软删）",
     )
     return action_result(True, person_id)
+
+
+@router.post(
+    "/people/{person_id}/review", auth=_auth, response=EnvelopeOut, summary="审批人员档案"
+)
+def people_review(request, person_id: str, body: s.PersonReviewBody):
+    account = require("personReview")
+    person = services.review_person(person_id, body.model_dump(), account)
+    audit_state(
+        request,
+        "person.review",
+        object_type="Person",
+        object_id=str(person.pk),
+        summary=f"档案审批 {person.full_name} → {person.audit_status}",
+    )
+    return ok(s.person_out(person))
 
 
 # ---------------------------------------------------------------- 本人档案（/me/profile）

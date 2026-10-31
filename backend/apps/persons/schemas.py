@@ -281,6 +281,21 @@ class ProfileConfirmation(StrictSchema):
     version: int = Field(ge=0)
 
 
+class PersonReviewBody(StrictSchema):
+    """POST /people/{id}/review 请求（问题#2，2026-10-31 裁定 a/b/c）。
+
+    - version 必填乐观锁（与 /people 写链同规则：缺失/非法=400，不匹配=409）；
+    - decision APPROVE/REJECT → audit_status APPROVED/REJECTED；REJECT 时
+      reason 必填（服务层校验，同 materials MaterialReviewBody）；
+    - 仅 PENDING 可审：DRAFT 须本人先经 /me/profile-confirmation 提交复核；
+      APPROVED/REJECTED 为终态，REJECTED 重提走本人再次确认回 PENDING。
+    """
+
+    decision: Literal["APPROVE", "REJECT"]
+    reason: Optional[str] = Field(None, max_length=200)
+    version: int = Field(ge=0)
+
+
 def _synthesized_kinds(person) -> list[str]:
     """kinds 合成（方案C）：扩展档案行存在性为事实源，固定 ATHLETE→COACH 顺序。
 

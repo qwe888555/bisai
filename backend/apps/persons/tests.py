@@ -2084,8 +2084,12 @@ class MyProfileApiTests(TestCase):
         self.athlete.refresh_from_db()
         self.assertEqual(self.athlete.audit_status, enums.AuditStatus.APPROVED)
 
-    def test_confirm_rejected_returns_state_conflict(self):
-        """REJECTED → 409：驳回后本人能否重新提交待业务确认（保守拒绝，未决项 B3）。"""
+    def test_confirm_rejected_resubmit_moves_to_pending(self):
+        """REJECTED → 本人再次确认 → PENDING（问题#2 2026-10-31 裁定 c：驳回后重提）。
+
+        闭环"驳回→修改→重提→再审"；不强制先修改档案（系统无法可靠判定
+        实质修改）；ChangeLog reason 区分重提场景。
+        """
         from apps.persons.schemas import person_version
 
         rejected = Person.objects.create(
@@ -2110,10 +2114,18 @@ class MyProfileApiTests(TestCase):
             {"version": person_version(rejected)},
             token=issue_access_token(rejected_user)[0],
         )
-        self.assertEqual(resp.status_code, 409)
-        self.assertEqual(resp.json()["code"], "STATE_CONFLICT")
+        self.assertEqual(resp.status_code, 200, resp.content)
+        data = resp.json()["data"]
+        self.assertEqual(data["reviewStatus"], "PENDING")
         rejected.refresh_from_db()
-        self.assertEqual(rejected.audit_status, enums.AuditStatus.REJECTED)
+        self.assertEqual(rejected.audit_status, enums.AuditStatus.PENDING)
+        log = PersonChangeLog.objects.filter(
+            person=rejected, change_type=enums.ChangeType.UPDATE
+        ).latest("id")
+        self.assertEqual(log.reason, "本人确认档案（驳回后重提）")
+        entry = next(c for c in log.field_changes if c["field"] == "audit_status")
+        self.assertEqual(entry["old"], "REJECTED")
+        self.assertEqual(entry["new"], "PENDING")
 
     def test_confirm_pending_is_idempotent_no_new_changelog(self):
         """PENDING 重复确认 → 幂等成功：状态不变、无新 ChangeLog（实现选择在案）。"""
@@ -2246,6 +2258,331 @@ class MyProfileApiTests(TestCase):
         resp = self.client.get(self.ME_TEAMS, **self._auth(self.norel_token))
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.json()["data"], [])
+
+
+class PersonReviewApiTests(TestCase):
+    """POST /people/{id}/review 学校端档案审批（问题#2，2026-10-31 裁定 a/b/c）。
+
+    权限 personReview=(UNIVERSITY, ADMIN)、市州/省不参与（裁定 a，同材料
+    方案 i）；仅 PENDING 可审、DRAFT 须本人先确认（裁定 b）；REJECT 必填
+    原因；REJECTED 重提=本人再次确认回 PENDING（裁定 c）。
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        region = Region.objects.create(name="丙省", code="820000", level=1)
+        cls.school = School.objects.create(
+            name="丙一小", code="SCH-820100-401", school_type="PRIMARY", region=region
+        )
+        # 映射夹具：org.code = School.code（schoolOrgId 按组织节点 ID）
+        cls.org_school = Organization.objects.create(
+            id=new_organization_id(),
+            name="丙一小组织",
+            org_type="SCHOOL",
+            code="SCH-820100-401",
+        )
+        other_school = School.objects.create(
+            name="丙二小", code="SCH-820100-402", school_type="PRIMARY", region=region
+        )
+        cls.org_school_other = Organization.objects.create(
+            id=new_organization_id(),
+            name="丙二小组织",
+            org_type="SCHOOL",
+            code="SCH-820100-402",
+        )
+        cls.admin = Account.objects.create(
+            id=new_account_id(),
+            username="review-admin",
+            roles=["ADMIN"],
+            password=make_password("review-pass-123"),
+            enabled=True,
+        )
+        cls.uni = Account.objects.create(
+            id=new_account_id(),
+            username="review-uni",
+            roles=["UNIVERSITY"],
+            organization=cls.org_school,
+            password=make_password("review-pass-123"),
+            enabled=True,
+        )
+        cls.uni_other = Account.objects.create(
+            id=new_account_id(),
+            username="review-uni-other",
+            roles=["UNIVERSITY"],
+            organization=cls.org_school_other,
+            password=make_password("review-pass-123"),
+            enabled=True,
+        )
+        cls.city = Account.objects.create(
+            id=new_account_id(),
+            username="review-city",
+            roles=["CITY"],
+            password=make_password("review-pass-123"),
+            enabled=True,
+        )
+        cls.admin_token = issue_access_token(cls.admin)[0]
+        cls.uni_token = issue_access_token(cls.uni)[0]
+        cls.uni_other_token = issue_access_token(cls.uni_other)[0]
+        cls.city_token = issue_access_token(cls.city)[0]
+
+    @staticmethod
+    def _auth(token):
+        return {"HTTP_AUTHORIZATION": f"Bearer {token}"} if token else {}
+
+    def _create_person(self, **overrides):
+        """走 POST /people 建档（DRAFT 起步），返回 (响应data, Person行)。"""
+        payload = {
+            "kinds": ["ATHLETE"],
+            "realName": "赵审批",
+            "idNumber": "110101201305017777",
+            "schoolOrgId": str(self.org_school.pk),
+        }
+        payload.update(overrides)
+        resp = self.client.post(
+            PEOPLE,
+            data=json.dumps(payload),
+            content_type="application/json",
+            **self._auth(self.admin_token),
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        data = resp.json()["data"]
+        return data, Person.objects.get(pk=int(data["id"]))
+
+    def _confirm_as_self(self, person):
+        """本人确认（DRAFT→PENDING 提交复核；REJECTED→PENDING 重提）。
+
+        username 随机后缀：同一 person 在重提闭环等场景会二次确认，
+        避免账号名撞 UNIQUE 约束。
+        """
+        from apps.persons.schemas import person_version
+
+        user = Account.objects.create(
+            id=new_account_id(),
+            username=f"review-self-{person.pk}-{new_account_id()[:8]}",
+            display_name=person.full_name,
+            roles=["ATHLETE"],
+            password=make_password("review-pass-123"),
+            enabled=True,
+            person_id=str(person.pk),
+        )
+        return self.client.post(
+            ME_PROFILE_CONFIRM,
+            data=json.dumps({"version": person_version(person)}),
+            content_type="application/json",
+            **self._auth(issue_access_token(user)[0]),
+        )
+
+    def _pending_person(self):
+        """前置：建档 → 本人确认 → PENDING。"""
+        _, person = self._create_person()
+        resp = self._confirm_as_self(person)
+        self.assertEqual(resp.status_code, 200, resp.content)
+        person.refresh_from_db()
+        return person
+
+    def _review(self, person_id, payload, token=None):
+        return self.client.post(
+            f"{PEOPLE}/{person_id}/review",
+            data=json.dumps(payload),
+            content_type="application/json",
+            **self._auth(token or self.uni_token),
+        )
+
+    # ------------------------------------------------------------ 主链
+
+    def test_review_approve_success_full_chain(self):
+        """主链：建档 DRAFT → 本人确认 PENDING → 学校端 APPROVE → APPROVED。"""
+        from apps.persons.schemas import person_version
+
+        person = self._pending_person()
+        before = person_version(person)
+        resp = self._review(str(person.pk), {"decision": "APPROVE", "version": before})
+        self.assertEqual(resp.status_code, 200, resp.content)
+        data = resp.json()["data"]
+        self.assertEqual(data["reviewStatus"], "APPROVED")
+        person.refresh_from_db()
+        self.assertEqual(data["version"], person_version(person))
+        self.assertGreater(person_version(person), before)
+        # AUDIT 留痕（old=PENDING/new=APPROVED）+ API 层审计
+        log = PersonChangeLog.objects.filter(
+            person=person, change_type=enums.ChangeType.AUDIT
+        ).latest("id")
+        self.assertEqual(log.reason, "审批通过")
+        entry = next(c for c in log.field_changes if c["field"] == "audit_status")
+        self.assertEqual(entry["old"], "PENDING")
+        self.assertEqual(entry["new"], "APPROVED")
+        self.assertTrue(
+            AuditLog.objects.filter(
+                action="person.review", object_id=str(person.pk)
+            ).exists()
+        )
+
+    def test_review_reject_with_reason_success(self):
+        """REJECT 带原因 → REJECTED；ChangeLog 留存审核意见。"""
+        from apps.persons.schemas import person_version
+
+        person = self._pending_person()
+        resp = self._review(
+            str(person.pk),
+            {
+                "decision": "REJECT",
+                "reason": "姓名与学籍不一致",
+                "version": person_version(person),
+            },
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertEqual(resp.json()["data"]["reviewStatus"], "REJECTED")
+        person.refresh_from_db()
+        self.assertEqual(person.audit_status, enums.AuditStatus.REJECTED)
+        log = PersonChangeLog.objects.filter(
+            person=person, change_type=enums.ChangeType.AUDIT
+        ).latest("id")
+        self.assertEqual(log.reason, "姓名与学籍不一致")
+
+    def test_review_reject_without_reason_400(self):
+        """REJECT 必填原因（同 material_review 口径）；version 用真实值，
+        确保 400 来自 reason 校验而非乐观锁（服务层先 ensure_version）。"""
+        from apps.persons.schemas import person_version
+
+        person = self._pending_person()
+        resp = self._review(
+            str(person.pk),
+            {"decision": "REJECT", "version": person_version(person)},
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.json()["code"], "INVALID_ARGUMENT")
+        person.refresh_from_db()
+        self.assertEqual(person.audit_status, enums.AuditStatus.PENDING)
+
+    # ------------------------------------------------------------ 权限与范围
+
+    def test_review_out_of_scope_school_403(self):
+        """他校 UNIVERSITY 账号 → 403 DATA_SCOPE_DENIED（写链范围校验）。"""
+        person = self._pending_person()
+        resp = self._review(
+            str(person.pk),
+            {"decision": "APPROVE", "version": 0},
+            token=self.uni_other_token,
+        )
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json()["code"], "DATA_SCOPE_DENIED")
+        person.refresh_from_db()
+        self.assertEqual(person.audit_status, enums.AuditStatus.PENDING)
+
+    def test_review_city_forbidden_by_role(self):
+        """CITY 不在 personReview 角色集（裁定 a）→ 403 FORBIDDEN。"""
+        person = self._pending_person()
+        resp = self._review(
+            str(person.pk),
+            {"decision": "APPROVE", "version": 0},
+            token=self.city_token,
+        )
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json()["code"], "FORBIDDEN")
+
+    def test_review_admin_global_can_review(self):
+        """全局 ADMIN 在角色集内且数据范围不受限 → 可审本校档案。"""
+        from apps.persons.schemas import person_version
+
+        person = self._pending_person()
+        resp = self._review(
+            str(person.pk),
+            {"decision": "APPROVE", "version": person_version(person)},
+            token=self.admin_token,
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertEqual(resp.json()["data"]["reviewStatus"], "APPROVED")
+
+    # ------------------------------------------------------------ 状态机
+
+    def test_review_draft_state_conflict(self):
+        """裁定 b：DRAFT 不可直接审，须本人先提交复核。"""
+        from apps.persons.schemas import person_version
+
+        _, person = self._create_person()
+        resp = self._review(
+            str(person.pk),
+            {"decision": "APPROVE", "version": person_version(person)},
+        )
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(resp.json()["code"], "STATE_CONFLICT")
+        person.refresh_from_db()
+        self.assertEqual(person.audit_status, enums.AuditStatus.DRAFT)
+
+    def test_review_approved_terminal_409(self):
+        """APPROVED 终态不可再审。"""
+        from apps.persons.schemas import person_version
+
+        person = self._pending_person()
+        resp = self._review(
+            str(person.pk),
+            {"decision": "APPROVE", "version": person_version(person)},
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        person.refresh_from_db()
+        self.assertEqual(person.audit_status, enums.AuditStatus.APPROVED)
+
+        resp = self._review(
+            str(person.pk), {"decision": "APPROVE", "version": person_version(person)}
+        )
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(resp.json()["code"], "STATE_CONFLICT")
+        self.assertIn("仅待复核", resp.json()["message"])
+
+    def test_review_rejected_terminal_409(self):
+        """REJECTED 终态不可再审；重提路径=本人再次确认回 PENDING。"""
+        from apps.persons.schemas import person_version
+
+        person = self._pending_person()
+        resp = self._review(
+            str(person.pk),
+            {
+                "decision": "REJECT",
+                "reason": "材料不齐",
+                "version": person_version(person),
+            },
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        person.refresh_from_db()
+        self.assertEqual(person.audit_status, enums.AuditStatus.REJECTED)
+
+        resp = self._review(
+            str(person.pk), {"decision": "APPROVE", "version": person_version(person)}
+        )
+        self.assertEqual(resp.status_code, 409)
+        # 重提闭环：本人再次确认 → PENDING → 可再审
+        resp = self._confirm_as_self(person)
+        self.assertEqual(resp.status_code, 200, resp.content)
+        person.refresh_from_db()
+        self.assertEqual(person.audit_status, enums.AuditStatus.PENDING)
+        resp = self._review(
+            str(person.pk),
+            {"decision": "APPROVE", "version": person_version(person)},
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertEqual(resp.json()["data"]["reviewStatus"], "APPROVED")
+
+    def test_review_stale_version_409(self):
+        """过期 version → 409 VERSION_CONFLICT，状态不变。"""
+        from apps.persons.schemas import person_version
+
+        person = self._pending_person()
+        stale = person_version(person)
+        person.full_name = "赵审批改名"
+        person.save()
+        resp = self._review(str(person.pk), {"decision": "APPROVE", "version": stale})
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(resp.json()["code"], "VERSION_CONFLICT")
+        person.refresh_from_db()
+        self.assertEqual(person.audit_status, enums.AuditStatus.PENDING)
+        self.assertEqual(person.full_name, "赵审批改名")
+
+    def test_review_missing_version_400(self):
+        """version 缺失 → 400 统一校验错误（StrictSchema 必填）。"""
+        person = self._pending_person()
+        resp = self._review(str(person.pk), {"decision": "APPROVE"})
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.json()["code"], "INVALID_ARGUMENT")
 
 
 class DossierApiTests(TestCase):
