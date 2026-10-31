@@ -14,7 +14,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from typing import Optional
 
 from django.db import transaction
@@ -37,7 +37,8 @@ from apps.common.errors import (
 )
 from apps.common.permissions import ATHLETE, COACH, TEAM
 from apps.common.scopes import account_org_code, is_global_admin, visible_school_codes
-from apps.accounts.models import Organization
+from apps.accounts.models import Account, Organization
+from apps.notices.models import push_message
 from apps.persons.models import (
     AthleteProfile,
     CoachProfile,
@@ -977,7 +978,9 @@ def update_person(person_id: str, payload: dict, account):
     """PUT /people/{id}：版本校验 → 必填字段全量替换 + 可选字段缺省保留 → diff 留痕。
 
     idNumber 不接受（身份证变更走更正流程，一期不开放）；
-    education/coachCategory 落扩展档案 ext_json（预留扩展列，未传=保留原值）。
+    education/coachCategory 落扩展档案 ext_json（预留扩展列，未传=保留原值）；
+    问题#4：复审字段（姓名/出生日期/类别/学校/教练类别）实际变更时，
+    APPROVED 档案自动退回 PENDING（_apply_re_review_on_change）。
     """
     person = _get_person_for_write(person_id, account)
     ensure_version(person, payload["version"])
@@ -1005,8 +1008,9 @@ def update_person(person_id: str, payload: dict, account):
         track("gender", person.gender, gender_value)
         person.gender = gender_value
 
-        track("birthDate", person.birth_date, payload.get("birthDate"))
-        person.birth_date = payload.get("birthDate")
+        birth_value = _coerce_date(payload.get("birthDate"))
+        track("birthDate", person.birth_date, birth_value)
+        person.birth_date = birth_value
 
         track("kinds", old_kinds, kind_list)
         track("personCategory", person.person_category, primary_category)
@@ -1039,12 +1043,20 @@ def update_person(person_id: str, payload: dict, account):
         save_profile_ext_values(person, ext_updates)
         if avatar:
             _bind_avatar(avatar, person)
+        # 问题#4：复审字段实际变更 → APPROVED 退回 PENDING（与变更同事务）；
+        # 退回时 reason 追加明确后缀 + 站内信通知本人/学校端（遗留风险1 落地）
+        demoted = _apply_re_review_on_change(person, changes)
+        reason = (payload.get("changeReason") or "").strip()
+        if demoted:
+            reason = f"{reason}（复审字段变更，退回待审）".strip()
         _log_change(
             person,
             enums.ChangeType.UPDATE,
             changes,
-            reason=(payload.get("changeReason") or "").strip(),
+            reason=reason,
         )
+        if demoted:
+            _notify_re_review_return(person)
     # 重新查询：get_person 的 annotate（exists 快照）与 save 后的 updated_at
     # 都可能过期，返回值须反映建/删行后的真实合成 kinds 与新版本号
     return get_person(person_id, account)
@@ -1058,6 +1070,119 @@ def _change_entry(field: str, old, new) -> Optional[dict]:
     old_out = old.isoformat() if hasattr(old, "isoformat") else old
     new_out = new.isoformat() if hasattr(new, "isoformat") else new
     return {"field": field, "old": old_out, "new": new_out}
+
+
+def _apply_re_review_on_change(person, changes) -> bool:
+    """问题#4（2026-10-31 裁定）：复审字段实际变更 → APPROVED 自动退回 PENDING。
+
+    审核结论不因静默修改过期：与材料域"仅 PENDING 可改"哲学对齐，
+    档案侧以"改后重审"替代"禁止修改"（本人纠错不受阻，学校端重新把关）。
+
+    - 字段集：姓名/出生日期/身份类别(kinds)/主类别/学校/教练类别；
+      education 不触发（与问题清单"至少应算"口径一致，资格核心是教练类别）；
+    - 幂等：changes 只含 old!=new 的实际变更，值未变（表单全量回传）不触发；
+    - kinds 仅顺序变化（集合相同）不触发（遗留风险2 补充裁定：类别增删才是
+      资格实质变更，此时 personCategory=kinds 首项的漂移同步豁免）；
+    - 仅 APPROVED 退回：DRAFT/PENDING 本在待审轨道，REJECTED 待本人重提；
+      档案状态机无 CLOSED 态（AuditStatus 仅 DRAFT/PENDING/APPROVED/REJECTED，
+      2026-10-31 已核实枚举、DDL 注释与接口文档）——原报告"遗留风险3：CLOSED
+      档案冻结"前提不成立，REJECTED 改字段维持原状态即现行为（纠错走本人
+      重提链路，问题#2 已实现）；
+    - 退回条目（auditStatus old/new）并入同一条 UPDATE ChangeLog，调用点在
+      reason 追加"复审字段变更，退回待审"后缀，并经 _notify_re_review_return
+      发站内信通知本人与学校端（遗留风险1 落地，复用 notices.push_message）。
+    调用点：update_person / update_own_person 的 save_profile_ext_values 之后、
+    _log_change 之前（须在事务内，退回与变更同事务原子落库）。
+    """
+    re_review_fields = {
+        "realName",
+        "birthDate",
+        "kinds",
+        "personCategory",
+        "school",
+        "coachCategory",
+    }
+    triggered = {c["field"] for c in changes if c["field"] in re_review_fields}
+    kinds_entry = next((c for c in changes if c["field"] == "kinds"), None)
+    if kinds_entry and set(kinds_entry["old"] or []) == set(kinds_entry["new"] or []):
+        triggered.discard("kinds")
+        triggered.discard("personCategory")
+    if person.audit_status != enums.AuditStatus.APPROVED:
+        return False
+    if not triggered:
+        return False
+    changes.append(
+        {
+            "field": "auditStatus",
+            "old": enums.AuditStatus.APPROVED.value,
+            "new": enums.AuditStatus.PENDING.value,
+        }
+    )
+    person.audit_status = enums.AuditStatus.PENDING
+    person.save()
+    return True
+
+
+def _notify_re_review_return(person) -> None:
+    """复审退回站内信（遗留风险1 落地）：通知本人与学校端，复用 notices.push_message。
+
+    - 接收人：绑定该档案的启用账号（Account.person_id）+ 档案归属学校的组织
+      启用账号（Organization.code=school.code，code 全局唯一）——与 personReview
+      "学校端把关"口径一致；无绑定账号/无学校归属/学校无组织时静默跳过；
+    - 双重身份去重：既绑定档案又属学校组织的账号只收一条（本人口径优先）；
+    - 文案不含敏感字段明细（身份证/手机号不进消息体），字段明细走变更留痕；
+    - 调用点在事务内：消息与退回同事务原子落库（退回回滚则消息不残留）；
+    - 消息经现成 /me/messages 列表/详情/已读接口触达（notices 契约不变）。
+    """
+    own_ids = set(
+        Account.objects.filter(person_id=str(person.pk), enabled=True).values_list(
+            "pk", flat=True
+        )
+    )
+    school_ids: set[str] = set()
+    if person.school_id:
+        org = Organization.objects.filter(code=person.school.code).first()
+        if org is not None:
+            school_ids = set(
+                Account.objects.filter(
+                    organization_id=org.pk, enabled=True
+                ).values_list("pk", flat=True)
+            ) - own_ids
+    if not own_ids and not school_ids:
+        return
+    label = (
+        "运动员"
+        if person.person_category == enums.PersonCategory.ATHLETE.value
+        else "教练员"
+    )
+    for account_id in own_ids:
+        push_message(
+            account_id,
+            "人员档案已退回待审核",
+            "您的人员档案因信息变更已自动退回待审核，请等待重新审核。",
+            "PERSON",
+            str(person.pk),
+        )
+    for account_id in school_ids:
+        push_message(
+            account_id,
+            "本校人员档案退回待审核",
+            f"{label} {person.full_name} 的档案因信息变更已退回待审核，请及时复核。",
+            "PERSON",
+            str(person.pk),
+        )
+
+
+def _coerce_date(value):
+    """ISO 字符串 → date（写链同值回传的幂等比较用：date 与 str 直接比较恒
+    不等，会把未变化的出生日期误判为变更并在问题#4 下误触发复审）；
+    非字符串/非法格式原样返回，走原有赋值/报错路径。"""
+    if isinstance(value, str) and value:
+        try:
+            return date.fromisoformat(value[:10])
+        except ValueError:
+            return value
+    return value
 
 
 # ---- education / coachCategory 承载（扩展档案 ext_json 预留扩展列）----------
@@ -1146,6 +1271,8 @@ def update_own_person(person_id: str, payload: dict):
       业务错误（不再"200 OK 但字段未保存"，5.txt 问题一）；
     - education/coachCategory：落扩展档案 ext_json（预留扩展列，不动 DDL），
       未传=保留原值；读回见 person_out；
+    - 问题#4：复审字段（姓名/出生日期/教练类别）实际变更时，APPROVED 档案
+      自动退回 PENDING（_apply_re_review_on_change；本人入口触发面为字段集子集）；
     - 留痕复用 _log_change；审计走 API 层 audit_state。
     """
     person = people_queryset().filter(pk=parse_path_id(person_id)).first()
@@ -1173,10 +1300,11 @@ def update_own_person(person_id: str, payload: dict):
             changes.append(entry)
         person.gender = gender_value
 
-        entry = _change_entry("birthDate", person.birth_date, payload.get("birthDate"))
+        birth_value = _coerce_date(payload.get("birthDate"))
+        entry = _change_entry("birthDate", person.birth_date, birth_value)
         if entry:
             changes.append(entry)
-        person.birth_date = payload.get("birthDate")
+        person.birth_date = birth_value
 
         person.save()
         for key, value in ext_updates.items():
@@ -1184,12 +1312,17 @@ def update_own_person(person_id: str, payload: dict):
             if entry:
                 changes.append(entry)
         save_profile_ext_values(person, ext_updates)
+        # 问题#4：复审字段实际变更 → APPROVED 退回 PENDING（与变更同事务；
+        # 退回 reason 追加后缀 + 站内信通知，遗留风险1 同 update_person）
+        demoted = _apply_re_review_on_change(person, changes)
         _log_change(
             person,
             enums.ChangeType.UPDATE,
             changes,
-            reason="本人更新档案",
+            reason="本人更新档案（复审字段变更，退回待审）" if demoted else "本人更新档案",
         )
+        if demoted:
+            _notify_re_review_return(person)
     # 重查取 save 后的 updated_at（派生 version 必须与持久化结果一致）
     return people_queryset().filter(pk=person.pk).first()
 

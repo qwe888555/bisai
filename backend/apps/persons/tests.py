@@ -23,6 +23,7 @@ from apps.common.authentication import issue_access_token, make_password
 from apps.common.crypto import encrypt_text, lookup_hash, mask_id_number
 from apps.common.ids import new_account_id, new_file_id, new_organization_id
 from apps.materials.models import MaterialType, PersonMaterial
+from apps.notices.models import Message
 from apps.persons.models import (
     AthleteProfile,
     CoachProfile,
@@ -1718,7 +1719,9 @@ class MyProfileApiTests(TestCase):
         fields = {c["field"]: c for c in log.field_changes}
         self.assertEqual(fields["realName"]["old"], "张小明")
         self.assertEqual(fields["realName"]["new"], "张小改")
-        self.assertEqual(log.reason, "本人更新档案")
+        # 问题#4：姓名属复审字段，APPROVED 档案改后自动退回 PENDING，
+        # reason 追加后缀（遗留风险1：留痕兜底感知）
+        self.assertEqual(log.reason, "本人更新档案（复审字段变更，退回待审）")
 
         # education/coachCategory 落扩展档案 ext_json（预留扩展列）→ 提交后读得回；
         # schoolName 为派生只读字段，回传原值放行
@@ -2583,6 +2586,279 @@ class PersonReviewApiTests(TestCase):
         resp = self._review(str(person.pk), {"decision": "APPROVE"})
         self.assertEqual(resp.status_code, 400)
         self.assertEqual(resp.json()["code"], "INVALID_ARGUMENT")
+
+
+class PersonReReviewApiTests(TestCase):
+    """问题#4：APPROVED 档案复审字段变更自动退回 PENDING（2026-10-31 裁定）。
+
+    字段集 realName/birthDate/kinds/personCategory/school/coachCategory 实际
+    变更（old!=new）→ APPROVED 退回 PENDING；education 不触发；DRAFT/PENDING/
+    REJECTED 不动；同值回传（表单全量回传）幂等不触发。
+    附带修复回归：birthDate ISO 字符串与 date 同值比较（_coerce_date）。
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        region = Region.objects.create(name="丁省", code="830000", level=1)
+        cls.school = School.objects.create(
+            name="丁一小", code="SCH-830100-501", school_type="PRIMARY", region=region
+        )
+        cls.org_school = Organization.objects.create(
+            id=new_organization_id(),
+            name="丁一小组织",
+            org_type="SCHOOL",
+            code="SCH-830100-501",
+        )
+        other_school = School.objects.create(
+            name="丁二小", code="SCH-830100-502", school_type="PRIMARY", region=region
+        )
+        cls.org_school_other = Organization.objects.create(
+            id=new_organization_id(),
+            name="丁二小组织",
+            org_type="SCHOOL",
+            code="SCH-830100-502",
+        )
+        cls.admin = Account.objects.create(
+            id=new_account_id(),
+            username="rereview-admin",
+            roles=["ADMIN"],
+            password=make_password("rereview-pass-123"),
+            enabled=True,
+        )
+        cls.admin_token = issue_access_token(cls.admin)[0]
+
+        def _person(no, name, id_suffix, status, with_school=True):
+            row = Person.objects.create(
+                person_no=f"P2026000000{no}",
+                full_name=name,
+                gender=enums.Gender.MALE,
+                birth_date=date(2013, 5, 1),
+                id_card_cipher=encrypt_text(f"11010120130501{id_suffix}"),
+                id_card_hash=lookup_hash(f"11010120130501{id_suffix}"),
+                id_card_masked=mask_id_number(f"11010120130501{id_suffix}"),
+                person_category=enums.PersonCategory.ATHLETE,
+                audit_status=status,
+                school=cls.school if with_school else None,
+            )
+            AthleteProfile.objects.create(person=row)
+            return row
+
+        cls.approved = _person("101", "钱复审", "8888", enums.AuditStatus.APPROVED)
+        cls.pending = _person("102", "孙待审", "8899", enums.AuditStatus.PENDING)
+        cls.draft = _person("103", "周草稿", "8800", enums.AuditStatus.DRAFT)
+        # 双类别档案（kinds 排序豁免用例）：类别集合相同仅顺序变化不触发复审
+        cls.dual = _person("104", "吴双类别", "8877", enums.AuditStatus.APPROVED)
+        CoachProfile.objects.create(person=cls.dual)
+        cls.own = Account.objects.create(
+            id=new_account_id(),
+            username="rereview-own",
+            display_name="钱复审",
+            roles=["ATHLETE"],
+            password=make_password("rereview-pass-123"),
+            enabled=True,
+            person_id=str(cls.approved.pk),
+        )
+        cls.own_token = issue_access_token(cls.own)[0]
+        # 学校端账号（站内信接收方验证用）：属档案所属学校组织
+        cls.school_user = Account.objects.create(
+            id=new_account_id(),
+            username="rereview-school",
+            display_name="丁一审校员",
+            roles=["UNIVERSITY"],
+            organization=cls.org_school,
+            password=make_password("rereview-pass-123"),
+            enabled=True,
+        )
+        # 停用的学校端账号：不应收到站内信（错误接收人排除用）
+        cls.school_user_disabled = Account.objects.create(
+            id=new_account_id(),
+            username="rereview-school-disabled",
+            display_name="丁一停用账号",
+            roles=["UNIVERSITY"],
+            organization=cls.org_school,
+            password=make_password("rereview-pass-123"),
+            enabled=False,
+        )
+
+    @staticmethod
+    def _auth(token):
+        return {"HTTP_AUTHORIZATION": f"Bearer {token}"} if token else {}
+
+    def _put_person(self, person, **overrides):
+        """PUT /people/{id}（admin）：默认全量原值回传（幂等基线）。"""
+        from apps.persons.schemas import person_version
+
+        payload = {
+            "kinds": ["ATHLETE"],
+            "realName": person.full_name,
+            "birthDate": person.birth_date.isoformat(),
+            "version": person_version(person),
+        }
+        payload.update(overrides)
+        return self.client.put(
+            f"{PEOPLE}/{person.pk}",
+            data=json.dumps(payload),
+            content_type="application/json",
+            **self._auth(self.admin_token),
+        )
+
+    def _put_own(self, person, **overrides):
+        """PUT /me/profile（本人）：默认全量原值回传（幂等基线）。"""
+        from apps.persons.schemas import person_version
+
+        payload = {
+            "realName": person.full_name,
+            "gender": "MALE",
+            "birthDate": person.birth_date.isoformat(),
+            "version": person_version(person),
+        }
+        payload.update(overrides)
+        return self.client.put(
+            ME_PROFILE,
+            data=json.dumps(payload),
+            content_type="application/json",
+            **self._auth(self.own_token),
+        )
+
+    def _audit_status_entries(self, person):
+        """最新一条 UPDATE ChangeLog 中的 auditStatus 条目（无则空列表）。"""
+        log = PersonChangeLog.objects.filter(
+            person=person, change_type=enums.ChangeType.UPDATE
+        ).latest("id")
+        return [c for c in (log.field_changes or []) if c["field"] == "auditStatus"]
+
+    # ------------------------------------------------------------ 管理员入口
+
+    def test_admin_update_realname_change_demotes_approved(self):
+        """APPROVED + 实际改姓名 → 退回 PENDING；ChangeLog 含退回条目。"""
+        resp = self._put_person(self.approved, realName="钱复审改")
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertEqual(resp.json()["data"]["reviewStatus"], "PENDING")
+        self.approved.refresh_from_db()
+        self.assertEqual(self.approved.audit_status, enums.AuditStatus.PENDING)
+        entries = self._audit_status_entries(self.approved)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["old"], "APPROVED")
+        self.assertEqual(entries[0]["new"], "PENDING")
+        # 遗留风险1：退回留痕 reason 明确后缀（changeReason 未传 → 纯后缀）
+        log = PersonChangeLog.objects.filter(
+            person=self.approved, change_type=enums.ChangeType.UPDATE
+        ).latest("id")
+        self.assertEqual(log.reason, "（复审字段变更，退回待审）")
+
+    def test_admin_update_school_change_demotes_approved(self):
+        """APPROVED + 实际改学校 → 退回 PENDING（归属变更须重审）。"""
+        resp = self._put_person(
+            self.approved, schoolOrgId=str(self.org_school_other.pk)
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertEqual(resp.json()["data"]["reviewStatus"], "PENDING")
+
+    def test_admin_update_unchanged_values_no_demote(self):
+        """全量原值回传 → 无任何实际变更 → 保持 APPROVED（幂等）。"""
+        resp = self._put_person(self.approved)
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertEqual(resp.json()["data"]["reviewStatus"], "APPROVED")
+        self.approved.refresh_from_db()
+        self.assertEqual(self.approved.audit_status, enums.AuditStatus.APPROVED)
+
+    def test_admin_update_phone_only_no_demote(self):
+        """phone 不在复审字段集 → 保持 APPROVED。"""
+        resp = self._put_person(self.approved, phone="13900001111")
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertEqual(resp.json()["data"]["reviewStatus"], "APPROVED")
+
+    def test_admin_update_pending_realname_stays_pending(self):
+        """PENDING 改姓名 → 保持 PENDING，无 auditStatus 退回条目。"""
+        resp = self._put_person(self.pending, realName="孙待审改")
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertEqual(resp.json()["data"]["reviewStatus"], "PENDING")
+        self.assertEqual(self._audit_status_entries(self.pending), [])
+
+    def test_admin_update_kinds_reorder_only_no_demote(self):
+        """遗留风险2：kinds 集合相同仅顺序变化 → 不触发复审（保持 APPROVED）。"""
+        resp = self._put_person(self.dual, kinds=["COACH", "ATHLETE"])
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertEqual(resp.json()["data"]["reviewStatus"], "APPROVED")
+        self.dual.refresh_from_db()
+        self.assertEqual(self.dual.audit_status, enums.AuditStatus.APPROVED)
+        self.assertEqual(self._audit_status_entries(self.dual), [])
+
+    def test_admin_update_kinds_remove_demotes(self):
+        """kinds 集合实质变化（移除 COACH，空档案行可移除）→ 退回 PENDING。"""
+        resp = self._put_person(self.dual, kinds=["ATHLETE"])
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertEqual(resp.json()["data"]["reviewStatus"], "PENDING")
+
+    # ------------------------------------------------------------ 站内信通知（遗留风险1）
+
+    def test_admin_update_demote_notifies_self_and_school(self):
+        """退回时站内信通知本人（绑定账号）与学校端（学校组织账号）。"""
+        resp = self._put_person(self.approved, realName="钱复审改")
+        self.assertEqual(resp.status_code, 200, resp.content)
+        own_msgs = Message.objects.filter(recipient_account_id=self.own.pk)
+        # 精确一条：同请求不重复发送
+        self.assertEqual(own_msgs.count(), 1)
+        self.assertEqual(own_msgs.first().title, "人员档案已退回待审核")
+        self.assertEqual(own_msgs.first().business_type, "PERSON")
+        self.assertEqual(own_msgs.first().business_id, str(self.approved.pk))
+        school_msgs = Message.objects.filter(recipient_account_id=self.school_user.pk)
+        self.assertEqual(school_msgs.count(), 1)
+        self.assertEqual(school_msgs.first().title, "本校人员档案退回待审核")
+        self.assertIn("钱复审改", school_msgs.first().body)
+        # 错误接收人排除：管理员（未绑档案/无组织）与停用的学校端账号均不收
+        self.assertFalse(
+            Message.objects.filter(recipient_account_id=self.admin.pk).exists()
+        )
+        self.assertFalse(
+            Message.objects.filter(
+                recipient_account_id=self.school_user_disabled.pk
+            ).exists()
+        )
+
+    def test_own_update_demote_notifies_self_and_school(self):
+        """本人入口退回同样通知：本人一条 + 学校端一条（同事务原子落库）。"""
+        resp = self._put_own(self.approved, realName="钱复审自改")
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertEqual(
+            Message.objects.filter(
+                recipient_account_id=self.own.pk, title="人员档案已退回待审核"
+            ).count(),
+            1,
+        )
+        self.assertEqual(
+            Message.objects.filter(recipient_account_id=self.school_user.pk).count(), 1
+        )
+
+    def test_no_notification_when_not_demoted(self):
+        """未退回不发消息：全原值幂等（不触发）与 PENDING 变更（非 APPROVED）均不发。"""
+        self._put_person(self.approved)
+        self._put_person(self.pending, realName="孙待审改")
+        self.assertEqual(Message.objects.count(), 0)
+
+    # ------------------------------------------------------------ 本人入口
+
+    def test_own_update_realname_change_demotes_approved(self):
+        """本人改姓名 → APPROVED 退回 PENDING（本人纠错后须重审）。"""
+        resp = self._put_own(self.approved, realName="钱复审改")
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertEqual(resp.json()["data"]["reviewStatus"], "PENDING")
+        self.approved.refresh_from_db()
+        self.assertEqual(self.approved.audit_status, enums.AuditStatus.PENDING)
+
+    def test_own_update_education_only_no_demote(self):
+        """education 不在复审字段集 → 保持 APPROVED。"""
+        resp = self._put_own(self.approved, education="本科")
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertEqual(resp.json()["data"]["reviewStatus"], "APPROVED")
+
+    def test_admin_update_draft_realname_stays_draft(self):
+        """DRAFT 改姓名 → 保持 DRAFT（本在待审轨道前段，不误动）。"""
+        resp = self._put_person(self.draft, realName="周草稿改")
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.draft.refresh_from_db()
+        self.assertEqual(self.draft.audit_status, enums.AuditStatus.DRAFT)
+        self.assertEqual(self._audit_status_entries(self.draft), [])
 
 
 class DossierApiTests(TestCase):
