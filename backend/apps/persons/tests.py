@@ -809,75 +809,177 @@ class PersonCoachDutiesTests(TestCase):
             ).duty_other
         )
 
-    # ------------------------------------------------ P1-7 教练证书有效期只读派生
-    # 口径（2026-10-30 用户授权）：仅 COACH 输出；证书有效期仅供展示，
-    # 不改 audit_status、不参与报名门槛。日期边界统一取 timezone.localdate()：
-    # expire == today → VALID；expire < today → EXPIRED；空 → UNSET。
 
-    def _set_certificate(self, person, expire_date, certificate_no="C2026001"):
-        CoachProfile.objects.filter(person=person).update(
-            certificate_no=certificate_no, certificate_expire_date=expire_date
+class CoachQualificationTests(TestCase):
+    """GET /people/{id} 只读派生字段 coachQualification（问题#7，2026-10-31 裁定 B 口径移植）。
+
+    四态：MISSING 无证书（无 CoachProfile 行，或证书编号与有效期均未登记）/
+    UNKNOWN 证书信息不完整（有证号无有效期，或有有效期无证号——二轮修正）/
+    VALID 有效期 >= 当前业务日期 / EXPIRED 有效期 < 当前业务日期
+    （有效期至当日含当日有效）。
+    业务日期基准=settings.TIME_ZONE（Asia/Shanghai，timezone.localdate()）。
+    零落库：仅派生输出，不写 CoachProfile、不改 audit_status；
+    取代 A 版 person_out 三态 certificateValidity（证书字段不再经全部人员
+    端点输出，本类与列表契约测试共同守护）。
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        region = Region.objects.create(name="庚省", code="990000", level=1)
+        cls.school = School.objects.create(
+            name="庚一小", code="SCH-990100-701", school_type="PRIMARY", region=region
         )
+        cls.org_school = Organization.objects.create(
+            id=new_organization_id(),
+            name="庚一小组织",
+            org_type="SCHOOL",
+            code="SCH-990100-701",
+        )
+        cls.admin = Account.objects.create(
+            id=new_account_id(),
+            username="qual-admin",
+            roles=["ADMIN"],
+            password=make_password("qual-pass-123"),
+            enabled=True,
+        )
+        cls.admin_token = issue_access_token(cls.admin)[0]
 
-    def _row_by_name(self, full_name):
-        data = self._list_items()
-        return {row["realName"]: row for row in data["items"]}[full_name]
+    @classmethod
+    def _coach(cls, no, name, id_no, cert_no=None, expire=None):
+        person = Person.objects.create(
+            person_no=no,
+            full_name=name,
+            school=cls.school,
+            id_card_cipher=encrypt_text(id_no),
+            id_card_hash=lookup_hash(id_no),
+            id_card_masked=mask_id_number(id_no),
+            person_category=enums.PersonCategory.COACH,
+            audit_status=enums.AuditStatus.APPROVED,
+        )
+        CoachProfile.objects.create(
+            person=person, certificate_no=cert_no, certificate_expire_date=expire
+        )
+        return person
 
-    def test_certificate_validity_valid_when_expire_after_today(self):
-        expire = timezone.localdate() + timedelta(days=1)
-        self._set_certificate(self.free_coach, expire)
-        row = self._row_by_name(self.free_coach.full_name)
-        self.assertEqual(row["certificateNo"], "C2026001")
-        self.assertEqual(row["certificateExpireDate"], expire.isoformat())
-        self.assertEqual(row["certificateValidity"], "VALID")
+    def _detail(self, person):
+        resp = self.client.get(
+            f"{PEOPLE}/{person.pk}",
+            **{"HTTP_AUTHORIZATION": f"Bearer {self.admin_token}"},
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        return resp.json()["data"]
 
-    def test_certificate_validity_boundary_expire_today_is_valid(self):
-        today = timezone.localdate()
-        self._set_certificate(self.free_coach, today)
-        row = self._row_by_name(self.free_coach.full_name)
-        self.assertEqual(row["certificateExpireDate"], today.isoformat())
-        self.assertEqual(row["certificateValidity"], "VALID")
+    # ------------------------------------------------------------ 四态
 
-    def test_certificate_validity_expired_when_expire_before_today(self):
-        expire = timezone.localdate() - timedelta(days=1)
-        self._set_certificate(self.free_coach, expire)
-        row = self._row_by_name(self.free_coach.full_name)
-        self.assertEqual(row["certificateValidity"], "EXPIRED")
-
-    def test_certificate_validity_unset_when_expire_missing(self):
-        row = self._row_by_name(self.free_coach.full_name)
-        self.assertIsNone(row["certificateNo"])
-        self.assertIsNone(row["certificateExpireDate"])
-        self.assertEqual(row["certificateValidity"], "UNSET")
-
-    def test_certificate_fields_absent_for_non_coach(self):
-        athlete = Person.objects.create(
-            person_no="P202600000099",
-            full_name="仅运动员证书隔离",
-            id_card_cipher=encrypt_text("110101201401019876"),
-            id_card_hash=lookup_hash("110101201401019876"),
-            id_card_masked=mask_id_number("110101201401019876"),
+    def test_detail_without_coach_profile_missing(self):
+        """非教练（无 CoachProfile 行）→ MISSING（无教练证书）。"""
+        person = Person.objects.create(
+            person_no="P202600000951",
+            full_name="庚运动员",
+            school=self.school,
+            id_card_cipher=encrypt_text("110101201001019801"),
+            id_card_hash=lookup_hash("110101201001019801"),
+            id_card_masked=mask_id_number("110101201001019801"),
             person_category=enums.PersonCategory.ATHLETE,
             audit_status=enums.AuditStatus.APPROVED,
         )
-        AthleteProfile.objects.create(person=athlete, student_no="G2026000099")
-        row = self._row_by_name(athlete.full_name)
-        self.assertNotIn("certificateNo", row)
-        self.assertNotIn("certificateExpireDate", row)
-        self.assertNotIn("certificateValidity", row)
+        AthleteProfile.objects.create(person=person)
+        self.assertEqual(self._detail(person)["coachQualification"], "MISSING")
 
-    def test_expired_certificate_does_not_change_audit_status(self):
-        self._set_certificate(
-            self.free_coach, timezone.localdate() - timedelta(days=30)
+    def test_detail_blank_certificate_no_missing(self):
+        """证书编号与有效期均未登记 → MISSING（无证书）。"""
+        person = self._coach(
+            "P202600000952", "庚无证", "110101198501019802"
         )
-        detail = self._get(
-            f"{PEOPLE}/{self.free_coach.pk}", token=self.admin_token
+        self.assertEqual(self._detail(person)["coachQualification"], "MISSING")
+
+    def test_detail_expire_without_certificate_no_unknown(self):
+        """二轮修正：仅有有效期、未登记证书编号 → UNKNOWN（证书信息不完整，
+        不再归 MISSING；不新增第五种状态）。"""
+        person = self._coach(
+            "P202600000959",
+            "庚孤证",
+            "110101198501019809",
+            expire=timezone.localdate() + timedelta(days=30),
         )
-        self.assertEqual(detail.status_code, 200)
-        self.assertEqual(detail.json()["data"]["certificateValidity"], "EXPIRED")
-        self.assertEqual(detail.json()["data"]["reviewStatus"], "APPROVED")
-        self.free_coach.refresh_from_db()
-        self.assertEqual(self.free_coach.audit_status, "APPROVED")
+        self.assertEqual(self._detail(person)["coachQualification"], "UNKNOWN")
+
+    def test_detail_certificate_without_expire_unknown(self):
+        """有证书编号未登记有效期 → UNKNOWN。"""
+        person = self._coach(
+            "P202600000953", "庚未知", "110101198501019803", cert_no="CERT-2026-001"
+        )
+        self.assertEqual(self._detail(person)["coachQualification"], "UNKNOWN")
+
+    def test_detail_expire_today_valid(self):
+        """有效期边界（裁定：expire_date == 今日 → VALID，含当日有效）。"""
+        person = self._coach(
+            "P202600000954",
+            "庚今日",
+            "110101198501019804",
+            cert_no="CERT-2026-002",
+            expire=timezone.localdate(),
+        )
+        self.assertEqual(self._detail(person)["coachQualification"], "VALID")
+
+    def test_detail_expire_yesterday_expired(self):
+        """有效期昨日（< 今日）→ EXPIRED。"""
+        person = self._coach(
+            "P202600000955",
+            "庚过期",
+            "110101198501019805",
+            cert_no="CERT-2026-003",
+            expire=timezone.localdate() - timedelta(days=1),
+        )
+        self.assertEqual(self._detail(person)["coachQualification"], "EXPIRED")
+
+    def test_detail_expire_future_valid(self):
+        person = self._coach(
+            "P202600000956",
+            "庚有效",
+            "110101198501019806",
+            cert_no="CERT-2026-004",
+            expire=timezone.localdate() + timedelta(days=30),
+        )
+        self.assertEqual(self._detail(person)["coachQualification"], "VALID")
+
+    def test_derivation_is_read_only(self):
+        """派生只读：detail 前后 CoachProfile 行与主档均未变化（零落库）。"""
+        from apps.persons.schemas import person_version
+
+        person = self._coach(
+            "P202600000957",
+            "庚只读",
+            "110101198501019807",
+            cert_no="CERT-2026-005",
+            expire=timezone.localdate() - timedelta(days=1),
+        )
+        before_version = person_version(person)
+        before_expire = (
+            CoachProfile.objects.get(person=person).certificate_expire_date
+        )
+        self.assertEqual(self._detail(person)["coachQualification"], "EXPIRED")
+        person.refresh_from_db()
+        profile = CoachProfile.objects.get(person=person)
+        self.assertEqual(person_version(person), before_version)
+        self.assertEqual(profile.certificate_expire_date, before_expire)
+
+    # ------------------------------------------------------------ 契约边界
+
+    def test_list_does_not_expose_coach_qualification(self):
+        """裁定范围：仅 GET /people/{id} 输出，列表契约不扩散。"""
+        self._coach(
+            "P202600000958",
+            "庚列表",
+            "110101198501019808",
+            cert_no="CERT-2026-006",
+        )
+        resp = self.client.get(
+            PEOPLE, **{"HTTP_AUTHORIZATION": f"Bearer {self.admin_token}"}
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        for item in resp.json()["data"]["items"]:
+            self.assertNotIn("coachQualification", item)
 
 
 class PeopleApiTests(TestCase):

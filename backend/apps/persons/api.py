@@ -465,8 +465,15 @@ def people_search(request, body: s.PersonSearchBody):
     "/people/{person_id}", auth=_auth, response=EnvelopeOut, summary="人员档案详情"
 )
 def people_get(request, person_id: str):
+    """详情在 person_out 基础上追加只读派生字段 coachQualification
+    （问题#7，2026-10-31 裁定 B 口径移植：仅 GET /people/{id} 输出，列表/
+    搜索契约不扩散，取代 A 版三态 certificateValidity；四态语义见
+    services.coach_qualification）。"""
     account = require("personGet")
-    return ok(s.person_out(services.get_person(person_id, account)))
+    person = services.get_person(person_id, account)
+    data = s.person_out(person)
+    data["coachQualification"] = services.coach_qualification(person)
+    return ok(data)
 
 
 # P0-2（2026-10-28）：学校端档案审核。学校端是人员资格与履历的最终审核方
