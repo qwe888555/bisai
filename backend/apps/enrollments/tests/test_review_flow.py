@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import date
 
 from apps.enrollments.tests.factories import (
     BASE,
@@ -210,3 +211,107 @@ def test_precheck_reports_outside_window(client, auth, monkeypatch):
     result = response.json()["data"]
     assert result["passed"] is False
     assert "OUTSIDE_WINDOW" in {issue["code"] for issue in result["issues"]}
+
+
+# ---------------------------------------------------------------------------
+# 问题#3（2026-10-30 裁定 1-b/2-a/3-a）：学校端审核结论接入报名链路。
+# 软提交硬终审——档案/履历材料未过学校端审核：提交阶段 WARNING 放行，
+# 省级终审（double_track_issues）升级 ERROR 硬拦截。
+
+
+def _create_athlete(person_no: str, audit_status: str):
+    """建真实人员主档；mock 模式下 person_client 优先读真实行，
+    无真实行时回退演示档案（视为 APPROVED，不误拦既有链路）。"""
+    from apps.persons.models import Person
+
+    return Person.objects.create(
+        person_no=person_no,
+        full_name=f"测试运动员{person_no[-2:]}",
+        gender=1,
+        birth_date=date(2012, 5, 1),
+        id_card_hash=f"h_{person_no}",
+        id_card_masked="110*******1",
+        person_category="ATHLETE",
+        audit_status=audit_status,
+    )
+
+
+def test_province_final_review_blocks_unapproved_archive(client, auth):
+    _create_athlete("per_test_00", "DRAFT")
+    school_headers = auth("university")
+    city_headers = auth("city")
+    province_headers = auth("province")
+    enrollment_id = complete_draft(client, school_headers)
+
+    # 软提交：学校端档案未审核仅 WARNING，不阻断提交与市州审核
+    assert submit(client, school_headers, enrollment_id, "archive-submit").status_code == 200
+    assert review(client, city_headers, enrollment_id, "APPROVE", "archive-city").status_code == 200
+
+    # 省级终审硬拦截：学校端档案未 APPROVED
+    response = review(client, province_headers, enrollment_id, "APPROVE", "archive-prov")
+    assert response.status_code == 422
+    assert response.json()["code"] == "BUSINESS_VALIDATION_FAILED"
+    issues = response.json()["data"] or []
+    assert any(
+        issue.get("field") == "reviewStatus" and issue.get("athleteId") == "per_test_00"
+        for issue in issues
+    )
+
+
+def test_province_final_review_passes_with_approved_archive(client, auth):
+    _create_athlete("per_test_00", "APPROVED")
+    school_headers = auth("university")
+    city_headers = auth("city")
+    province_headers = auth("province")
+    enrollment_id = complete_draft(client, school_headers)
+
+    approved = approve_flow(
+        client, school_headers, city_headers, province_headers, enrollment_id, "arch-ok"
+    )
+    assert approved["status"] == "APPROVED"
+
+
+def test_material_review_status_warning_on_submit_error_on_final(client, auth, monkeypatch):
+    from apps.enrollments import clients, precheck
+    from apps.enrollments.models import Enrollment
+
+    school_headers = auth("university")
+    enrollment_id = complete_draft(client, school_headers)
+    enrollment = Enrollment.objects.get(pk=enrollment_id)
+
+    # mock 模式下 list_materials 恒空，无法用真实行驱动，用 stub 注入履历材料
+    entry = {
+        "type": "STAMPED_FORM",
+        "fileId": "f1",
+        "fileName": "履历材料.pdf",
+        "status": "PENDING",
+    }
+    monkeypatch.setattr(
+        clients.material_client, "list_materials", lambda owner_type, owner_id: [dict(entry)]
+    )
+
+    # 提交阶段：材料待学校端审核仅 WARNING，预检仍放行
+    result = precheck.run_precheck(enrollment)
+    material_issues = [
+        issue
+        for issue in result["issues"]
+        if issue["code"] == "QUALIFICATION_PENDING" and issue.get("field") == "materials"
+    ]
+    assert material_issues
+    assert all(issue["severity"] == "WARNING" for issue in material_issues)
+    assert result["passed"] is True
+
+    # 省级终审：待审材料升级 ERROR
+    track = precheck.double_track_issues(enrollment)
+    assert track
+    assert all(issue["severity"] == "ERROR" for issue in track)
+    assert any("待学校端审核" in issue["message"] for issue in track)
+
+    # 驳回材料同样拦截
+    entry["status"] = "REJECTED"
+    track = precheck.double_track_issues(enrollment)
+    assert any("审核未通过" in issue["message"] for issue in track)
+
+    # 对照：已通过材料不拦
+    entry["status"] = "APPROVED"
+    assert precheck.double_track_issues(enrollment) == []

@@ -443,6 +443,9 @@ class PersonClient:
             "maskedStudentNumber": mask_student_number(student_no) if student_no else "",
             "hasIdConflict": False,
             "banned": False,
+            # 问题#3（2026-10-30 裁定 1-b/2-a/3-a）：学校端档案审核结论直出
+            # （与 persons PersonOut 的 reviewStatus 同口径）
+            "reviewStatus": person.audit_status or "",
         }
 
     def get_person(self, athlete_id: str) -> dict[str, Any]:
@@ -466,6 +469,8 @@ class PersonClient:
                 "maskedStudentNumber": mask_student_number(f"ST{tail}0001"),
                 "hasIdConflict": False,
                 "banned": False,
+                # 演示档案视为已审核（mock 链路无审核流，避免终审被演示数据误拦）
+                "reviewStatus": "APPROVED",
             }
         from apps.common.errors import ApiError, NOT_FOUND
 

@@ -150,7 +150,9 @@ def run_precheck(enrollment) -> dict[str, Any]:
                 )
             )
 
-    # 2) 其余 4 类材料：只能经成员4 履历材料查询；取不到降级 WARNING，不臆造缺失
+    # 2) 其余 4 类材料：只能经成员4 履历材料查询；取不到降级 WARNING，不臆造缺失。
+    #    问题#3（2026-10-30 裁定 1-b/2-a/3-a）：已提交材料按学校端审核状态分级——
+    #    提交阶段一律 WARNING 放行（软提交），省级终审在 double_track_issues 升级 ERROR。
     try:
         team_materials = material_client.list_materials("TEAM", enrollment.team_id)
         person_materials = [
@@ -169,6 +171,27 @@ def run_precheck(enrollment) -> dict[str, Any]:
                 field="materials",
             )
         )
+    else:
+        for entry in team_materials + person_materials:
+            status = entry.get("status")
+            if status == "REJECTED":
+                issues.append(
+                    _issue(
+                        "QUALIFICATION_PENDING",
+                        WARNING,
+                        f"履历材料「{entry.get('fileName')}」学校端审核未通过，需重新提交并审核",
+                        field="materials",
+                    )
+                )
+            elif status == "PENDING":
+                issues.append(
+                    _issue(
+                        "QUALIFICATION_PENDING",
+                        WARNING,
+                        f"履历材料「{entry.get('fileName')}」待学校端审核",
+                        field="materials",
+                    )
+                )
 
     # 3) 人数与守门员（参数缺失归 QUALIFICATION_PENDING）
     min_players = rules.get("minPlayers")
@@ -334,10 +357,57 @@ def _normalize_name(value: Optional[str]) -> str:
 
 
 def double_track_issues(enrollment) -> list[dict]:
-    """球队最终 APPROVED 的双轨合规校验（人员轨 + 球队轨）。"""
+    """球队最终 APPROVED 的双轨合规校验（人员轨 + 球队轨）。
+
+    问题#3（2026-10-30 裁定 1-b/2-a/3-a）：省级终审硬门槛——学校端审核结论。
+    档案：每名运动员主档须学校端 APPROVED；材料：已提交履历材料不得存在
+    待审/驳回。材料清单取不到时降级跳过（不臆造缺失）。
+    """
     issues: list[dict] = []
     players = list(enrollment.players.all())
     active = [item for item in players if item.qualification_status != QUALIFICATION_EXCLUDED]
+    for item in active:
+        person = person_client.get_person(item.athlete_id)
+        review_status = person.get("reviewStatus") or ""
+        if review_status != "APPROVED":
+            issues.append(
+                _issue(
+                    "QUALIFICATION_PENDING",
+                    ERROR,
+                    f"运动员学校端档案审核状态为 {review_status or '未送审'}，不能最终通过",
+                    field="reviewStatus",
+                    athleteId=item.athlete_id,
+                )
+            )
+    try:
+        team_materials = material_client.list_materials("TEAM", enrollment.team_id)
+        person_materials = [
+            entry
+            for item in active
+            for entry in material_client.list_materials("PERSON", item.athlete_id)
+        ]
+    except ApiError:
+        team_materials, person_materials = [], []
+    for entry in team_materials + person_materials:
+        status = entry.get("status")
+        if status == "REJECTED":
+            issues.append(
+                _issue(
+                    "QUALIFICATION_PENDING",
+                    ERROR,
+                    f"履历材料「{entry.get('fileName')}」学校端审核未通过，不能最终通过",
+                    field="materials",
+                )
+            )
+        elif status == "PENDING":
+            issues.append(
+                _issue(
+                    "QUALIFICATION_PENDING",
+                    ERROR,
+                    f"履历材料「{entry.get('fileName')}」待学校端审核，不能最终通过",
+                    field="materials",
+                )
+            )
     for item in active:
         if item.qualification_status != QUALIFICATION_QUALIFIED:
             issues.append(
