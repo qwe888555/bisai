@@ -202,6 +202,45 @@ def run_precheck(enrollment) -> dict[str, Any]:
             )
         )
 
+    # 2.5) 材料域审核状态（阶段一，2026-10-31 批准口径）：双条件之"审核通过"
+    # 证据。报名附件承载与材料域审核通过证据分别校验、互不替代；仅作用于
+    # requiredMaterialTypes ∩ 材料域字典且 need_audit=true 的类型（当前唯一
+    # 交集 STUDENT_STATUS；STAMPED_FORM 等报名附件体系类型无审核环节）。
+    # 提交阶段按批准规则仅产生 WARNING（不阻断提交）；终审在
+    # double_track_issues 中对已查明但未通过审核的材料以 ERROR 硬性阻断。
+    # 查询不到记录 / 类型不在字典 / 异常 → 降级不臆造（§2 口径），
+    # 绝不视为审核通过。只查 active_players（不含教练），不会向教练
+    # 要求学籍证明（与 is_required=false 基线初衷一致）。
+    audit_candidates = [c for c in required if c != "STAMPED_FORM"]
+    audit_person_ids = []
+    for item in active_players:
+        text = str(item.athlete_id or "")
+        if text.isdigit():
+            audit_person_ids.append(int(text))
+    audit_snapshot = _material_audit_snapshot(audit_person_ids, audit_candidates)
+    for code, states in audit_snapshot.items():
+        for item in active_players:
+            state = states.get(item.athlete_id)
+            if state is None or state["approved"]:
+                continue
+            label = _AUDIT_STATUS_LABELS.get(state["status"], state["status"])
+            if state["status"] == "PENDING":
+                detail = "待学校端审核"
+            elif state["status"] == "REJECTED":
+                detail = "已被驳回，需重新提交并通过审核"
+            else:
+                detail = "未通过学校端审核"
+            issues.append(
+                _issue(
+                    "QUALIFICATION_PENDING",
+                    WARNING,
+                    f"必需材料 {code} {detail}（当前状态 {label}），"
+                    "提交后须完成学校端材料审核方可最终通过",
+                    field="materialAudit",
+                    athleteId=item.athlete_id,
+                )
+            )
+
     # 3) 人数与守门员（参数缺失归 QUALIFICATION_PENDING）
     min_players = rules.get("minPlayers")
     max_players = rules.get("maxPlayers")
@@ -379,6 +418,55 @@ def _material_evidence(
     return None
 
 
+# 材料域审核状态展示文案（阶段一 2026-10-31；其余状态原样输出）
+_AUDIT_STATUS_LABELS = {
+    "PENDING": "待审核",
+    "REJECTED": "已驳回",
+}
+
+
+def _material_audit_snapshot(person_ids: list, type_codes: list) -> dict:
+    """材料域审核状态快照（阶段一 2026-10-31，同进程直连 materials 域）。
+
+    对每个类型码独立调用 material_batch_query_internal（系统级只读，
+    无账号数据范围；persons 域 person_audit_snapshot 同款先例）：
+    - 类型不在材料域字典 / 归属不符 / 入参非法 / 查询异常 → 该码缺席
+      （降级口径：不臆造、不阻断，也绝不视为审核通过）；
+    - 查到记录 → {code: {person_id(str): {"status": 展示状态,
+      "approved": 是否审核通过}}}。approved 按"任一记录 APPROVED"判定
+      （allow_multiple 类型多份取并集）；未通过时展示最新一条记录状态
+      （排序首位 updated_at DESC）。
+    只查 PERSON 侧（阶段一边界：TEAM 归属映射未定，不做；TEAM 类型由
+    applies_to 预检自然降级跳过）。
+    """
+    result: dict[str, dict[str, dict]] = {}
+    if not person_ids or not type_codes:
+        return result
+    from apps.materials import services as material_services
+
+    for code in type_codes:
+        try:
+            payload = material_services.material_batch_query_internal(
+                "PERSON", person_ids, [code]
+            )
+        except Exception:  # noqa: BLE001 - 材料域异常降级，不阻断报名域
+            continue
+        items = payload.get("items") or []
+        if not items:
+            continue
+        by_owner: dict[int, list[dict]] = {}
+        for entry in items:
+            by_owner.setdefault(entry["owner_id"], []).append(entry)
+        for oid, rows in by_owner.items():
+            approved = any(r["status"] == "APPROVED" for r in rows)
+            latest = rows[0]["status"]  # 排序首位即最新
+            result.setdefault(code, {})[str(oid)] = {
+                "status": "APPROVED" if approved else latest,
+                "approved": approved,
+            }
+    return result
+
+
 def _normalize_name(value: Optional[str]) -> str:
     return "".join((value or "").split())
 
@@ -396,8 +484,12 @@ def double_track_issues(enrollment) -> list[dict]:
       宣称为真实跨域集成已验证）；
     - requiredMaterialTypes 声明的必需材料在终审时按共享证据口径
       （_material_evidence）重验存在性：STUDENT_STATUS 认可报名附件与
-      名单行 student_status_file_ids，与提交预检一致（当前两类均为报名
-      附件体系，非材料域审核对象——清单边界见报告）；
+      名单行 student_status_file_ids，与提交预检一致（修复两侧比对差异）；
+    - 材料域审核状态硬门槛（阶段一 2026-10-31 批准口径）：字典内
+      need_audit=true 的必需类型（当前唯一交集 STUDENT_STATUS）须存在
+      APPROVED 记录，已查明未通过 → MISSING_MATERIAL ERROR（报名附件
+      承载与审核通过证据互不替代）；查不到记录/异常 → 降级不阻断
+      （批准口径#5）；
     - E-2 资格确认硬门槛（v7，2026-10-28）：QUALIFIED 且确认凭证缺失/单侧
       无效 → QUALIFICATION_NOT_CONFIRMED ERROR（双条件
       confirmed_at + confirmed_by；REVOKE 后状态仍 QUALIFIED 但凭证失效，
@@ -511,6 +603,36 @@ def double_track_issues(enrollment) -> list[dict]:
                     ERROR,
                     f"必需材料 {material_type} 在终审时缺失",
                     field="materialType",
+                )
+            )
+
+    # 材料域审核状态终审硬门槛（阶段一 2026-10-31 批准口径）：已查明但
+    # 未通过审核（PENDING/REJECTED/DRAFT/WITHDRAWN 均不算通过）→
+    # MISSING_MATERIAL ERROR 阻断；查不到记录 / 类型不在字典 / 异常 →
+    # 降级不臆造、不阻断（批准口径#5；已知边界：从未上传履历材料者
+    # 不会被此处拦住，提交预检阶段由 §2 WARNING 提示）。与上方存在性
+    # 重验互不替代：附件缺失照旧 ERROR，审核未通过同样 ERROR。
+    audit_candidates = [c for c in required if c != "STAMPED_FORM"]
+    audit_person_ids = []
+    for item in active:
+        text = str(item.athlete_id or "")
+        if text.isdigit():
+            audit_person_ids.append(int(text))
+    audit_snapshot = _material_audit_snapshot(audit_person_ids, audit_candidates)
+    for code, states in audit_snapshot.items():
+        for item in active:
+            state = states.get(item.athlete_id)
+            if state is None or state["approved"]:
+                continue
+            label = _AUDIT_STATUS_LABELS.get(state["status"], state["status"])
+            issues.append(
+                _issue(
+                    "MISSING_MATERIAL",
+                    ERROR,
+                    f"必需材料 {code} 未经学校端审核通过（当前状态 {label}），"
+                    "不能最终通过",
+                    field="materialAudit",
+                    athleteId=item.athlete_id,
                 )
             )
 
