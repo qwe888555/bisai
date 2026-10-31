@@ -4851,3 +4851,214 @@ class P0UnifiedFlowTests(TestCase):
         self.assertEqual(self.p_approved.audit_status, enums.AuditStatus.APPROVED)
         self.assertEqual(self.p_approved.full_name, "已过乙")
         self.assertFalse(self._update_logs(self.p_approved).exists())
+
+
+class AuditTransactionConsistencyTests(TestCase):
+    """审计事务一致性（风险5 修订方案，2026-10-31 裁定 B 口径移植）T1-T3。
+
+    覆盖：T1 服务层审计失败 → 业务整体回滚（Person/PersonChangeLog/
+    SUCCESS 审计零残留）；T2 成功审计精确一条（API 层 audit_state(request,
+    None) 撤销中间件声明，防重复）+ 幂等重复确认保留 SUCCESS 审计（裁定：
+    语义=请求成功处理而非状态变化）；T3 服务层失败形成 500 时中间件按原
+    行为落 FAILURE——用"仅首次抛错"的 mock 精确区分服务层写与中间件写，
+    不以恒抛错 mock 误判中间件行为。
+
+    验证边界（T5 声明）：本类在 SQLite 运行，可验证事务原子性与审计唯一
+    性；select_for_update 在 SQLite 被 ORM 静默忽略
+    （features.has_select_for_update=False），Person 行锁互斥与 MySQL
+    REPEATABLE READ 快照时序未在本环境验证，SQLite 通过不代表 MySQL
+    并发安全已验证（须 MySQL 可控环境专项执行，本批不连接真实 MySQL）。
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        region = Region.objects.create(name="壬省", code="970000", level=1)
+        cls.school = School.objects.create(
+            name="壬一小", code="SCH-970100-901", school_type="PRIMARY", region=region
+        )
+        cls.org_school = Organization.objects.create(
+            id=new_organization_id(),
+            name="壬一小组织",
+            org_type="SCHOOL",
+            code="SCH-970100-901",
+        )
+        cls.admin = Account.objects.create(
+            id=new_account_id(),
+            username="audit-tx-admin",
+            roles=["ADMIN"],
+            password=make_password("audit-tx-pass-123"),
+            enabled=True,
+        )
+        cls.admin_token = issue_access_token(cls.admin)[0]
+
+    def _auth(self, token):
+        return {"HTTP_AUTHORIZATION": f"Bearer {token}"}
+
+    def _post_create(self, real_name="钱事务", id_no="110101201001019821"):
+        payload = {
+            "kinds": ["ATHLETE"],
+            "realName": real_name,
+            "idNumber": id_no,
+            "schoolOrgId": str(self.org_school.pk),
+        }
+        return self.client.post(
+            PEOPLE,
+            data=json.dumps(payload),
+            content_type="application/json",
+            **self._auth(self.admin_token),
+        )
+
+    def _bind_and_confirm(self, person, seq=1):
+        """新建绑定账号并提交复核，返回 (响应, 确认账号 token)。
+
+        seq 用于同档案多次绑定账号的场景防 username 撞 UNIQUE。"""
+        from apps.persons.schemas import person_version
+
+        user = Account.objects.create(
+            id=new_account_id(),
+            username=f"audit-tx-self-{person.pk}-{seq}",
+            display_name=person.full_name,
+            roles=["ATHLETE"],
+            password=make_password("audit-tx-pass-123"),
+            enabled=True,
+            person_id=str(person.pk),
+        )
+        token = issue_access_token(user)[0]
+        resp = self.client.post(
+            ME_PROFILE_CONFIRM,
+            data=json.dumps({"version": person_version(person)}),
+            content_type="application/json",
+            **self._auth(token),
+        )
+        return resp, token
+
+    def test_t1_audit_write_failure_rolls_back_business(self):
+        """T1：服务层审计写入失败 → 业务事务整体回滚，三者零残留。"""
+        from unittest import mock
+
+        with mock.patch.object(
+            AuditLog.objects, "create", side_effect=Exception("audit db down")
+        ):
+            resp = self.client.post(
+                PEOPLE,
+                data=json.dumps(
+                    {
+                        "kinds": ["ATHLETE"],
+                        "realName": "钱事务",
+                        "idNumber": "110101201001019821",
+                        "schoolOrgId": str(self.org_school.pk),
+                    }
+                ),
+                content_type="application/json",
+                raise_request_exception=False,
+                **self._auth(self.admin_token),
+            )
+        self.assertEqual(resp.status_code, 500)
+        # Person、PersonChangeLog、SUCCESS 审计同生共死，零残留
+        self.assertEqual(Person.objects.filter(full_name="钱事务").count(), 0)
+        self.assertEqual(
+            PersonChangeLog.objects.filter(
+                change_type=enums.ChangeType.CREATE
+            ).count(),
+            0,
+        )
+        self.assertEqual(
+            AuditLog.objects.filter(action="person.create").count(), 0
+        )
+
+    def test_t2_success_audit_exactly_once(self):
+        """T2：创建/提交成功后各自 SUCCESS 审计精确一条（中间件被
+        audit_state(request, None) 撤销不重复）；幂等重复确认每次请求
+        仍各记一条 SUCCESS（裁定保留），不写 ChangeLog。"""
+        from apps.persons.schemas import person_version
+
+        resp = self._post_create()
+        self.assertEqual(resp.status_code, 200, resp.content)
+        person = Person.objects.get(full_name="钱事务")
+        self.assertEqual(
+            AuditLog.objects.filter(
+                action="person.create",
+                object_id=str(person.pk),
+                outcome="SUCCESS",
+            ).count(),
+            1,
+        )
+        resp, _ = self._bind_and_confirm(person)
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertEqual(
+            AuditLog.objects.filter(
+                action="person.self_confirm",
+                object_id=str(person.pk),
+                outcome="SUCCESS",
+            ).count(),
+            1,
+        )
+        # 幂等重复确认：审计按请求记 SUCCESS（请求成功处理语义），状态不变、
+        # ChangeLog 数量不变（幂等不写留痕）
+        person.refresh_from_db()
+        before_version = person_version(person)
+        cl_count = PersonChangeLog.objects.filter(person=person).count()
+        resp, _ = self._bind_and_confirm(person, seq=2)
+        self.assertEqual(resp.status_code, 200, resp.content)
+        person.refresh_from_db()
+        self.assertEqual(person.audit_status, enums.AuditStatus.PENDING)
+        self.assertEqual(person_version(person), before_version)
+        self.assertEqual(
+            PersonChangeLog.objects.filter(person=person).count(), cl_count
+        )
+        logs = AuditLog.objects.filter(
+            action="person.self_confirm",
+            object_id=str(person.pk),
+            outcome="SUCCESS",
+        ).order_by("created_at")
+        self.assertEqual(logs.count(), 2)
+        self.assertEqual(
+            len({log.operator_account_id for log in logs}), 2
+        )  # 两次请求两个绑定账号，各自如实记录
+
+    def test_t3_service_failure_middleware_writes_failure_audit(self):
+        """T3：服务层审计失败 → 500 且业务回滚；中间件（声明未撤销）按原
+        行为记录 FAILURE。mock 仅首次调用（服务层）抛错、后续（中间件）
+        放行，与 T1 的恒抛错 mock 严格区分，不误判中间件写入。"""
+        from unittest import mock
+
+        real_create = AuditLog.objects.create
+        calls = {"n": 0}
+
+        def flaky_create(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:  # 仅服务层事务内首次写入失败
+                raise Exception("audit db down")
+            return real_create(*args, **kwargs)
+
+        with mock.patch.object(AuditLog.objects, "create", side_effect=flaky_create):
+            resp = self.client.post(
+                PEOPLE,
+                data=json.dumps(
+                    {
+                        "kinds": ["ATHLETE"],
+                        "realName": "钱事务",
+                        "idNumber": "110101201001019821",
+                        "schoolOrgId": str(self.org_school.pk),
+                    }
+                ),
+                content_type="application/json",
+                raise_request_exception=False,
+                **self._auth(self.admin_token),
+            )
+        self.assertEqual(resp.status_code, 500)
+        self.assertEqual(Person.objects.filter(full_name="钱事务").count(), 0)
+        # 中间件 FAILURE 恰一条（声明未撤销→原行为写入），无 SUCCESS 残留
+        failures = AuditLog.objects.filter(
+            action="person.create", outcome="FAILURE"
+        )
+        self.assertEqual(failures.count(), 1)
+        self.assertEqual(
+            failures.first().operator_account_id, self.admin.pk
+        )
+        self.assertEqual(
+            AuditLog.objects.filter(
+                action="person.create", outcome="SUCCESS"
+            ).count(),
+            0,
+        )
