@@ -28,8 +28,8 @@ class Command(BaseCommand):
         from apps.events.models import Match, MatchEvent
         from apps.enrollments.models import RosterItem
 
-        event_id = (options.get("event-id") or "").strip()
-        match_id = (options.get("match-id") or "").strip()
+        event_id = (options.get("event_id") or "").strip()
+        match_id = (options.get("match_id") or "").strip()
         dry_run = bool(options.get("dry_run"))
 
         if match_id:
@@ -55,7 +55,7 @@ class Command(BaseCommand):
             # 取主客队报名运动员作为被罚球员（按创建顺序前两名，黄牌用；红牌用第一名）
             def roster_athletes(team_id):
                 return list(
-                    RosterItem.objects.filter(team_id=team_id)
+                    RosterItem.objects.filter(deleted_at__isnull=True, enrollment__team_id=team_id)
                     .order_by("created_at")
                     .values_list("athlete_id", flat=True)[:3]
                 )
