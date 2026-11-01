@@ -40,13 +40,15 @@ from .models import ENROLLMENT_STATUSES, SUBJECT_TYPES
 router = Router(tags=["enrollments"])
 _auth = JWTAuth()
 
-# 角色元组：R5 全业务角色（只读/名单/材料维护）；R1 仅学校端（报名单写操作）；
+# 角色元组：R5 全业务角色（只读/名单/材料维护）；R1 报名单写操作（学校端 + 球队端）；
 # R3 审核/统计（ADMIN 依口径可代审，但不代建代提）。
 # MATCH_RECORDER 纳入 R5 仅为赛前身份核验读取名册/运动员（只读，不授予任何写权限）。
-# 报送主体口径（已确认 2026-10-27）：仅 UNIVERSITY 可报送；TEAM/CITY/PROVINCE_REVIEWER/ADMIN
-# 一律不可代报（含市州代报）。故 R1 仅含 UNIVERSITY，subject_type_allowed 亦只放行 UNIVERSITY。
+# 报送主体口径（2026-11-01 修订，原 2026-10-27「仅学校端可报送」已由用户裁定放开）：
+#   - UNIVERSITY：本校球队（SCHOOL_TEAM）；
+#   - TEAM：仅本队（SCHOOL_TEAM），数据范围由 ensure_team_in_scope 校验；
+#   - CITY/PROVINCE_REVIEWER/ADMIN：仍不可代报（含市州代报）。
 R5 = (TEAM, UNIVERSITY, CITY, PROVINCE_REVIEWER, ADMIN, MATCH_RECORDER)
-R1 = (UNIVERSITY,)
+R1 = (UNIVERSITY, TEAM)
 R3 = (CITY, PROVINCE_REVIEWER, ADMIN)
 
 # 权限点登记（导入期完成，漏登记 require() 会直接报错）

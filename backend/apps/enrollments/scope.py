@@ -92,21 +92,20 @@ def get_enrollment(account, enrollment_id: str) -> Enrollment:
 def subject_type_allowed(account, subject_type: str) -> None:
     """谁能以什么主体类型报单。
 
-    规则（已确认口径：仅学校端可报送，不设任何代报）：
-    - UNIVERSITY 角色：SCHOOL_TEAM（本校球队）或 UNIVERSITY（自己作为主体）
-    - TEAM/CITY/PROVINCE_REVIEWER/ADMIN：不可报送（不代建代提，含市州代报）
-    另外还要由 ensure_team_in_scope 确认球队在数据范围内。
+    规则（2026-11-01 用户裁定修订）：
+    - UNIVERSITY 角色：本校球队 SCHOOL_TEAM（UNIVERSITY 主体本项目无高校组，已拒）
+    - TEAM 角色：仅本队 SCHOOL_TEAM，球队归属由 ensure_team_in_scope 校验
+    - CITY/PROVINCE_REVIEWER/ADMIN：不可报送（不代建代提，含市州代报）
     """
     roles = role_set(account)
     allowed: set[str] = set()
-    if UNIVERSITY in roles:
+    if UNIVERSITY in roles or TEAM in roles:
         allowed.add("SCHOOL_TEAM")
-        allowed.add("UNIVERSITY")
     if not allowed:
         raise ApiError(
             FORBIDDEN,
             "当前角色无报送权限",
-            [{"field": "subjectType", "reason": "仅学校端可报送"}],
+            [{"field": "subjectType", "reason": "仅学校端/球队端可报送"}],
         )
     # 2026-10-28 业务规则：本项目无"高校组"，报送主体仅中小学球队
     # （CITY 代报是否放行属 D-1 契约，仍走原 403 分支）；UNIVERSITY
@@ -120,20 +119,34 @@ def subject_type_allowed(account, subject_type: str) -> None:
 
 
 def ensure_enrollment_creator(account, enrollment: Enrollment) -> None:
-    """报名单的编辑/提交/撤回：仅学校端账号可操作（已确认不设代报）。"""
+    """报名单的编辑/提交/撤回：学校端（创建者本人）或球队端（本队）可操作。
+
+    - UNIVERSITY：仅创建该报名的账号（本校范围内，不代他人操作）；
+    - TEAM（2026-11-01 用户裁定放开）：报名单所属球队在账号数据范围内即可，
+      不再要求 created_by 一致——球队账号换人接手时仍能继续维护本队报名。
+    """
     roles = role_set(account)
-    if UNIVERSITY not in roles:
-        raise ApiError(
-            FORBIDDEN,
-            "当前角色不能操作报名单",
-            [{"field": "enrollmentId", "reason": "仅学校端可操作"}],
-        )
-    if account.pk != enrollment.created_by:
-        raise ApiError(
-            FORBIDDEN,
-            "仅创建该报名的账号可操作",
-            [{"field": "enrollmentId", "reason": "非报名的创建者"}],
-        )
+    if UNIVERSITY in roles:
+        if account.pk != enrollment.created_by:
+            raise ApiError(
+                FORBIDDEN,
+                "仅创建该报名的账号可操作",
+                [{"field": "enrollmentId", "reason": "非报名的创建者"}],
+            )
+        return
+    if TEAM in roles:
+        if enrollment.team_id not in set(team_scope_ids(account)):
+            raise ApiError(
+                DATA_SCOPE_DENIED,
+                "该报名单不在当前账号的球队范围内",
+                [{"field": "enrollmentId", "reason": "超出球队范围"}],
+            )
+        return
+    raise ApiError(
+        FORBIDDEN,
+        "当前角色不能操作报名单",
+        [{"field": "enrollmentId", "reason": "仅学校端/球队端可操作"}],
+    )
 
 
 def ensure_team_in_scope(account, team: dict) -> None:

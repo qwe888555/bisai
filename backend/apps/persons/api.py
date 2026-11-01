@@ -672,6 +672,28 @@ def my_teams(request):
     return ok(services.list_own_teams(person_id))
 
 
+# GET /me/team-affiliations（2026-11-01 补齐）：前端 MyTeamsView 的「归属记录」
+# 表格此前只有 mock 实现，真实模式下接口 404 只能隐藏。本接口只读回放正式关系
+# 表（TeamMember + TeamCoach，含 EXITED 历史），分页信封与前端 meApi.affiliations
+# 的 PageResult<MyAffiliation> 一致；自报归属（UNVERIFIED）需申请表，B5 未采用，
+# 写操作仍未提供，前端在真实模式下不展示新增/结束/删除入口。
+register_operation("myTeamAffiliations", (ATHLETE, COACH))
+
+
+@router.get(
+    "/me/team-affiliations",
+    auth=_auth,
+    response=EnvelopeOut,
+    summary="本人球队归属记录",
+)
+def my_team_affiliations(request):
+    account = require("myTeamAffiliations")
+    person_id = _own_person_id(account)
+    if not person_id:
+        raise ApiError(NOT_FOUND, "当前账号未绑定人员档案")
+    return paginate_list(request, services.list_own_team_affiliations(person_id))
+
+
 # §6.8 档案聚合（批次 D-1）：文档角色 ADMIN/PROVINCE_REVIEWER（接口文档
 # L1740/L1762）；数据范围复用 apply_person_scope（非 ADMIN → 403
 # DATA_SCOPE_DENIED，D5 同口径，PROVINCE_REVIEWER 权限点通过但范围拒绝）。

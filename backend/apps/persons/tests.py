@@ -3411,6 +3411,35 @@ class MyProfileApiTests(TestCase):
         self.assertEqual(data["realName"], "李大 Coach")
         self.assertEqual(data["kinds"], ["COACH"])
         self.assertEqual(data["reviewStatus"], "PENDING")
+        # 2026-11-01：教练没有 TeamMember 行，teamName 回落到现役 TeamCoach
+        self.assertEqual(data["teamName"], "甲一小男足一队")
+
+    def test_team_affiliations_list_own_relations(self):
+        """GET /me/team-affiliations：回放正式关系（现役在前，含 EXITED 历史）。"""
+        resp = self.client.get(
+            "/api/v1/me/team-affiliations?page=1&pageSize=50",
+            **self._auth(self.athlete_token),
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        payload = resp.json()["data"]
+        self.assertEqual(payload["total"], 2)
+        first = payload["items"][0]
+        self.assertEqual(first["teamName"], "甲一小男足一队")
+        self.assertEqual(first["relation"], "运动员")
+        self.assertTrue(first["current"])
+        self.assertEqual(first["verifyStatus"], "VERIFIED")
+        # 历史关系：current=false 且带结束时间
+        history = payload["items"][1]
+        self.assertEqual(history["teamName"], "甲一小男足二队")
+        self.assertFalse(history["current"])
+        self.assertIsNotNone(history["endDate"])
+
+        coach_resp = self.client.get(
+            "/api/v1/me/team-affiliations", **self._auth(self.coach_token)
+        )
+        self.assertEqual(coach_resp.status_code, 200, coach_resp.content)
+        coach_items = coach_resp.json()["data"]["items"]
+        self.assertEqual(coach_items[0]["relation"], "主教练")
 
     def test_account_without_person_returns_404(self):
         resp = self.client.get(ME_PROFILE, **self._auth(self.unbound_token))

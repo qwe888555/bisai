@@ -19,7 +19,9 @@ from apps.common.pagination import paginate
 from apps.common.permissions import (
     ADMIN,
     ALL_ROLES,
+    ATHLETE,
     CITY,
+    COACH,
     MATCH_RECORDER,
     PROVINCE_REVIEWER,
     TEAM,
@@ -252,8 +254,9 @@ def available_groups(request, event_id: str):
 # ---------------------------------------------------------------- 比赛对阵管理（5.1）
 
 _MATCH_ROLES = (MATCH_RECORDER, ADMIN, PROVINCE_REVIEWER)
-# 对阵只读：比赛页需要学校端、市州、球队也能查看，写操作仍限制在 _MATCH_ROLES
-_MATCH_READ_ROLES = _MATCH_ROLES + (CITY, UNIVERSITY, TEAM)
+# 对阵只读：比赛页需要学校端、市州、球队、运动员/教练也能查看，写操作仍限制在 _MATCH_ROLES
+# （2026-11-01 用户裁定：运动员/教练个人页放开认证业务接口只读，去掉「403 只能走公开接口」的限制）
+_MATCH_READ_ROLES = _MATCH_ROLES + (CITY, UNIVERSITY, TEAM, ATHLETE, COACH)
 register_operation("matchList", _MATCH_READ_ROLES)
 register_operation("matchGet", _MATCH_READ_ROLES)
 register_operation("matchCreate", _MATCH_ROLES)
@@ -860,8 +863,11 @@ register_operation("matchResultGet", _RESULT_ROLES)
 register_operation("matchResultWrite", _RESULT_ROLES)
 register_operation("matchResultPublish", _RESULT_ROLES)
 register_operation("matchResultDelete", _RESULT_ROLES)
-register_operation("goalRanking", _RESULT_ROLES)
-register_operation("standingList", _RESULT_ROLES)
+# 统计只读（2026-11-01）：进球榜/积分榜属公开数据，运动员/教练与各端均可读取；
+# 赛果读写仍限制在 _RESULT_ROLES。
+_STATS_READ_ROLES = _RESULT_ROLES + (CITY, UNIVERSITY, TEAM, ATHLETE, COACH)
+register_operation("goalRanking", _STATS_READ_ROLES)
+register_operation("standingList", _STATS_READ_ROLES)
 
 
 @router.get("/matches/{match_id}/result", auth=_auth, response=EnvelopeOut, summary="赛果信息")

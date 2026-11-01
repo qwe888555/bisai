@@ -324,6 +324,37 @@ class ApiSmokeTests(TestCase):
             self.assertIn("api:matchList", me["permissions"])
             self.assertIn("api:eventList", me["permissions"])
 
+    def test_athlete_coach_can_read_matches_and_teams(self):
+        """2026-11-01 用户裁定：运动员/教练个人页可直接读比赛与球队档案，
+        不再被迫只走 /public/* 接口；写操作仍然拒绝。"""
+        for username in ("athlete", "coach"):
+            token = self.login(username)
+            for path in ("/matches", "/teams", "/statistics/goals?eventId=evt_demo"):
+                response = self.get(path, token)
+                self.assertEqual(
+                    response.status_code,
+                    200,
+                    f"{username} 读取 {path} 被拒：{response.content}",
+                )
+            me = body(self.get("/me", token))["data"]
+            self.assertIn("api:matchList", me["permissions"])
+            self.assertIn("api:teamGet", me["permissions"])
+
+            created = self.post(
+                "/matches",
+                {
+                    "eventId": "evt_demo",
+                    "groupId": "grp_male_u15",
+                    "homeTeamId": "team_demo_a",
+                    "awayTeamId": "team_demo_b",
+                    # 用合法 body：schema 校验先于权限判定，非法 body 会先返回 400
+                    "kickoffAt": "2026-06-01T10:00:00+08:00",
+                    "status": "SCHEDULED",
+                },
+                token,
+            )
+            self.assertEqual(created.status_code, 403, created.content)
+
     def test_match_and_event_writes_still_denied_for_school_city_team(self):
         for username in ("city", "team", "university"):
             token = self.login(username)

@@ -36,7 +36,9 @@ from apps.common.middleware import audit_state
 from apps.common.pagination import paginate
 from apps.common.permissions import (
     ADMIN,
+    ATHLETE,
     CITY,
+    COACH,
     PROVINCE_REVIEWER,
     TEAM,
     UNIVERSITY,
@@ -55,8 +57,11 @@ _auth = JWTAuth()
 # 角色集逐条对齐契约文档（docs/后端接口文档.md 各接口“角色：”行）：
 # 10 个接口均为 TEAM / UNIVERSITY / CITY / PROVINCE_REVIEWER / ADMIN。
 _TEAM_ROLES = (ADMIN, UNIVERSITY, TEAM, CITY, PROVINCE_REVIEWER)
-register_operation("teamList", _TEAM_ROLES)
-register_operation("teamGet", _TEAM_ROLES)
+# 球队只读（2026-11-01 用户裁定）：运动员/教练个人页可直接查球队档案与赛程，
+# 写操作仍限定在原角色集。
+_TEAM_READ_ROLES = _TEAM_ROLES + (ATHLETE, COACH)
+register_operation("teamList", _TEAM_READ_ROLES)
+register_operation("teamGet", _TEAM_READ_ROLES)
 register_operation("teamCreate", _TEAM_ROLES)
 register_operation("teamUpdate", _TEAM_ROLES)
 # 成员域：读=管理端花名册 + 球队端名单页；写=名单页 + 省市管理端，
@@ -74,7 +79,7 @@ register_operation("teamCoachCreate", _TEAM_ROLES)
 register_operation("teamCoachDelete", _TEAM_ROLES)
 # 球队赛程聚合入口（契约 api:teamMatches，2026-10-29 交付）：路由归球队域，
 # 查询委托 events 比赛读服务（docs/后端接口文档.md teamMatches 契约）。
-register_operation("teamMatches", _TEAM_ROLES)
+register_operation("teamMatches", _TEAM_READ_ROLES)
 
 
 @router.get("/teams", auth=_auth, response=EnvelopeOut, summary="球队档案列表")

@@ -20,6 +20,7 @@ from typing import Optional
 from django.core.exceptions import ObjectDoesNotExist
 from django.db import transaction
 from django.db.models import Count, Exists, OuterRef, Q, QuerySet, Subquery
+from django.db.models.functions import Coalesce
 from django.utils import timezone
 
 from apps.common import crypto, enums
@@ -415,10 +416,17 @@ def people_queryset() -> QuerySet:
     """人员主档基础查询：排除软删；学校、扩展档案、现役球队名一次取齐。
 
     team_name 取现役（CURRENT）球队名（team_member 单向流转，历史关系不计）。
+    coach 没有 TeamMember 行，2026-11-01 起回落到现役教练关系 TeamCoach，
+    否则 /me/profile 对教练恒为空（前端只能自己用 /me/teams 兜底）。
     """
-    current_team_name = TeamMember.objects.filter(
-        person=OuterRef("pk"), status=enums.RelationStatus.CURRENT
-    ).values("team__name")[:1]
+    current_team_name = Coalesce(
+        TeamMember.objects.filter(
+            person=OuterRef("pk"), status=enums.RelationStatus.CURRENT
+        ).values("team__name")[:1],
+        TeamCoach.objects.filter(
+            person=OuterRef("pk"), status=enums.RelationStatus.CURRENT
+        ).values("team__name")[:1],
+    )
     return (
         Person.objects.filter(is_deleted=False)
         .select_related("school")
@@ -1655,6 +1663,97 @@ def list_own_teams(person_id: str) -> list[dict]:
         .order_by("created_at", "id")
     )
     return [_team_brief_out(row) for row in rows]
+
+
+def list_own_team_affiliations(person_id: str) -> list[dict]:
+    """GET /me/team-affiliations：本人球队归属记录（含现役与历史）。
+
+    契约（前端 zuqiu types.ts:MyAffiliation + mock adapter.ts:339）：分页信封，
+    元素字段 id/personId/teamId/teamName/relation/startDate/endDate/current/
+    verifyStatus/version。数据源=正式关系表 TeamMember + TeamCoach：
+    - relation：球员关系固定「运动员」，教练关系按 CoachDuty 中文标签；
+    - verifyStatus 固定 VERIFIED（正式关系本身就是核验结果；自报归属的
+      UNVERIFIED/REJECTED 需申请表，B5 未采用，故无历史数据可回放）；
+    - EXITED 历史关系按 left_at 收尾，current=false 供前端区分「已结束」；
+    - 排序：现役在前，其次按加入日期倒序。
+    """
+    pid = int(person_id)
+    rows: list[dict] = []
+    members = (
+        TeamMember.objects.filter(person_id=pid, team__is_deleted=False)
+        .select_related("team")
+        .order_by("-joined_at", "-id")
+    )
+    for item in members:
+        rows.append(
+            _affiliation_out(
+                key=f"tm_{item.pk}",
+                person_id=pid,
+                team=item.team,
+                relation="运动员",
+                joined_at=item.joined_at,
+                left_at=item.left_at,
+                current=item.status == enums.RelationStatus.CURRENT,
+                updated_at=item.updated_at,
+            )
+        )
+    coaches = (
+        TeamCoach.objects.filter(person_id=pid, team__is_deleted=False)
+        .select_related("team")
+        .order_by("-joined_at", "-id")
+    )
+    for item in coaches:
+        rows.append(
+            _affiliation_out(
+                key=f"tc_{item.pk}",
+                person_id=pid,
+                team=item.team,
+                relation=_COACH_DUTY_LABELS.get(item.duty, "教练"),
+                joined_at=item.joined_at,
+                left_at=item.left_at,
+                current=item.status == enums.RelationStatus.CURRENT,
+                updated_at=item.updated_at,
+            )
+        )
+    # 现役在前，其次按加入日期倒序（最新的关系排上面）
+    rows.sort(key=lambda row: (row["current"], row["startDate"] or ""), reverse=True)
+    return rows
+
+
+_COACH_DUTY_LABELS = {
+    "HEAD_COACH": "主教练",
+    "ASSISTANT_COACH": "助理教练",
+    "GOALKEEPER_COACH": "守门员教练",
+    "FITNESS_COACH": "体能教练",
+    "MANAGER": "领队",
+    "OTHER": "教练",
+}
+
+
+def _affiliation_out(
+    *,
+    key: str,
+    person_id: int,
+    team,
+    relation: str,
+    joined_at,
+    left_at,
+    current: bool,
+    updated_at,
+) -> dict:
+    return {
+        "id": key,
+        "personId": str(person_id),
+        "teamId": str(team.pk),
+        "teamName": team.name,
+        "relation": relation,
+        # 空值统一给 ""（信封内不出现 null；前端 types.ts 的 startDate?/endDate? 直接可用）
+        "startDate": joined_at.isoformat() if joined_at else "",
+        "endDate": left_at.isoformat() if left_at else "",
+        "current": bool(current),
+        "verifyStatus": "VERIFIED",
+        "version": int(updated_at.timestamp() * 1_000_000) if updated_at else 0,
+    }
 
 
 def _team_brief_out(team) -> dict:

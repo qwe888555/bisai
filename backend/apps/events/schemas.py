@@ -420,6 +420,10 @@ def content_out(content) -> dict:
         "revision": int(content.revision or 1),
         "bodyText": content.body_text or "",
         "version": int(content.version or 0),
+        # 赛果快讯自动生成标记（2026-11-01）：返回值让调用方/验收可确认这条
+        # 「赛果：…」是系统按 source_match_id 幂等生成的，而不是人工录入。
+        "autoCreated": bool(content.auto_created),
+        "sourceMatchId": content.source_match_id or "",
         "createdAt": content.created_at,
         "updatedAt": content.updated_at,
     }
@@ -459,6 +463,9 @@ def public_content_out(content, base_url: str = "") -> dict:
         "groupId": content.group_id or "",
         "publishedAt": content.published_at,
         "revision": int(content.revision or 1),
+        # 赛果快讯自动生成标记：门户侧同样可据此展示「自动生成」来源。
+        "autoCreated": bool(content.auto_created),
+        "sourceMatchId": content.source_match_id or "",
     }
 
 
