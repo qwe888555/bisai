@@ -15,6 +15,7 @@ from apps.common.schemas import StrictSchema
 from .services import event_phase
 
 from . import display
+from .models import event_category_label
 
 EventStatus = Literal["DRAFT", "REGISTRATION_OPEN", "REGISTRATION_CLOSED", "RUNNING", "FINISHED"]
 GroupCategory = Literal["PRIMARY", "MIDDLE"]
@@ -63,6 +64,7 @@ def event_out(event) -> dict:
         "name": event.name,
         "season": event.season,
         "eventCategory": event.event_category,
+        "eventCategoryLabel": event_category_label(event.event_category),
         "registrationOpensAt": event.registration_opens_at,
         "registrationClosesAt": event.registration_closes_at,
         "status": event.status,
@@ -500,6 +502,23 @@ def goal_ranking_row_out(rank: int, athlete_id: str, athlete_name: str,
         "goals": int(goals),
     }
 
+
+def standing_row_out(row: dict) -> dict:
+    """积分榜行投影：球队名称取成员4 Team 主档，查不到回退 ID。"""
+    return {
+        "rank": row["rank"],
+        "teamId": row["teamId"],
+        "teamName": display.team_name(row["teamId"], row["teamId"]),
+        "played": row["played"],
+        "wins": row["wins"],
+        "draws": row["draws"],
+        "losses": row["losses"],
+        "goalsFor": row["goalsFor"],
+        "goalsAgainst": row["goalsAgainst"],
+        "goalDiff": row["goalDiff"],
+        "points": row["points"],
+    }
+
 # ---------------------------------------------------------------- 门户公开只读(T5-07)
 
 def public_event_out(event) -> dict:
@@ -511,6 +530,7 @@ def public_event_out(event) -> dict:
         "name": event.name,
         "season": event.season,
         "eventCategory": event.event_category,
+        "eventCategoryLabel": event_category_label(event.event_category),
         "status": event.status,
         "currentPhase": phase["currentPhase"],
         "phaseStartedAt": phase["phaseStartedAt"],
@@ -529,6 +549,8 @@ def public_match_out(match) -> dict:
         "eventName": display.event_name(match.event_id, match.event_id),
         "groupId": match.group_id,
         "groupName": display.group_name(match.group_id, match.group_id),
+        "homeTeamId": match.home_team_id,
+        "awayTeamId": match.away_team_id,
         "homeTeamName": display.team_name(match.home_team_id, match.home_team_id),
         "awayTeamName": display.team_name(match.away_team_id, match.away_team_id),
         "kickoffAt": match.kickoff_at,
