@@ -861,6 +861,7 @@ register_operation("matchResultWrite", _RESULT_ROLES)
 register_operation("matchResultPublish", _RESULT_ROLES)
 register_operation("matchResultDelete", _RESULT_ROLES)
 register_operation("goalRanking", _RESULT_ROLES)
+register_operation("standingList", _RESULT_ROLES)
 
 
 @router.get("/matches/{match_id}/result", auth=_auth, response=EnvelopeOut, summary="赛果信息")
@@ -910,6 +911,18 @@ def goal_ranking(
     page = max(1, page)
     pageSize = min(100, max(1, pageSize))
     return ok(services.goal_ranking(eventId, groupId, category, page, pageSize))
+
+
+@router.get("/statistics/standings", auth=_auth, response=EnvelopeOut, summary="赛事官方积分榜")
+def standings(
+    request,
+    eventId: str,
+    groupId: Optional[str] = None,
+):
+    require("standingList")
+    result = services.standings(eventId, groupId)
+    result["items"] = [s.standing_row_out(row) for row in result["items"]]
+    return ok(result)
 
 # ---------------------------------------------------------------- 门户公开读(T5-07，免登录)
 
@@ -973,3 +986,14 @@ def public_goal_ranking(
     page = max(1, page)
     pageSize = min(100, max(1, pageSize))
     return ok(services.goal_ranking(eventId, groupId, category, page, pageSize, published_only=True))
+
+
+@router.get("/public/statistics/standings", auth=None, response=EnvelopeOut, summary="门户赛事积分榜")
+def public_standings(
+    request,
+    eventId: str,
+    groupId: Optional[str] = None,
+):
+    result = services.standings(eventId, groupId)
+    result["items"] = [s.standing_row_out(row) for row in result["items"]]
+    return ok(result)

@@ -56,6 +56,55 @@ GROUP_GENDERS = (
     ("MIXED", "混合"),
 )
 
+# 赛事层级标准枚举：取代自由文本 event_category，稳定区分省/市/校/杯赛。
+# 历史自由文本经 0008 数据迁移归一化；未知值一律归入 OTHER。
+EVENT_CATEGORIES = (
+    ("PROVINCIAL_LEAGUE", "省级联赛"),
+    ("CITY_LEAGUE", "市级联赛"),
+    ("SCHOOL_LEAGUE", "校级联赛"),
+    ("CHAMPIONSHIP", "锦标赛"),
+    ("FRIENDLY", "友谊赛"),
+    ("OTHER", "其他"),
+)
+
+_EVENT_CATEGORY_KEYS = {code for code, _ in EVENT_CATEGORIES}
+
+# 历史自由文本 → 标准枚举映射（0008 迁移与写入归一化共用，保持单一口径）
+EVENT_CATEGORY_ALIASES = {
+    "PROVINCIAL": "PROVINCIAL_LEAGUE",
+    "PROVINCIAL_LEAGUE": "PROVINCIAL_LEAGUE",
+    "CITY": "CITY_LEAGUE",
+    "CITY_LEAGUE": "CITY_LEAGUE",
+    "CITY_TOURNAMENT": "CITY_LEAGUE",
+    "SCHOOL": "SCHOOL_LEAGUE",
+    "SCHOOL_LEAGUE": "SCHOOL_LEAGUE",
+    "SCHOOL_GAMES": "SCHOOL_LEAGUE",
+    "CHAMPIONSHIP": "CHAMPIONSHIP",
+    "CHAMPIONSHIPS": "CHAMPIONSHIP",
+    "TOURNAMENT": "CHAMPIONSHIP",
+    "FRIENDLY": "FRIENDLY",
+}
+
+
+def normalize_event_category(value: str) -> str:
+    """把任意赛事分类输入归一化为标准枚举编码；空值/未知值返回 OTHER。"""
+    if not value:
+        return ""
+    key = str(value).strip().upper()
+    if key in _EVENT_CATEGORY_KEYS:
+        return key
+    return EVENT_CATEGORY_ALIASES.get(key, "OTHER")
+
+
+def event_category_label(value: str) -> str:
+    """标准枚举编码 → 中文标签；未知/空值显示「未分级」，前端无需自行兜底。"""
+    if not value:
+        return "未分级"
+    for code, label in EVENT_CATEGORIES:
+        if code == value:
+            return label
+    return "未分级"
+
 
 class Event(SoftDeleteVersionedModel):
     """赛事配置：赛季、报名时间窗与状态。"""
@@ -63,8 +112,10 @@ class Event(SoftDeleteVersionedModel):
     id = models.CharField(primary_key=True, max_length=64)
     name = models.CharField(max_length=200)
     season = models.CharField(max_length=30)
-    # 赛事类别字典编码，可空
-    event_category = models.CharField(max_length=64, blank=True, default="")
+    # 赛事层级标准枚举（见 EVENT_CATEGORIES），写入前经 normalize_event_category 归一化
+    event_category = models.CharField(
+        max_length=32, choices=EVENT_CATEGORIES, blank=True, default=""
+    )
     registration_opens_at = models.DateTimeField()
     registration_closes_at = models.DateTimeField()
     status = models.CharField(
@@ -298,6 +349,8 @@ class Content(SoftDeleteVersionedModel):
     body_text = models.TextField(max_length=50000, blank=True, default="")
     # 由「门户资源·新闻配图」自动创建：标题/摘要/正文跟随配图同步，删除配图时一并下线。
     auto_created = models.BooleanField(default=False)
+    # 自动赛果快讯溯源：publish_match_result 生成的快讯记录来源比赛，幂等 upsert/下线。
+    source_match_id = models.CharField(max_length=64, blank=True, default="")
 
     class Meta:
         db_table = "events_content"

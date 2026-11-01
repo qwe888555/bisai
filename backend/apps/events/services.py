@@ -22,7 +22,7 @@ from apps.common.ids import new_id
 from apps.common.versioning import bump, check_version
 
 from . import display
-from .models import Event, EventGroup
+from .models import Event, EventGroup, normalize_event_category
 
 
 # ---------------------------------------------------------------- 内部校验
@@ -66,7 +66,7 @@ def create_event(data: dict) -> Event:
         id=new_id("evt"),
         name=data["name"],
         season=data["season"],
-        event_category=data.get("eventCategory", ""),
+        event_category=normalize_event_category(data.get("eventCategory", "")),
         registration_opens_at=data["registrationOpensAt"],
         registration_closes_at=data["registrationClosesAt"],
         status=data.get("status", "DRAFT"),
@@ -87,7 +87,7 @@ def update_event(event_id: str, data: dict) -> Event:
     _validate_window(data["registrationOpensAt"], data["registrationClosesAt"])
     event.name = data["name"]
     event.season = data["season"]
-    event.event_category = data.get("eventCategory", "")
+    event.event_category = normalize_event_category(data.get("eventCategory", ""))
     event.registration_opens_at = data["registrationOpensAt"]
     event.registration_closes_at = data["registrationClosesAt"]
     event.status = data.get("status", event.status)
@@ -783,10 +783,15 @@ def _content_queryset(filters: dict, published_only: bool = False):
         kw = filters["keyword"]
         queryset = queryset.filter(title__icontains=kw)
     if filters.get("eventCategory"):
-        event_ids = Event.objects.filter(
-            event_category=filters["eventCategory"]
-        ).values_list("id", flat=True)
-        queryset = queryset.filter(event_id__in=list(event_ids) + [""])
+        event_ids = list(
+            Event.objects.filter(event_category=filters["eventCategory"])
+            .values_list("id", flat=True)
+        )
+        if not event_ids:
+            # 该分类下无赛事：明确返回空集，避免带出无赛事关联的内容
+            queryset = queryset.none()
+        else:
+            queryset = queryset.filter(event_id__in=event_ids)
     return queryset
 
 
@@ -1208,7 +1213,70 @@ def publish_match_result(match_id: str, version: int) -> "Match":
     match.result_published = True
     bump(match)
     match.save()
+    _sync_result_news(match)
     return match
+
+
+def _result_news_title(match) -> str:
+    home = display.team_name(match.home_team_id, match.home_team_id)
+    away = display.team_name(match.away_team_id, match.away_team_id)
+    hs, as_ = int(match.home_score or 0), int(match.away_score or 0)
+    return f"赛果：{home} {hs}:{as_} {away}"
+
+
+def _sync_result_news(match) -> None:
+    """赛果发布后自动生成/更新一条已发布赛果快讯（HIGHLIGHT）。
+
+    按 source_match_id 幂等 upsert：同一比赛重复发布只更新不堆积；
+    撤下赛果时由 _offline_result_news 下线对应快讯。
+    """
+    from .models import Content
+
+    event_name = display.event_name(match.event_id, match.event_id)
+    title = _result_news_title(match)
+    summary = f"{title}（{event_name}）"
+    body_html = f"<p>{event_name}</p><p>{title}</p>"
+    content = Content.objects.filter(source_match_id=match.pk).first()
+    if content is None:
+        Content.objects.create(
+            id=new_id("cnt"),
+            content_type="HIGHLIGHT",
+            title=title,
+            summary=summary,
+            body_html=body_html,
+            body_text=summary,
+            event_id=match.event_id,
+            group_id=match.group_id,
+            status="PUBLISHED",
+            published_at=timezone.now(),
+            revision=1,
+            auto_created=True,
+            source_match_id=match.pk,
+        )
+    else:
+        content.title = title
+        content.summary = summary
+        content.body_html = body_html
+        content.body_text = summary
+        content.event_id = match.event_id
+        content.group_id = match.group_id
+        content.status = "PUBLISHED"
+        content.published_at = timezone.now()
+        content.revision = int(content.revision or 1) + 1
+        bump(content)
+        content.save()
+    _invalidate_public_cache()
+
+
+def _offline_result_news(match) -> None:
+    """撤下赛果：将自动快讯下线（不删除，保留审计可查）。"""
+    from .models import Content
+
+    updated = Content.objects.filter(
+        source_match_id=match.pk, status="PUBLISHED"
+    ).update(status="OFFLINE")
+    if updated:
+        _invalidate_public_cache()
 
 
 def delete_match_result(match_id: str, version: int) -> "Match":
@@ -1223,7 +1291,69 @@ def delete_match_result(match_id: str, version: int) -> "Match":
     _rescore(match)
     bump(match)
     match.save()
+    _offline_result_news(match)
     return match
+
+
+# ---------------------------------------------------------------- 官方名次：赛事积分榜（P1）
+
+def standings(event_id: str, group_id: Optional[str] = None) -> dict:
+    """赛事官方积分榜：仅统计已发布赛果（result_published=True）且未取消的比赛。
+
+    计分 3-1-0；排序 积分 → 净胜球 → 进球数 → teamId；密集排名（同分同名次）。
+    淘汰赛晋级/名次依赖赛程编排，不在此积分推算，需按官方赛果发布为准。
+    """
+    from .models import Match
+
+    qs = Match.objects.filter(
+        event_id=event_id, result_published=True
+    ).exclude(status="CANCELLED")
+    if group_id:
+        qs = qs.filter(group_id=group_id)
+
+    table: dict[str, dict] = {}
+    for m in qs:
+        hs, as_ = int(m.home_score or 0), int(m.away_score or 0)
+        for team_id, gf, ga in (
+            (str(m.home_team_id), hs, as_),
+            (str(m.away_team_id), as_, hs),
+        ):
+            row = table.setdefault(team_id, {
+                "teamId": team_id, "played": 0, "wins": 0, "draws": 0,
+                "losses": 0, "goalsFor": 0, "goalsAgainst": 0,
+                "goalDiff": 0, "points": 0,
+            })
+            row["played"] += 1
+            row["goalsFor"] += gf
+            row["goalsAgainst"] += ga
+            if gf > ga:
+                row["wins"] += 1
+                row["points"] += 3
+            elif gf == ga:
+                row["draws"] += 1
+                row["points"] += 1
+            else:
+                row["losses"] += 1
+
+    rows = sorted(
+        table.values(),
+        key=lambda r: (
+            -r["points"],
+            -(r["goalsFor"] - r["goalsAgainst"]),
+            -r["goalsFor"],
+            r["teamId"],
+        ),
+    )
+    ranked: list[dict] = []
+    rank, prev = 0, None
+    for idx, r in enumerate(rows, start=1):
+        r["goalDiff"] = r["goalsFor"] - r["goalsAgainst"]
+        key = (r["points"], r["goalDiff"], r["goalsFor"])
+        if key != prev:
+            rank = idx
+            prev = key
+        ranked.append({"rank": rank, **r})
+    return {"items": ranked, "total": len(ranked)}
 
 
 # ---------------------------------------------------------------- 进球榜(5.5，由 GOAL 事件派生)
