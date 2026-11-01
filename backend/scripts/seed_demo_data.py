@@ -762,8 +762,67 @@ def seed_match_events(contexts: list[dict], matches: dict[str, Match]) -> int:
 # ---------------------------------------------------------------- 文件 / 核验
 
 
+def _demo_pdf(title: str) -> bytes:
+    """最小可识别 PDF 占位内容（配合 seed_files 真实写字节）。"""
+    import re as _re
+
+    text = _re.sub(r"[^\x20-\x7e]", "", title) or "Demo material"
+    stream = f"BT /F1 20 Tf 72 760 Td ({text}) Tj ET".encode("ascii")
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] "
+        b"/Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+        b"<< /Length " + str(len(stream)).encode("ascii") + b" >>\nstream\n" + stream + b"\nendstream",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    ]
+    data = bytearray(b"%PDF-1.4\n")
+    offsets = []
+    for index, body in enumerate(objects, start=1):
+        offsets.append(len(data))
+        data += f"{index} 0 obj\n".encode("ascii") + body + b"\nendobj\n"
+    xref_at = len(data)
+    data += f"xref\n0 {len(objects) + 1}\n".encode("ascii")
+    data += b"0000000000 65535 f \n"
+    for offset in offsets:
+        data += f"{offset:010d} 00000 n \n".encode("ascii")
+    data += (
+        f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\nstartxref\n{xref_at}\n%%EOF\n"
+    ).encode("ascii")
+    return bytes(data)
+
+
+def _demo_jpeg(seed: int) -> bytes:
+    """占位抓拍照 JPEG。"""
+    import io as _io
+
+    from PIL import Image, ImageDraw
+
+    width, height = 640, 480
+    image = Image.new("RGB", (width, height), (36 + seed % 40, 60, 104))
+    draw = ImageDraw.Draw(image)
+    for x in range(-height, width + height, 70):
+        draw.line([(x, 0), (x + height, height)], fill=(60, 96, 148), width=6)
+    draw.ellipse(
+        [width * 0.3, height * 0.2, width * 0.7, height * 0.8],
+        outline=(235, 240, 250), width=4,
+    )
+    buffer = _io.BytesIO()
+    image.save(buffer, format="JPEG", quality=85)
+    return buffer.getvalue()
+
+
+def _write_storage(storage_key: str, data: bytes) -> None:
+    """把字节写入配置的存储后端（Local 散列路径 / MinIO）。"""
+    import io as _io
+
+    from apps.attachments.storage import get_storage
+
+    get_storage().save(storage_key, _io.BytesIO(data))
+
+
 def seed_files(contexts: list[dict], enrollments: dict[str, Enrollment]) -> dict[str, str]:
-    """演示文件记录：核验抓拍照 + 报名材料。"""
+    """演示文件记录：核验抓拍照 + 报名材料（同步写真实占位字节）。"""
     photo_ids: dict[str, str] = {}
     seq = 0
     for match_id, match in _iter_identity_matches(contexts):
@@ -771,6 +830,7 @@ def seed_files(contexts: list[dict], enrollments: dict[str, Enrollment]) -> dict
             for player in players[:4]:
                 seq += 1
                 file_id = f"fil_demo_face_{seq:03d}"
+                data = _demo_jpeg(seq)
                 FileRecord.objects.update_or_create(
                     id=file_id,
                     defaults={
@@ -779,18 +839,20 @@ def seed_files(contexts: list[dict], enrollments: dict[str, Enrollment]) -> dict
                         "category": "FACE_CAPTURE",
                         "original_name": f"capture_{seq:03d}.jpg",
                         "content_type": "image/jpeg",
-                        "size_bytes": 180000 + seq,
+                        "size_bytes": len(data),
                         "private": True,
                         "storage_key": f"{FILE_KEY_PREFIX}identity/{file_id}.jpg",
                         "storage_backend": "local",
                         "uploaded_by": "acc_recorder",
                     },
                 )
+                _write_storage(f"{FILE_KEY_PREFIX}identity/{file_id}.jpg", data)
                 photo_ids[(match_id, str(player["person"].pk))] = file_id
 
     material_ids: dict[str, dict[str, str]] = {}
     for key, enrollment in enrollments.items():
         form_id = f"fil_demo_form_{key}"
+        form_data = _demo_pdf(f"Enrollment form {key}")
         FileRecord.objects.update_or_create(
             id=form_id,
             defaults={
@@ -799,14 +861,16 @@ def seed_files(contexts: list[dict], enrollments: dict[str, Enrollment]) -> dict
                 "category": "STAMPED_FORM",
                 "original_name": f"报名表与名单_{key}.pdf",
                 "content_type": "application/pdf",
-                "size_bytes": 240000,
+                "size_bytes": len(form_data),
                 "private": True,
                 "storage_key": f"{FILE_KEY_PREFIX}enrollments/{key}/form.pdf",
                 "storage_backend": "local",
                 "uploaded_by": enrollment.created_by or "acc_school01",
             },
         )
+        _write_storage(f"{FILE_KEY_PREFIX}enrollments/{key}/form.pdf", form_data)
         status_id = f"fil_demo_status_{key}"
+        status_data = _demo_pdf(f"Student status {key}")
         FileRecord.objects.update_or_create(
             id=status_id,
             defaults={
@@ -815,13 +879,14 @@ def seed_files(contexts: list[dict], enrollments: dict[str, Enrollment]) -> dict
                 "category": "STUDENT_STATUS",
                 "original_name": f"学籍证明_{key}.pdf",
                 "content_type": "application/pdf",
-                "size_bytes": 150000,
+                "size_bytes": len(status_data),
                 "private": True,
                 "storage_key": f"{FILE_KEY_PREFIX}enrollments/{key}/status.pdf",
                 "storage_backend": "local",
                 "uploaded_by": enrollment.created_by or "acc_school01",
             },
         )
+        _write_storage(f"{FILE_KEY_PREFIX}enrollments/{key}/status.pdf", status_data)
         material_ids[key] = {"form": form_id, "status": status_id}
     _STATS["files"] = FileRecord.objects.filter(storage_key__startswith=FILE_KEY_PREFIX).count()
     log(f"✅ 演示文件：{_STATS['files']} 条文件记录")

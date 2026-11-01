@@ -184,7 +184,36 @@ def delete_group(event_id: str, group_id: str, version: Optional[int]) -> EventG
 
 # ---------------------------------------------------------------- 比赛对阵（5.1）
 
-def list_matches(filters: dict):
+def _match_scope_team_ids(account) -> Optional[list]:
+    """TEAM 账号的比赛数据范围：仅本队参与的对阵（2026-10-29 交付）。
+
+    与 teams.visible_teams 的 TEAM 分支同源（team_no=账号组织节点 code）；
+    球队端比赛页（zuqiu matchApi.list，不带 teamId）据此只返回本队赛程，
+    不再全量返回。其余账号（全局管理员/MATCH_RECORDER/学校/市州/省级管理端）
+    暂不限制（返回 None，行为不变）；TEAM 账号未绑定球队组织 → 403
+    DATA_SCOPE_DENIED（visible_teams 同款语义，不静默返回空列表）。
+    """
+    from apps.common.errors import DATA_SCOPE_DENIED
+    from apps.common.permissions import TEAM
+    from apps.common.scopes import account_org_code, is_global_admin
+    from apps.teams.models import Team
+
+    if is_global_admin(account):
+        return None
+    if TEAM not in (getattr(account, "roles", ()) or ()):
+        return None
+    code = account_org_code(account)
+    if not code:
+        raise ApiError(DATA_SCOPE_DENIED, "球队账号未绑定球队组织，无法确定数据范围")
+    return [
+        str(pk)
+        for pk in Team.objects.filter(is_deleted=False, team_no=code).values_list(
+            "pk", flat=True
+        )
+    ]
+
+
+def list_matches(filters: dict, account=None):
     from django.db.models import Q
 
     from .models import Match
@@ -215,6 +244,14 @@ def list_matches(filters: dict):
             )
         else:
             queryset = queryset.none()
+    if account is not None:
+        # 球队账号数据范围（不带 teamId 也只看本队赛程）；显式 teamId 筛选与
+        # 范围取交集，筛选条件不扩大权限。
+        scope_ids = _match_scope_team_ids(account)
+        if scope_ids is not None:
+            queryset = queryset.filter(
+                Q(home_team_id__in=scope_ids) | Q(away_team_id__in=scope_ids)
+            )
     return queryset.order_by("kickoff_at", "id")
 
 

@@ -75,6 +75,17 @@ def _to_bool(raw: str | None, default: bool) -> bool:
     return str(raw).strip().lower() in TRUE_SET
 
 
+APPLIES_TO_TOKENS = ("PERSON", "TEAM")
+
+
+def _parse_applies_to(raw: str) -> str:
+    """applies_to 归一化：PERSON/TEAM 或双归属 PERSON,TEAM（BOTH 等其余值非法）。"""
+    parts = [p.strip() for p in (raw or "").split(",") if p.strip()]
+    if not parts or len(set(parts)) != len(parts) or any(p not in APPLIES_TO_TOKENS for p in parts):
+        raise ValueError(f"applies_to 非法: {raw!r}(PERSON/TEAM，双归属写 PERSON,TEAM)")
+    return ",".join(p for p in APPLIES_TO_TOKENS if p in parts)
+
+
 def _read_csv(path: str) -> list[dict]:
     """读取 CSV（兼容 Excel 的 utf-8-sig BOM；多余列丢弃，缺失值按空串）。"""
     file = Path(path)
@@ -294,8 +305,7 @@ class Command(BaseCommand):
             applies = row.get("applies_to", "")
             if not code or not name:
                 raise ValueError("code/name 必填")
-            if applies not in {"PERSON", "TEAM"}:
-                raise ValueError(f"applies_to 非法: {applies!r}(PERSON/TEAM)")
+            applies = _parse_applies_to(applies)
             defaults = {"name": name, "applies_to": applies,
                         "is_required": _to_bool(row.get("is_required"), False),
                         "need_audit": _to_bool(row.get("need_audit"), True),
@@ -395,9 +405,11 @@ class Command(BaseCommand):
             if MaterialType.objects.count() == 0:
                 findings.append(("INFO", "material_type: 空表, 未初始化"))
             for m in MaterialType.objects.order_by("pk"):
-                if m.applies_to not in ("PERSON", "TEAM"):  # 与导入校验同源
+                try:  # 与导入校验同源
+                    _parse_applies_to(m.applies_to)
+                except ValueError:
                     findings.append(("ERROR", f"material_type: code={m.code}"
-                                              f" applies_to={m.applies_to!r} 非法(允许: PERSON/TEAM)"))
+                                              f" applies_to={m.applies_to!r} 非法(允许: PERSON/TEAM,双归属 PERSON,TEAM)"))
 
         errors = [f for lv, f in findings if lv == "ERROR"]
         warns = [f for lv, f in findings if lv == "WARN"]

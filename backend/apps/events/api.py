@@ -272,9 +272,10 @@ def match_list(
     teamId: Optional[str] = None,
     teamName: Optional[str] = None,
 ):
-    require("matchList")
+    account = require("matchList")
     queryset = services.list_matches(
-        {"eventId": eventId, "groupId": groupId, "status": status, "teamId": teamId, "teamName": teamName}
+        {"eventId": eventId, "groupId": groupId, "status": status, "teamId": teamId, "teamName": teamName},
+        account=account,
     )
     return paginate(request, queryset, mapper=s.match_out)
 

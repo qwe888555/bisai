@@ -202,7 +202,7 @@ class TeamApiTests(TestCase):
             "cityName": "甲州市",
             "campusName": "本部",
             "gender": "MALE",
-            "coachName": "被忽略的名字",
+            "coachName": "王教练",
             "intro": "更新后的简介",
             "schoolOrgId": "42",
             "groupCategory": "PRIMARY",
@@ -297,8 +297,12 @@ class TeamApiTests(TestCase):
         self.assertEqual(data["intro"], "校主力队")
         self.assertEqual(data["status"], "APPROVED")
         self.assertIsInstance(data["version"], int)
+        # 2026-10-29 补列落库字段回显（未设置时为 None）
+        for present in ("shortName", "campusName", "gender"):
+            self.assertIn(present, data)
+            self.assertIsNone(data[present])
         # 无承载/无契约键不输出（联调待办：媒体受控 url/orgId）
-        for absent in ("orgId", "cityOrgId", "gender", "campusName", "shortName", "flagUrl"):
+        for absent in ("orgId", "cityOrgId", "flagUrl"):
             self.assertNotIn(absent, data)
 
     def test_get_plain_team_null_coach_and_zero_members(self):
@@ -511,7 +515,7 @@ class TeamApiTests(TestCase):
 
     def test_update_success_with_real_frontend_payload(self):
         """前端真实全字段 payload（含未变化回传字段）→ 正常编辑不失败；
-        可变字段生效，groupCategory/coachName 等被忽略。"""
+        可变字段生效；shortName/campusName/gender/coachName 落库回显。"""
         version = self._current_version(self.team_main)
         payload = self._full_update_payload(self.team_main, version)
         payload["flagFileId"] = "file-flag-new"
@@ -522,12 +526,19 @@ class TeamApiTests(TestCase):
         data = resp.json()["data"]
         self.assertEqual(data["name"], self.team_main.name)  # 未改 name 保留
         self.assertEqual(data["intro"], "更新后的简介")
-        self.assertEqual(data["coachName"], "李教练")  # 忽略传入值，仍为合成
         self.assertEqual(data["category"], "PRIMARY")  # groupCategory 忽略
-        self.assertNotIn("campusName", data)  # 无承载不回显
+        # 2026-10-29 补列落库字段：保存即回显（不再“保存成功但值消失”）
+        self.assertEqual(data["shortName"], "甲一队")
+        self.assertEqual(data["campusName"], "本部")
+        self.assertEqual(data["gender"], "MALE")
+        self.assertEqual(data["coachName"], "王教练")  # 落库值优先于合成
         self.assertGreater(data["version"], version)  # version 前进
         self.team_main.refresh_from_db()
         self.assertEqual(self.team_main.flag_file_id, "file-flag-new")
+        self.assertEqual(self.team_main.short_name, "甲一队")
+        self.assertEqual(self.team_main.campus_name, "本部")
+        self.assertEqual(self.team_main.gender, "MALE")
+        self.assertEqual(self.team_main.coach_name, "王教练")
 
     def test_update_missing_version_400(self):
         resp = self._put(

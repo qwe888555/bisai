@@ -89,6 +89,16 @@ def _require_version(request) -> int:
         raise ApiError(INVALID_ARGUMENT, "version 必须是整数") from exc
 
 
+def _open_stream(key: str):
+    """打开存储字节流；物理字节缺失时转 404（而非泄漏 FileNotFoundError 变 500）。"""
+    from .storage import get_storage
+
+    try:
+        return get_storage().open(key)
+    except FileNotFoundError as exc:
+        raise ApiError(NOT_FOUND, "文件内容缺失，请重新上传") from exc
+
+
 @router.post("/files", operation_id="fileUpload", auth=_auth, response=EnvelopeOut, summary="上传单个文件")
 def file_upload(
     request,
@@ -176,11 +186,9 @@ def file_signed_url(request, file_id: str, variant: str = "content"):
     summary="按短期签名地址读取文件内容",
 )
 def public_file_content(request, file_id: str, exp: int, sign: str = ""):
-    from .storage import get_storage
-
     services.verify_signature(file_id, "content", exp, sign)
     record = services.get_public_record(file_id)
-    stream = get_storage().open(record.storage_key)
+    stream = _open_stream(record.storage_key)
     response = FileResponse(
         stream,
         content_type=record.content_type or "application/octet-stream",
@@ -199,13 +207,11 @@ def public_file_content(request, file_id: str, exp: int, sign: str = ""):
     summary="按短期签名地址读取缩略图",
 )
 def public_file_thumbnail(request, file_id: str, exp: int, sign: str = ""):
-    from .storage import get_storage
-
     services.verify_signature(file_id, "thumbnail", exp, sign)
     record = services.get_public_record(file_id)
     if not record.thumbnail_key:
         raise ApiError(NOT_FOUND, "该文件没有缩略图")
-    stream = get_storage().open(record.thumbnail_key)
+    stream = _open_stream(record.thumbnail_key)
     response = FileResponse(stream, content_type="image/jpeg")
     response["Cache-Control"] = "private, no-store"
     return response
@@ -220,10 +226,8 @@ def public_file_thumbnail(request, file_id: str, exp: int, sign: str = ""):
 )
 def file_download(request, file_id: str):
     actor = require("fileDownload")
-    from .storage import get_storage
-
     record = services.get_record(actor, file_id)
-    stream = get_storage().open(record.storage_key)
+    stream = _open_stream(record.storage_key)
     response = FileResponse(
         stream,
         content_type=record.content_type or "application/octet-stream",
@@ -246,12 +250,10 @@ def file_download(request, file_id: str):
 )
 def file_thumbnail(request, file_id: str):
     actor = require("fileDownload")
-    from .storage import get_storage
-
     record = services.get_record(actor, file_id)
     if not record.thumbnail_key:
         raise ApiError(NOT_FOUND, "该文件没有缩略图")
-    stream = get_storage().open(record.thumbnail_key)
+    stream = _open_stream(record.thumbnail_key)
     response = FileResponse(stream, content_type="image/jpeg")
     response["Cache-Control"] = "private, no-store"
     return response

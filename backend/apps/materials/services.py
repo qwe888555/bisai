@@ -139,7 +139,7 @@ def _resolve_owner(owner_type: str, owner_id: str):
 
 
 def _resolve_material_type(code: str, owner_type: str) -> MaterialType:
-    """类型必须存在于 material_type 表且启用且归属匹配（空表 → 409 明确报错）。"""
+    """类型必须存在于 material_type 表且启用且归属匹配（applies_to 支持 PERSON,TEAM 双归属；空表 → 409 明确报错）。"""
     mtype = MaterialType.objects.filter(code=code).first()
     if mtype is None:
         raise ApiError(
@@ -148,7 +148,7 @@ def _resolve_material_type(code: str, owner_type: str) -> MaterialType:
         )
     if not mtype.is_active:
         raise ApiError(STATE_CONFLICT, f"材料类型 {code} 已停用")
-    if mtype.applies_to != owner_type:
+    if owner_type not in [p.strip() for p in mtype.applies_to.split(",") if p.strip()]:
         raise ApiError(STATE_CONFLICT, f"材料类型 {code} 不适用于 {owner_type} 归属")
     return mtype
 
