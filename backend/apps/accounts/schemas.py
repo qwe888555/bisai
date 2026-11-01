@@ -56,6 +56,13 @@ class InviteRequest(StrictSchema):
     expiresInMinutes: int = Field(default=1440, ge=5, le=10080)
 
 
+class InviteBatchIn(StrictSchema):
+    """批量签发邀请（multipart，配合 Excel 文件）。"""
+
+    orgId: str = Field(default="", max_length=64)
+    expiresInMinutes: int = Field(default=1440, ge=5, le=10080)
+
+
 class AccountCreate(StrictSchema):
     username: str = Field(min_length=3, max_length=64)
     displayName: str = Field(min_length=1, max_length=100)

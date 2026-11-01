@@ -42,7 +42,7 @@ class TeamCreateBody(StrictSchema):
     groupCategory: Literal["PRIMARY", "MIDDLE"]
     schoolOrgId: Optional[str] = Field(None, min_length=1, max_length=64)
     intro: Optional[str] = None
-    # ---- 声明但不持久化（冻结 Team 无对应列）----
+    # ---- 2026-10-29 起落库（补列）：gender/campusName ----
     gender: Optional[str] = Field(None, max_length=20)
     campusName: Optional[str] = Field(None, max_length=100)
 
@@ -55,7 +55,9 @@ class TeamUpdateBody(StrictSchema):
     flagFileId: Optional[str] = Field(None, max_length=64)
     emblemFileId: Optional[str] = Field(None, max_length=64)
     groupPhotoFileId: Optional[str] = Field(None, max_length=64)
-    # ---- 回传原值/无承载：声明但不持久化不回显 ----
+    # ---- 2026-10-29 起落库并回显（补列）：shortName/campusName/gender/coachName ----
+    # ---- 回传原值/无承载：声明但不持久化不回显（schoolName/cityName 为学校/市州
+    #      外键派生只读，schoolOrgId/groupCategory 不可变）----
     shortName: Optional[str] = Field(None, max_length=100)
     schoolName: Optional[str] = Field(None, max_length=100)
     cityName: Optional[str] = Field(None, max_length=100)
@@ -65,6 +67,22 @@ class TeamUpdateBody(StrictSchema):
     schoolOrgId: Optional[str] = Field(None, min_length=1, max_length=64)
     groupCategory: Optional[Literal["PRIMARY", "MIDDLE"]] = Field(None)  # 回传原值：同 create 无高校组
     version: int = Field(ge=0)
+
+
+class CoachAddBody(StrictSchema):
+    """POST /teams/{id}/coaches 请求体（键名与前端 addCoach payload 一致，
+    TeamCoachesView 提交 coachId/category/effectiveFrom）。
+
+    effectiveTo/reviewStatus：契约可选字段，声明以放行（extra=forbid），
+    服务层不应用——effectiveTo 无冻结承载列；reviewStatus 关联级审核列不存在
+    （输出按 person_out 先例直出人员 audit_status，审核对象留待 D1 确认）。
+    """
+
+    coachId: str = Field(min_length=1, max_length=64)
+    category: str = Field(min_length=1, max_length=20)
+    effectiveFrom: str = Field(min_length=10, max_length=10)
+    effectiveTo: Optional[str] = Field(None, max_length=10)
+    reviewStatus: Optional[str] = Field(None, max_length=20)
 
 
 class MemberSearchBody(StrictSchema):
@@ -130,16 +148,40 @@ def member_out(member) -> dict:
     }
 
 
+def coach_out(coach) -> dict:
+    """教练关系输出（dict 直出，对齐前端 TeamCoach 类型消费集）。
+
+    - category ← duty 列原值透传（契约值域 HEAD_COACH/ASSISTANT_COACH/
+      MANAGER/OTHER 与冻结 CoachDuty 不一致，position_code 先例不映射）；
+    - effectiveFrom ← joined_at；effectiveTo ← left_at 日期（现役为 None）；
+    - reviewStatus 直出 person.audit_status（person_out 先例）；
+    - maskedPhone ← person.phone_masked（受控掩码，明文不输出）。
+    """
+    person = coach.person
+    return {
+        "id": str(coach.pk),
+        "teamId": str(coach.team_id),
+        "coachId": str(coach.person_id),
+        "coachName": person.full_name,
+        "category": coach.duty,
+        "effectiveFrom": coach.joined_at.isoformat() if coach.joined_at else None,
+        "effectiveTo": coach.left_at.date().isoformat() if coach.left_at else None,
+        "maskedPhone": person.phone_masked,
+        "reviewStatus": person.audit_status,
+        "version": int(coach.updated_at.timestamp() * 1_000_000),
+    }
+
+
 def team_out(team) -> dict:
     """球队输出（dict 直出，EnvelopeOut.data=Any 不进 components）。
 
     member_count/head_coach_name 由 services._annotate_team 注解提供；
-    输出不含 orgId/cityOrgId/gender/campusName/shortName；
-    媒体三键 2026-10-29 成员4专项修复⑤补齐（列→键映射同请求侧冻结映射）：
-    flagFileId←flag_file_id、emblemFileId←logo_file_id（列注释"队徽"）、
-    groupPhotoFileId←group_photo_file_id，前端保存后凭 fileId 走受控附件
-    下载刷新显示；url（flagUrl/emblemUrl/groupPhotoUrl）仍不输出
-    （受控下载契约无公开直链，联调待办）。
+    shortName/campusName/gender/coachName 为补列落库字段（HEAD 侧扩展）；
+    媒体三键（flagFileId/emblemFileId/groupPhotoFileId）为 9b5676d 成员4
+    专项修复⑤补齐（列→键映射：flagFileId←flag_file_id、
+    emblemFileId←logo_file_id、groupPhotoFileId←group_photo_file_id）；
+    输出不含 orgId/cityOrgId 与 url（flagUrl/emblemUrl/groupPhotoUrl，
+    受控下载契约无公开直链，联调待办）。
     """
     return {
         "id": str(team.pk),
@@ -149,7 +191,10 @@ def team_out(team) -> dict:
         "schoolName": team.school.name if team.school_id else None,
         "cityName": team.region.name if team.region_id else None,
         "intro": team.introduction,
-        "coachName": getattr(team, "head_coach_name", None),
+        "shortName": team.short_name,
+        "campusName": team.campus_name,
+        "gender": team.gender,
+        "coachName": team.coach_name or getattr(team, "head_coach_name", None),
         "memberCount": getattr(team, "member_count", 0),
         "flagFileId": team.flag_file_id,
         "emblemFileId": team.logo_file_id,

@@ -11,7 +11,7 @@ Mapping (main -> member6):
 main model/field        member6 concept
 ======================  ==========================================
 Enrollment.event_id     event_id (string ``evt_...``)
-EventGroup.category     group_type (``UNIVERSITY`` -> ``HIGHER``)
+EventGroup.category     group_type (PRIMARY / MIDDLE)
 RosterItem.athlete_id   scoring candidate_id (person id)
 RosterItem.id           publicity source_id for ATHLETE
 TeamCoach.id            publicity source_id for COACH
@@ -39,12 +39,10 @@ from .publicity_source import PublicitySourceClient, PublicitySourceRecord
 _CATEGORY_TO_GROUP = {
     "PRIMARY": GroupType.PRIMARY,
     "MIDDLE": GroupType.MIDDLE,
-    "UNIVERSITY": GroupType.HIGHER,
 }
 _GROUP_TO_CATEGORIES = {
     GroupType.PRIMARY: ("PRIMARY",),
     GroupType.MIDDLE: ("MIDDLE",),
-    GroupType.HIGHER: ("UNIVERSITY",),
 }
 
 _REQUIRED_APPS = (
@@ -201,6 +199,7 @@ def _athlete_record(item, enrollment, group, person, team):
         group_type=group_type,
         city=_region_name(person, team),
         publicity_type=PublicityType.ATHLETE,
+        candidate_id=str(item.athlete_id or item.id),
         data=data,
     )
 
@@ -268,6 +267,44 @@ def _team_enrollment_map(enrollments):
     for enrollment in enrollments:
         mapping.setdefault(str(enrollment.team_id), enrollment)
     return mapping
+
+
+def person_publicity_source_ids(person_id: str) -> Dict[str, set]:
+    """Return the roster/coach relation IDs that belong to one person.
+
+    PublicityRecord stores the member4 registration row ID as ``source_id``,
+    not the person ID.  Matching through these relation IDs is stable across
+    events and still works after an enrollment is withdrawn or a coach leaves.
+    """
+    from apps.enrollments.models import RosterItem
+    from apps.teams.models import TeamCoach
+
+    person_text = str(person_id or "").strip()
+    if not person_text:
+        return {}
+
+    # RosterItem.athlete_id is a string and may use an opaque ``per_...`` ID in
+    # the main archive, so it must not be forced through an int conversion.
+    athlete_ids = {
+        str(value)
+        for value in RosterItem.objects.filter(
+            athlete_id=person_text
+        ).values_list("id", flat=True)
+    }
+
+    coach_ids = set()
+    numeric_person_id = _as_int(person_text)
+    if numeric_person_id is not None:
+        coach_ids = {
+            str(value)
+            for value in TeamCoach.objects.filter(
+                person_id=numeric_person_id
+            ).values_list("id", flat=True)
+        }
+    return {
+        PublicityType.ATHLETE: athlete_ids,
+        PublicityType.COACH: coach_ids,
+    }
 
 
 # ---------------------------------------------------------------------------

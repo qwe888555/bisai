@@ -7,14 +7,15 @@ project (DRF, Ninja or plain Django views).
 """
 
 import logging
-from typing import Any, Union
+from typing import Any, Optional, Union
 
+from django.conf import settings
 from django.http import HttpRequest, JsonResponse
 from ninja import Body, NinjaAPI, Router, Schema
 from ninja.errors import ValidationError
 from ninja.renderers import JSONRenderer
 
-from .auth import SelectionAuth
+from .auth import SelectionAuth, main_auth_available
 from .common import (
     BusinessError,
     fail,
@@ -24,6 +25,7 @@ from .common import (
     parse_page,
 )
 from .enums import GroupType, RoundType
+from .services import candidates as candidate_service
 from .services import excel as excel_service
 from .services import publicity as publicity_service
 from .services import results as result_service
@@ -63,6 +65,70 @@ selection_auth = SelectionAuth()
 # 所有管理接口默认继承此鉴权；公开的门户公示接口在装饰器里显式 auth=None。
 router = Router(auth=selection_auth)
 api.add_router("", router)
+
+# 并入主程序时登记权限点；独立运行时 apps.common 不存在，保留原有无登录演示模式。
+try:  # pragma: no cover - depends on deployment layout
+    from apps.common import permissions as main_permissions
+except Exception:  # pragma: no cover - standalone deployment
+    main_permissions = None
+
+_ADMIN_ONLY_OPERATIONS = (
+    "selectionTemplateList",
+    "selectionTemplateCreate",
+    "selectionTemplateGet",
+    "selectionTemplateUpdate",
+    "selectionScoreList",
+    "selectionScoreCreate",
+    "selectionScoreSummary",
+    "selectionScoreExport",
+    "selectionScoreGet",
+    "selectionScoreUpdate",
+    "selectionCandidateList",
+    "selectionResultGenerate",
+    "selectionResultLatest",
+    "selectionResultBatches",
+    "selectionResultExport",
+)
+_PUBLICITY_MANAGE_OPERATIONS = (
+    "selectionPublicityPublish",
+    "selectionPublicityManage",
+    "selectionPublicityManageGet",
+    "selectionPublicityBatch",
+    "selectionPublicityResultBatch",
+    "selectionPublicityCancel",
+)
+
+if main_permissions is not None:  # pragma: no cover - registration side effect
+    for _operation in _ADMIN_ONLY_OPERATIONS:
+        main_permissions.register_operation(
+            _operation, (main_permissions.ADMIN,)
+        )
+    for _operation in _PUBLICITY_MANAGE_OPERATIONS:
+        main_permissions.register_operation(
+            _operation,
+            (
+                main_permissions.ADMIN,
+                main_permissions.PROVINCE_REVIEWER,
+            ),
+        )
+    main_permissions.register_operation(
+        "selectionPublicityMine", main_permissions.ALL_ROLES
+    )
+
+
+def _require_operation(operation_id: str) -> Optional[object]:
+    """Enforce the main project's role gate when running merged.
+
+    The standalone/demo modes intentionally have no account context, so they
+    keep working without roles.  ``auto`` and ``main`` are production modes and
+    must go through ``apps.common.permissions.require``.
+    """
+    mode = getattr(settings, "SELECTION_AUTH_MODE", "auto")
+    if mode in ("none", "demo", "header"):
+        return None
+    if main_permissions is None or not main_auth_available():
+        return None
+    return main_permissions.require(operation_id)
 
 
 @api.exception_handler(BusinessError)
@@ -261,6 +327,22 @@ def update_template(request, template_id: int, payload: dict = Body(...)):
 
 
 # ---------------------------------------------------------------------------
+# Candidates
+# ---------------------------------------------------------------------------
+@router.get("/candidates/", response=ResponseEnvelope)
+def list_candidates(request):
+    """可评分运动员列表：来自已通过报名名册，按组别/赛事/关键字过滤。"""
+    _require_operation("selectionCandidateList")
+    return ok(
+        candidate_service.list_candidates(
+            event_id=_query(request, "event_id", "eventId"),
+            group_type=_query(request, "group_type", "groupType"),
+            keyword=_query(request, "keyword") or "",
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
 # Scores
 # ---------------------------------------------------------------------------
 @router.get("/scores/", response=ResponseEnvelope)
@@ -441,6 +523,29 @@ def batch_publish_publicity(request, payload: dict = Body(...)):
     return ok(
         publicity_service.batch_publish(
             payload, get_current_user_id(request)
+        )
+    )
+
+
+@router.post("/publicity/result-batch/", response=ResponseEnvelope)
+def publish_result_publicity(request, payload: dict = Body(...)):
+    """只发布某一现行结果批次的入围运动员，而不是全部已审报名。"""
+    _require_operation("selectionPublicityResultBatch")
+    return ok(
+        publicity_service.publish_result_batch(
+            payload, get_current_user_id(request)
+        )
+    )
+
+
+@router.get("/publicity/mine/", response=ResponseEnvelope)
+def my_publicity(request):
+    """当前人员（运动员/教练）的全部公示记录，含已撤销。"""
+    account = _require_operation("selectionPublicityMine")
+    page, size = parse_page(request)
+    return ok(
+        publicity_service.list_my_publications(
+            account, page=page, size=size
         )
     )
 

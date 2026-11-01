@@ -295,6 +295,45 @@ class ApiSmokeTests(TestCase):
         self.assertEqual(direct.status_code, 200)
         self.assertEqual(direct["Content-Type"], "image/jpeg")
 
+    # ---------------------------------------------------------------- 比赛页只读权限
+    def test_match_page_reads_open_to_school_city_team(self):
+        admin = self.login()
+        event = self.post(
+            "/events",
+            {
+                "name": "权限联调赛事",
+                "season": "2026",
+                "registrationOpensAt": "2026-01-01T00:00:00+08:00",
+                "registrationClosesAt": "2026-12-31T23:59:59+08:00",
+            },
+            admin,
+        )
+        self.assertEqual(event.status_code, 200, event.content)
+        event_id = body(event)["data"]["id"]
+
+        for username in ("city", "team", "university"):
+            token = self.login(username)
+            for path in ("/events", "/matches", f"/events/{event_id}/groups"):
+                response = self.get(path, token)
+                self.assertEqual(
+                    response.status_code,
+                    200,
+                    f"{username} 读取 {path} 被拒：{response.content}",
+                )
+            me = body(self.get("/me", token))["data"]
+            self.assertIn("api:matchList", me["permissions"])
+            self.assertIn("api:eventList", me["permissions"])
+
+    def test_match_and_event_writes_still_denied_for_school_city_team(self):
+        for username in ("city", "team", "university"):
+            token = self.login(username)
+            deleted = self.client.delete(
+                f"{BASE}/events/evt_demo?version=0",
+                HTTP_AUTHORIZATION=f"Bearer {token}",
+            )
+            self.assertEqual(deleted.status_code, 403, deleted.content)
+            self.assertEqual(body(deleted)["code"], "FORBIDDEN")
+
     # ---------------------------------------------------------------- 账号绑定约定
     def test_account_role_must_match_org_type(self):
         token = self.login()
@@ -323,6 +362,23 @@ class ApiSmokeTests(TestCase):
         self.assertEqual(body(conflict)["code"], "INVALID_ARGUMENT")
 
     def test_person_can_bind_only_one_account(self):
+        from apps.common import crypto
+        from apps.persons.models import Person, School
+
+        school = School.objects.get(code="SCH001")
+
+        def make_person(person_no: str, id_number: str) -> Person:
+            return Person.objects.create(
+                person_no=person_no,
+                full_name="绑定人员A",
+                id_card_cipher=crypto.encrypt_text(id_number),
+                id_card_hash=crypto.lookup_hash(id_number),
+                id_card_masked=crypto.mask_id_number(id_number),
+                person_category="ATHLETE",
+                school=school,
+            )
+
+        person = make_person("P202699999901", "110101200001010011")
         token = self.login()
         # 唯一绑定约束需要真实存在的 Person：经 ORM 创建真实人员档案。
         # （旧实现引用 seed 中不存在的 "person_bind_demo"，依赖幽灵 personId
@@ -340,6 +396,7 @@ class ApiSmokeTests(TestCase):
             id_card_masked=mask_id_number("110101200001010010"),
             person_category="ATHLETE",
             audit_status="APPROVED",
+            school=school,  # 邀请校验要求人员所属学校与组织 code（SCH001）一致
         )
         person_id = str(person.pk)
 
@@ -348,7 +405,7 @@ class ApiSmokeTests(TestCase):
             "displayName": "绑定人员A",
             "roles": ["ATHLETE"],
             "orgId": "org_school_01",
-            "personId": person_id,
+            "personId": str(person.pk),
         }
         self.assertEqual(self.post("/accounts", first, token).status_code, 200)
 
@@ -363,24 +420,40 @@ class ApiSmokeTests(TestCase):
             {
                 "kind": "ATHLETE",
                 "orgId": "org_school_01",
-                "personId": person_id,
+                "personId": str(person.pk),
             },
             token,
         )
-        self.assertEqual(invite.status_code, 200, invite.content)
-        register_token = body(invite)["data"]["registrationToken"]
-        registered = self.post(
-            "/auth/registrations",
+        self.assertEqual(invite.status_code, 409, invite.content)
+        self.assertEqual(body(invite)["code"], "DUPLICATE_RESOURCE")
+
+        # 未建档的 personId 直接拒绝，不再用占位值建凭证
+        missing = self.post(
+            "/accounts/registration-invitations",
             {
-                "registrationToken": register_token,
-                "username": "athlete_invited",
-                "password": "Invited@2026",
-                "realName": "受邀人员",
-                "idNumber": "110101200001010011",
+                "kind": "ATHLETE",
+                "orgId": "org_school_01",
+                "personId": "person_bind_missing",
             },
+            token,
         )
-        self.assertEqual(registered.status_code, 409, registered.content)
-        self.assertEqual(body(registered)["code"], "DUPLICATE_RESOURCE")
+        self.assertEqual(missing.status_code, 400, missing.content)
+        self.assertEqual(body(missing)["code"], "INVALID_ARGUMENT")
+
+        # 同一个人不能同时持有一张以上可用邀请
+        fresh = make_person("P202699999902", "11010120000101002X")
+        payload = {
+            "kind": "ATHLETE",
+            "orgId": "org_school_01",
+            "personId": str(fresh.pk),
+        }
+        self.assertEqual(
+            self.post("/accounts/registration-invitations", payload, token).status_code,
+            200,
+        )
+        again = self.post("/accounts/registration-invitations", payload, token)
+        self.assertEqual(again.status_code, 409, again.content)
+        self.assertEqual(body(again)["code"], "DUPLICATE_RESOURCE")
 
     def test_bad_extension_is_415(self):
         from django.core.files.uploadedfile import SimpleUploadedFile
@@ -627,6 +700,9 @@ class ApiSmokeTests(TestCase):
         self.assertTrue(hasattr(MySQLdb, "connect"))
 
     def test_policy_document_syncs_on_publish_and_offline(self):
+        from unittest import mock
+
+        from apps.common import conf
         from apps.events.models import Content
         from apps.events.services import publish_content, unpublish_content
         from apps.policyqa.models import PolicyDocument
@@ -648,7 +724,8 @@ class ApiSmokeTests(TestCase):
         self.assertTrue(document.enabled)
         self.assertIsNotNone(document.published_at)
 
-        result = answer("报名需要什么条件")
+        with mock.patch.object(conf, "AI_ENABLED", False):
+            result = answer("报名需要什么条件")
         self.assertEqual(result["status"], "DISABLED")
         self.assertEqual(len(result["fallbackPolicies"]), 1)
         self.assertEqual(result["fallbackPolicies"][0]["title"], "省级足球赛事报名办法")

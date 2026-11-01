@@ -46,7 +46,7 @@ class SelectionArchiveClient(ABC):
 
 
 class DemoSelectionArchiveClient(SelectionArchiveClient):
-    """45 deterministic fake candidates: 15 per group, event_id=1."""
+    """30 deterministic fake candidates: 15 per group, event_id=1."""
 
     NAMES = [
         "张伟", "王芳", "李娜", "刘洋", "陈静",
@@ -61,7 +61,6 @@ class DemoSelectionArchiveClient(SelectionArchiveClient):
     ]
 
     GROUP_TEAMS = {
-        GroupType.HIGHER: ["江城大学", "南湖大学", "东林大学"],
         GroupType.MIDDLE: ["江城一中", "南湖中学", "东林中学"],
         GroupType.PRIMARY: ["江城实验小学", "南湖小学", "东林小学"],
     }
@@ -74,9 +73,8 @@ class DemoSelectionArchiveClient(SelectionArchiveClient):
 
     def _build(self):
         groups = [
-            (GroupType.HIGHER, 10000, 0),
-            (GroupType.MIDDLE, 20000, 15),
-            (GroupType.PRIMARY, 30000, 30),
+            (GroupType.MIDDLE, 10000, 0),
+            (GroupType.PRIMARY, 20000, 15),
         ]
         for group_type, base_id, name_offset in groups:
             teams = self.GROUP_TEAMS[group_type]

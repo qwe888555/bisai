@@ -3,11 +3,14 @@
 前端契约：zuqiu teamApi（src/api/index.ts L135-157）——list/get/create/update
 + members 域 5 接口（批次 B）+ memberGet 详情（批次 D-2，文档契约明确）；
 remove（DELETE）暂不开放（关联检查依赖报名/比赛域，契约清单在案）；
-coaches 属批次 C，matches 属比赛域，不在本轮。
+coaches 域 3 接口已交付（批次 C，2026-10-29）；teamMatches 聚合入口已交付
+（2026-10-29，查询委托 events 读服务）。
 
-- 权限：查询多角色可见（menus.ts L145-176），但数据范围一期仅 ADMIN 全量
-  （UNIVERSITY/TEAM 依赖 A′-min 映射，交付前 403 DATA_SCOPE_DENIED）；
-  创建/更新=(ADMIN, UNIVERSITY)，成员管理=(ADMIN, UNIVERSITY, TEAM)，
+- 权限：角色登记按 docs/后端接口文档.md 各接口“角色：”行执行（teamList/
+  teamGet/teamCreate/teamUpdate 与成员域 6 接口均为 ADMIN/UNIVERSITY/TEAM/
+  CITY/PROVINCE_REVIEWER）；数据范围由 services.visible_teams 判定：全局
+  管理员全量、TEAM 本队、UNIVERSITY/CITY/PROVINCE_REVIEWER/挂组织 ADMIN
+  按组织子树内的学校范围，越界 403 DATA_SCOPE_DENIED（详情 404）；
   学校解析经 A′-min 组织映射（ensure_business_org，2026-10-25 已移植交付）；
 - 写操作统一 audit_state()（team.create/team.update/team.member.*）；
 - audit_status 字段保留（Q2 审核流程不启用），创建即默认 APPROVED；
@@ -33,6 +36,7 @@ from apps.common.middleware import audit_state
 from apps.common.pagination import paginate
 from apps.common.permissions import (
     ADMIN,
+    CITY,
     PROVINCE_REVIEWER,
     TEAM,
     UNIVERSITY,
@@ -47,21 +51,30 @@ from . import services
 router = Router(tags=["teams"])
 _auth = JWTAuth()
 
-# 权限点登记：导入期完成，漏登记 require() 会直接报错
-register_operation("teamList", (ADMIN, UNIVERSITY, TEAM, PROVINCE_REVIEWER))
-register_operation("teamGet", (ADMIN, UNIVERSITY, TEAM, PROVINCE_REVIEWER))
-register_operation("teamCreate", (ADMIN, UNIVERSITY))
-register_operation("teamUpdate", (ADMIN, UNIVERSITY))
-# 成员域：读=管理端花名册（admin/TeamsView）+ 球队端名单页（menus L164-169）；
-# 写=名单页（TEAM/UNIVERSITY 菜单）+ ADMIN 兜底；数据范围仍一期仅 ADMIN。
-register_operation("memberList", (ADMIN, UNIVERSITY, TEAM, PROVINCE_REVIEWER))
-# memberGet（批次 D-2）：文档角色表含 CITY，与 memberList 登记口径对齐
-# （不含 CITY）；数据范围一期仅 ADMIN，该差异无实际访问影响（验收报告记录）。
-register_operation("memberGet", (ADMIN, UNIVERSITY, TEAM, PROVINCE_REVIEWER))
-register_operation("memberSearch", (ADMIN, UNIVERSITY, TEAM))
-register_operation("memberCreate", (ADMIN, UNIVERSITY, TEAM))
-register_operation("memberUpdate", (ADMIN, UNIVERSITY, TEAM))
-register_operation("memberDelete", (ADMIN, UNIVERSITY, TEAM))
+# 权限点登记：导入期完成，漏登记 require() 会直接报错。
+# 角色集逐条对齐契约文档（docs/后端接口文档.md 各接口“角色：”行）：
+# 10 个接口均为 TEAM / UNIVERSITY / CITY / PROVINCE_REVIEWER / ADMIN。
+_TEAM_ROLES = (ADMIN, UNIVERSITY, TEAM, CITY, PROVINCE_REVIEWER)
+register_operation("teamList", _TEAM_ROLES)
+register_operation("teamGet", _TEAM_ROLES)
+register_operation("teamCreate", _TEAM_ROLES)
+register_operation("teamUpdate", _TEAM_ROLES)
+# 成员域：读=管理端花名册 + 球队端名单页；写=名单页 + 省市管理端，
+# 数据范围统一由 services.visible_teams 判定。
+register_operation("memberList", _TEAM_ROLES)
+register_operation("memberGet", _TEAM_ROLES)
+register_operation("memberSearch", _TEAM_ROLES)
+register_operation("memberCreate", _TEAM_ROLES)
+register_operation("memberUpdate", _TEAM_ROLES)
+register_operation("memberDelete", _TEAM_ROLES)
+# 教练域（批次 C，2026-10-29 交付）：契约 api:teamCoachList/teamCoachCreate/
+# teamCoachDelete，角色行与成员域一致。
+register_operation("teamCoachList", _TEAM_ROLES)
+register_operation("teamCoachCreate", _TEAM_ROLES)
+register_operation("teamCoachDelete", _TEAM_ROLES)
+# 球队赛程聚合入口（契约 api:teamMatches，2026-10-29 交付）：路由归球队域，
+# 查询委托 events 比赛读服务（docs/后端接口文档.md teamMatches 契约）。
+register_operation("teamMatches", _TEAM_ROLES)
 
 
 @router.get("/teams", auth=_auth, response=EnvelopeOut, summary="球队档案列表")
@@ -216,3 +229,86 @@ def team_member_delete(
         summary=f"移出成员 {member.person.full_name}（CURRENT→EXITED）",
     )
     return action_result(True, str(member.pk))
+
+
+# ---------------------------------------------------------------- 球队教练（批次 C）
+# 契约对齐 zuqiu teamApi.coaches/addCoach/removeCoach（index.ts L136-139）与
+# TeamCoachesView 实码；DELETE 路径参数为教练关系行 id + version 查询参数。
+
+@router.get(
+    "/teams/{team_id}/coaches", auth=_auth, response=EnvelopeOut, summary="球队教练名单"
+)
+def team_coach_list(
+    request,
+    team_id: str,
+    category: Optional[str] = None,
+    reviewStatus: Optional[str] = None,
+):
+    account = require("teamCoachList")
+    queryset = services.coach_list(
+        team_id, {"category": category, "reviewStatus": reviewStatus}, account
+    )
+    return paginate(request, queryset, mapper=s.coach_out)
+
+
+@router.post(
+    "/teams/{team_id}/coaches", auth=_auth, response=EnvelopeOut, summary="添加球队教练"
+)
+def team_coach_create(request, team_id: str, body: s.CoachAddBody):
+    account = require("teamCoachCreate")
+    coach = services.coach_add(team_id, body.model_dump(), account)
+    audit_state(
+        request,
+        "team.coach.create",
+        object_type="TeamCoach",
+        object_id=str(coach.pk),
+        summary=f"添加教练 {coach.person.full_name} @ {team_id}",
+    )
+    return ok(s.coach_out(coach))
+
+
+@router.delete(
+    "/teams/{team_id}/coaches/{coach_id}",
+    auth=_auth,
+    response=EnvelopeOut,
+    summary="移出球队教练（软退出）",
+)
+def team_coach_delete(
+    request, team_id: str, coach_id: str, version: Optional[int] = Query(None, ge=0)
+):
+    account = require("teamCoachDelete")
+    if version is None:
+        raise ApiError(
+            INVALID_ARGUMENT,
+            "缺少 version",
+            field_errors([("version", "该操作必须提交乐观锁版本")]),
+        )
+    coach = services.coach_remove(team_id, coach_id, version, account)
+    audit_state(
+        request,
+        "team.coach.remove",
+        object_type="TeamCoach",
+        object_id=str(coach.pk),
+        summary=f"移出教练 {coach.person.full_name}（CURRENT→EXITED）",
+    )
+    return action_result(True, str(coach.pk))
+
+
+# ---------------------------------------------------------------- 球队赛程（teamMatches 契约）
+# GET /teams/{teamId}/matches：成员4 聚合入口，查询委托 events 比赛读服务
+# （docs/后端接口文档.md L1889-1906），输出复用 events match_out；
+# 消费方 zuqiu teamApi.matches（admin/TeamsView 参赛队伍卡片赛程）。
+
+@router.get(
+    "/teams/{team_id}/matches", auth=_auth, response=EnvelopeOut, summary="球队赛程列表"
+)
+def team_match_list(request, team_id: str, eventId: Optional[str] = None):
+    account = require("teamMatches")
+    from apps.events.schemas import match_out
+    from apps.events.services import list_matches
+
+    # 球队可见性与 404 语义复用 get_team（主键 id / team_no 回退解析）；
+    # 过滤按球队参与（home/away），输出契约与 /matches 完全一致。
+    team = services.get_team(team_id, account)
+    queryset = list_matches({"teamId": str(team.pk), "eventId": eventId})
+    return paginate(request, queryset, mapper=match_out)

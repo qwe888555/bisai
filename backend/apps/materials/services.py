@@ -226,7 +226,8 @@ def _resolve_material_type(code: str, owner_type: str) -> MaterialType:
         )
     if not mtype.is_active:
         raise ApiError(INVALID_ARGUMENT, f"材料类型 {code} 已停用")
-    if mtype.applies_to != owner_type:
+    # main 653f04f 保留：applies_to 支持 PERSON,TEAM 逗号分隔双归属
+    if owner_type not in [p.strip() for p in mtype.applies_to.split(",") if p.strip()]:
         raise ApiError(INVALID_ARGUMENT, f"材料类型 {code} 不适用于 {owner_type} 归属")
     return mtype
 
@@ -390,7 +391,8 @@ def _validate_batch_query_args(owner_type, owner_ids, type_codes) -> tuple:
                 "reason": f"材料类型 {code} 不存在",
             })
             continue
-        if mtype.applies_to != owner_type:
+        # main 653f04f 保留：applies_to 支持 PERSON,TEAM 逗号分隔双归属
+        if owner_type not in [p.strip() for p in mtype.applies_to.split(",") if p.strip()]:
             problems.append({
                 "field": "type_codes",
                 "value": orig,

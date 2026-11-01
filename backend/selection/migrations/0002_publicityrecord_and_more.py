@@ -28,7 +28,6 @@ class Migration(migrations.Migration):
                     "group_type",
                     models.CharField(
                         choices=[
-                            ("HIGHER", "高校组"),
                             ("MIDDLE", "中学组"),
                             ("PRIMARY", "小学组"),
                         ],

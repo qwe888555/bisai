@@ -236,6 +236,24 @@ def update_template(template_id, data, user_id):
             [TemplateItem(template=template, **item) for item in items]
         )
 
+    if "status" in data:
+        status = parse_int(
+            get_field(data, "status"),
+            "状态",
+            min_value=0,
+            max_value=1,
+        )
+        if status == 1:
+            # 同组别 + 轮次仅保留一个启用模板，启用时自动停用其余模板。
+            ScoreTemplate.objects.filter(
+                group_type=template.group_type,
+                score_round=template.score_round,
+                status=1,
+            ).exclude(pk=template.pk).update(
+                status=0, updated_at=timezone.now()
+            )
+        template.status = status
+
     template.save()
     # Re-query so the prefetched item cache does not show deleted dimensions.
     return template_detail(get_template_or_404(template.id))

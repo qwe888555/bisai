@@ -6,6 +6,8 @@ common.scopes 中完成，本模块负责第四层（对象归属与状态）。
 
 from __future__ import annotations
 
+import csv
+import io
 import secrets
 from datetime import timedelta
 from typing import Any, Optional
@@ -24,12 +26,17 @@ from apps.common.authentication import (
     revoke_token,
 )
 from apps.common.errors import (
+    BATCH_LIMIT_EXCEEDED,
+    BUSINESS_VALIDATION_FAILED,
+    DATA_SCOPE_DENIED,
     DUPLICATE_RESOURCE,
+    FILE_TOO_LARGE,
     INVALID_ARGUMENT,
     NOT_FOUND,
     STATE_CONFLICT,
     UNAUTHENTICATED,
     FORBIDDEN,
+    UNSUPPORTED_FILE_TYPE,
     ApiError,
 )
 from apps.common.ids import (
@@ -46,6 +53,7 @@ from apps.common.scopes import (
     is_admin,
     is_global_admin,
     org_scope_ids,
+    visible_school_codes,
 )
 from apps.common.versioning import bump, check_version
 
@@ -137,13 +145,95 @@ def register(data: dict) -> Account:
     return account
 
 
+_INVITATION_ORG_TYPES = ("SCHOOL", "UNIVERSITY", "TEAM")
+
+
+def _ensure_invitation_org(
+    org: Organization, person=None, field: str = "orgId"
+) -> None:
+    """邀请只能挂学校/球队；带人员时校验人员学校与组织一致。"""
+    if org.org_type not in _INVITATION_ORG_TYPES:
+        raise ApiError(
+            INVALID_ARGUMENT,
+            "邀请只能挂学校或球队组织",
+            [{"field": field, "reason": "不可挂省/市州节点"}],
+        )
+    if org.org_type in ("SCHOOL", "UNIVERSITY"):
+        if person is None:
+            return
+        person_school = person.school.code if person.school_id else ""
+        if person_school != org.code:
+            raise ApiError(
+                BUSINESS_VALIDATION_FAILED,
+                "人员所属学校与邀请组织不一致",
+                [{"field": field, "reason": "请选择人员所属学校"}],
+            )
+        return
+    from apps.teams.models import Team
+
+    team = Team.objects.filter(team_no=org.code, is_deleted=False).first()
+    if team is None:
+        raise ApiError(
+            INVALID_ARGUMENT,
+            "球队组织不存在",
+            [{"field": field, "reason": f"未找到球队 {org.code}"}],
+        )
+    if person is None:
+        return
+    if not person.school_id or team.school_id != person.school_id:
+        raise ApiError(
+            BUSINESS_VALIDATION_FAILED,
+            "人员所属学校与球队不一致",
+            [{"field": field, "reason": "人员不属于该球队所属学校"}],
+        )
+
+
 def create_invitation(actor: Account, data: dict) -> dict[str, Any]:
     kind = data["kind"]
     if kind not in INVITE_KINDS:
         raise ApiError(INVALID_ARGUMENT, "邀请凭证只允许运动员/教练业务身份")
-    ensure_org_in_scope(actor, data["orgId"])
-    # 签发阶段即校验：避免签发一个必然无法正常激活的邀请（幽灵 personId）
-    _ensure_person_bindable(data.get("personId"))
+    org = Organization.objects.filter(pk=data["orgId"]).first()
+    if org is None:
+        raise ApiError(
+            NOT_FOUND,
+            "组织不存在",
+            [{"field": "orgId", "reason": "不存在或已删除"}],
+        )
+    ensure_org_in_scope(actor, org.pk)
+    person = None
+    person_id = data.get("personId") or ""
+    if person_id:
+        from apps.persons.models import Person
+
+        try:
+            person = Person.objects.filter(pk=person_id, is_deleted=False).first()
+        except (TypeError, ValueError):
+            person = None
+        if person is None:
+            raise ApiError(
+                INVALID_ARGUMENT,
+                "人员档案不存在",
+                [{"field": "personId", "reason": "请先在人员管理中建档"}],
+            )
+    _ensure_invitation_org(org, person)
+    if person is not None:
+        # 一个人员只能绑定一个账号，也不能同时持有两张可用邀请
+        if Account.objects.filter(person_id=str(person.pk)).exists():
+            raise ApiError(
+                DUPLICATE_RESOURCE,
+                "该人员已绑定账号",
+                [{"field": "personId", "reason": "一个人员只能绑定一个账号"}],
+            )
+        if RegistrationInvitation.objects.filter(
+            person_id=str(person.pk),
+            used_at__isnull=True,
+            expires_at__gt=timezone.now(),
+        ).exists():
+            raise ApiError(
+                DUPLICATE_RESOURCE,
+                "该人员已有未使用的邀请",
+                [{"field": "personId", "reason": "请使用已签发凭证或等待过期"}],
+            )
     minutes = int(data.get("expiresInMinutes") or 1440)
     # 凭证明文为 32 字节随机数，只在签发响应里返回一次，库里只存哈希
     plain_token = secrets.token_hex(32)
@@ -158,6 +248,328 @@ def create_invitation(actor: Account, data: dict) -> dict[str, Any]:
         created_by=actor.pk,
     )
     return {"registrationToken": plain_token, "expiresAt": expires_at}
+
+
+# ---------------------------------------------------------------- 批量邀请
+# 5.txt 账号批量发放：按学校/队伍 Excel 导入名单，一次签发邀请并导出 CSV。
+# 方案要点：
+# - 只给"已有人员主档"发邀请（身份证号匹配 id_card_hash），不凭姓名/证件认领；
+# - 组织编码逐行解析并做数据范围校验（ADMIN 全局、CITY/UNIVERSITY 子树）；
+# - 明文凭证只在本次响应/CSV 中出现一次（库中仅存哈希）。
+
+BATCH_MAX_ROWS = 500
+BATCH_MAX_BYTES = 5 * 1024 * 1024
+BATCH_EXPIRES_DEFAULT = 1440
+
+# Excel 表头 → 内部字段
+_BATCH_HEADERS: dict[str, str] = {
+    "姓名": "realName",
+    "身份证号": "idNumber",
+    "手机号": "phone",
+    "角色": "kind",
+    "组织编码": "orgCode",
+    "人员ID": "personId",
+}
+_BATCH_REQUIRED: tuple[str, ...] = ("realName", "idNumber", "kind", "orgCode")
+
+
+def _row_text(value) -> str:
+    return "" if value is None else str(value).strip()
+
+
+def parse_invitation_workbook(upload) -> list[dict]:
+    """解析批量邀请 xlsx（第一行为表头），返回按行的原始字段。"""
+    filename = (getattr(upload, "name", "") or "").lower()
+    if not filename.endswith(".xlsx"):
+        raise ApiError(
+            UNSUPPORTED_FILE_TYPE,
+            "批量发放仅支持 .xlsx",
+            [{"field": "file", "reason": "需要 .xlsx"}],
+        )
+    raw = upload.read()
+    if len(raw) > BATCH_MAX_BYTES:
+        raise ApiError(
+            FILE_TOO_LARGE,
+            "文件超过 5MB 上限",
+            [{"field": "file", "reason": "请拆分后分批导入"}],
+        )
+    try:
+        from openpyxl import load_workbook
+
+        workbook = load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
+        sheet = workbook.active
+    except Exception as exc:  # noqa: BLE001 - 交由统一错误响应
+        raise ApiError(
+            INVALID_ARGUMENT,
+            "无法解析该 xlsx 文件",
+            [{"field": "file", "reason": "请使用模板（.xlsx）"}],
+        ) from exc
+
+    rows_iter = sheet.iter_rows(values_only=True)
+    header_row = next(rows_iter, None)
+    if not header_row:
+        raise ApiError(INVALID_ARGUMENT, "名单为空", [{"field": "file", "reason": "缺少表头"}])
+    positions: dict[str, int] = {}
+    for index, header in enumerate(header_row):
+        key = _BATCH_HEADERS.get(_row_text(header))
+        if key and key not in positions:
+            positions[key] = index
+    missing = [name for name in _BATCH_REQUIRED if name not in positions]
+    if missing:
+        labels = {value: key for key, value in _BATCH_HEADERS.items()}
+        raise ApiError(
+            INVALID_ARGUMENT,
+            "名单缺少必需列",
+            [
+                {"field": "file", "reason": f"缺少表头：{labels[name]}"}
+                for name in missing
+            ],
+        )
+
+    rows: list[dict] = []
+    for offset, values in enumerate(rows_iter, start=2):
+        if values is None or all(_row_text(v) == "" for v in values):
+            continue
+        row = {"rowNo": offset}
+        for key, index in positions.items():
+            row[key] = _row_text(values[index] if index < len(values) else "")
+        rows.append(row)
+    if not rows:
+        raise ApiError(INVALID_ARGUMENT, "名单没有数据行", [{"field": "file", "reason": "仅表头"}])
+    if len(rows) > BATCH_MAX_ROWS:
+        raise ApiError(
+            BATCH_LIMIT_EXCEEDED,
+            f"单批最多 {BATCH_MAX_ROWS} 行",
+            [{"field": "file", "reason": f"本次 {len(rows)} 行，请分批"}],
+        )
+    return rows
+
+
+def _resolve_batch_org(org_code: str, fallback_org_id: Optional[str]) -> Organization:
+    if org_code:
+        org = Organization.objects.filter(code=org_code).first()
+    elif fallback_org_id:
+        org = Organization.objects.filter(pk=fallback_org_id).first()
+    else:
+        org = None
+    if org is None:
+        raise ApiError(
+            INVALID_ARGUMENT,
+            "组织不存在",
+            [{"field": "orgCode", "reason": f"未找到组织编码 {org_code or '-'}"}],
+        )
+    return org
+
+
+def _match_person_by_id_number(id_number: str, real_name: str):
+    from apps.persons.models import Person
+
+    normalized = crypto.normalize_id_number(id_number)
+    if len(normalized) != 18 or not normalized[:17].isdigit() or normalized[17] not in "0123456789X":
+        raise ApiError(
+            INVALID_ARGUMENT,
+            "身份证号格式不正确",
+            [{"field": "idNumber", "reason": "需 18 位"}],
+        )
+    person = Person.objects.filter(id_card_hash=crypto.lookup_hash(normalized)).first()
+    if person is None or person.is_deleted:
+        raise ApiError(
+            INVALID_ARGUMENT,
+            "未找到人员档案",
+            [{"field": "idNumber", "reason": "请先在人员管理中建档后再发账号"}],
+        )
+    if person.full_name != real_name:
+        raise ApiError(
+            INVALID_ARGUMENT,
+            "姓名与人员档案不一致",
+            [{"field": "realName", "reason": "与身份证匹配到的档案姓名不符"}],
+        )
+    return person
+
+
+def _issue_one_invitation(
+    actor: Account, minutes: int, row: dict, fallback_org_id: Optional[str]
+) -> dict:
+    kind = _row_text(row.get("kind")).upper()
+    if kind not in INVITE_KINDS:
+        raise ApiError(
+            INVALID_ARGUMENT,
+            "角色只允许运动员/教练",
+            [{"field": "kind", "reason": "仅 ATHLETE / COACH"}],
+        )
+    org = _resolve_batch_org(_row_text(row.get("orgCode")), fallback_org_id)
+    ensure_org_in_scope(actor, org.pk)
+
+    person_id = _row_text(row.get("personId"))
+    if person_id:
+        from apps.persons.models import Person
+
+        person = Person.objects.filter(pk=person_id, is_deleted=False).first()
+        if person is None:
+            raise ApiError(
+                INVALID_ARGUMENT,
+                "人员档案不存在",
+                [{"field": "personId", "reason": "不存在或已删除"}],
+            )
+        if person.full_name != _row_text(row.get("realName")):
+            raise ApiError(
+                INVALID_ARGUMENT,
+                "姓名与人员档案不一致",
+                [{"field": "realName", "reason": "与 personId 对应档案不符"}],
+            )
+    else:
+        person = _match_person_by_id_number(
+            _row_text(row.get("idNumber")), _row_text(row.get("realName"))
+        )
+
+    # 不得跨数据范围发放：非全局管理员只能给子树内学校的人员发账号
+    school_codes = visible_school_codes(actor)
+    if school_codes is not None:
+        person_school = person.school.code if person.school_id else ""
+        if person_school not in school_codes:
+            raise ApiError(
+                DATA_SCOPE_DENIED,
+                "人员不在当前账号数据范围内",
+                [{"field": "idNumber", "reason": "所属学校超出当前账号范围"}],
+            )
+
+    # 邀请只能挂学校/球队，且必须与人员所属学校一致
+    _ensure_invitation_org(org, person, field="orgCode")
+
+    if Account.objects.filter(person_id=person.pk).exists():
+        raise ApiError(
+            DUPLICATE_RESOURCE,
+            "该人员已绑定账号",
+            [{"field": "idNumber", "reason": "一个人员只能绑定一个账号"}],
+        )
+    if RegistrationInvitation.objects.filter(
+        person_id=person.pk, used_at__isnull=True, expires_at__gt=timezone.now()
+    ).exists():
+        raise ApiError(
+            DUPLICATE_RESOURCE,
+            "该人员已有未使用的邀请",
+            [{"field": "idNumber", "reason": "请使用已签发凭证或等待过期"}],
+        )
+
+    plain_token = secrets.token_hex(32)
+    expires_at = timezone.now() + timedelta(minutes=minutes)
+    RegistrationInvitation.objects.create(
+        id=new_invitation_id(),
+        token_hash=crypto.hash_token(plain_token),
+        kind=kind,
+        person_id=person.pk,
+        organization_id=org.pk,
+        expires_at=expires_at,
+        created_by=actor.pk,
+    )
+    return {
+        "rowNo": row["rowNo"],
+        "realName": person.full_name,
+        "maskedIdNumber": person.id_card_masked,
+        "kind": kind,
+        "orgCode": org.code,
+        "registrationToken": plain_token,
+        "expiresAt": expires_at.isoformat(),
+    }
+
+
+def create_invitation_batch(
+    actor: Account,
+    org_id: Optional[str],
+    expires_in_minutes: Optional[int],
+    upload,
+) -> dict:
+    """批量签发邀请：逐行独立事务，部分成功，返回成功行（含明文凭证一次）。"""
+    rows = parse_invitation_workbook(upload)
+    minutes = int(expires_in_minutes or BATCH_EXPIRES_DEFAULT)
+    if not 5 <= minutes <= 10080:
+        raise ApiError(
+            INVALID_ARGUMENT,
+            "有效期必须在 5—10080 分钟之间",
+            [{"field": "expiresInMinutes", "reason": "5—10080"}],
+        )
+
+    # 同一份名单内按身份证号去重：一个人只能绑定一个账号
+    seen_ids: dict[str, int] = {}
+    duplicate_of: dict[int, int] = {}
+    for row in rows:
+        key = crypto.normalize_id_number(_row_text(row.get("idNumber"))) or _row_text(
+            row.get("idNumber")
+        )
+        if key in seen_ids:
+            duplicate_of[row["rowNo"]] = seen_ids[key]
+        else:
+            seen_ids[key] = row["rowNo"]
+
+    results: list[dict] = []
+    success_count = 0
+    for row in rows:
+        if row["rowNo"] in duplicate_of:
+            first_row = duplicate_of[row["rowNo"]]
+            results.append(
+                {
+                    "rowNo": row["rowNo"],
+                    "realName": _row_text(row.get("realName")),
+                    "kind": _row_text(row.get("kind")).upper(),
+                    "orgCode": _row_text(row.get("orgCode")),
+                    "status": "FAILED",
+                    "error": f"名单内身份证号重复（与第 {first_row} 行相同）",
+                    "code": DUPLICATE_RESOURCE,
+                    "fieldErrors": [
+                        {"field": "idNumber", "reason": "名单内重复"}
+                    ],
+                }
+            )
+            continue
+        try:
+            with transaction.atomic():
+                item = _issue_one_invitation(actor, minutes, row, org_id)
+            item["status"] = "OK"
+            success_count += 1
+        except ApiError as exc:
+            item = {
+                "rowNo": row["rowNo"],
+                "realName": _row_text(row.get("realName")),
+                "kind": _row_text(row.get("kind")).upper(),
+                "orgCode": _row_text(row.get("orgCode")),
+                "status": "FAILED",
+                "error": exc.message,
+                "code": exc.code,
+                "fieldErrors": exc.data or [],
+            }
+        results.append(item)
+    return {
+        "total": len(results),
+        "successCount": success_count,
+        "failureCount": len(results) - success_count,
+        "rows": results,
+    }
+
+
+def invitation_batch_csv(result: dict) -> tuple[bytes, str]:
+    """批量邀请结果导出 CSV（含明文凭证；失败行含原因）。"""
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(
+        ["序号", "姓名", "证件号", "角色", "组织编码", "状态", "邀请凭证", "过期时间", "失败原因"]
+    )
+    for row in result.get("rows", []):
+        writer.writerow(
+            [
+                row.get("rowNo"),
+                row.get("realName"),
+                row.get("maskedIdNumber", ""),
+                row.get("kind"),
+                row.get("orgCode", ""),
+                row.get("status"),
+                row.get("registrationToken", ""),
+                row.get("expiresAt", ""),
+                row.get("error", ""),
+            ]
+        )
+    filename = f"invitations-{timezone.now():%Y%m%d%H%M%S}.csv"
+    # UTF-8 BOM：Excel 双击打开不乱码
+    return ("\ufeff" + buffer.getvalue()).encode("utf-8"), filename
 
 
 # ---------------------------------------------------------------- 账号
@@ -191,7 +603,8 @@ def list_accounts(actor: Account, filters: dict):
 
 ROLE_ORG_TYPES: dict[str, set[str]] = {
     "TEAM": {"TEAM"},
-    "UNIVERSITY": {"UNIVERSITY"},
+    # 学校节点在组织树里可能是 SCHOOL（种子数据）或 UNIVERSITY（测试/部分导入）
+    "UNIVERSITY": {"UNIVERSITY", "SCHOOL"},
     "CITY": {"CITY"},
     "PROVINCE_REVIEWER": {"PROVINCE"},
 }
@@ -231,16 +644,21 @@ def _validate_account_refs(
     organization = Organization.objects.filter(pk=org_id).first()
     if organization is None:
         raise ApiError(INVALID_ARGUMENT, "组织不存在", [{"field": "orgId", "reason": "不存在"}])
-    required: set[str] = set()
+    allowed: Optional[set[str]] = None
     for role in roles or []:
-        required |= ROLE_ORG_TYPES.get(role, set())
-    allowed = required
-    if len(required) > 1:
-        raise ApiError(
-            INVALID_ARGUMENT,
-            "一个账号只能绑定一个组织节点，多角色请分设账号",
-            [{"field": "roles", "reason": "角色要求的组织类型互相冲突"}],
-        )
+        role_types = ROLE_ORG_TYPES.get(role)
+        if role_types is None:
+            continue
+        if allowed is None:
+            allowed = set(role_types)
+        else:
+            allowed &= role_types
+            if not allowed:
+                raise ApiError(
+                    INVALID_ARGUMENT,
+                    "一个账号只能绑定一个组织节点，多角色请分设账号",
+                    [{"field": "roles", "reason": "角色要求的组织类型互相冲突"}],
+                )
     if allowed and organization.org_type not in allowed:
         raise ApiError(
             INVALID_ARGUMENT,

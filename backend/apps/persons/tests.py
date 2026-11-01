@@ -2697,6 +2697,19 @@ class PersonThirdBatchScopeTests(TestCase):
 
     # ------------------------------------------------------------ TEAM 本队 CURRENT
 
+    def test_my_teams_team_role_returns_bound_team(self):
+        """TEAM（main 9f92156 保留）：/me/teams 只返回 code==team_no 的本队。"""
+        resp = self._get("/api/v1/me/teams", token=self.team_ta_token)
+        self.assertEqual(resp.status_code, 200, resp.content)
+        teams = resp.json()["data"]
+        self.assertEqual([t["name"] for t in teams], ["三批一队"])
+
+    def test_my_teams_team_role_unaligned_org_returns_empty(self):
+        """TEAM：绑定学校类节点（code 无对应 team_no）→ 空数组 200（工作台可进入）。"""
+        resp = self._get("/api/v1/me/teams", token=self.team_ghost_token)
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertEqual(resp.json()["data"], [])
+
     def test_team_list_only_current_members(self):
         resp = self._get(PEOPLE, token=self.team_ta_token)
         self.assertEqual(resp.status_code, 200)

@@ -121,8 +121,7 @@ class ScoringFormulaTests(SimpleTestCase):
 
 class EnumParsingTests(SimpleTestCase):
     def test_group_aliases(self):
-        self.assertEqual(GroupType.parse("HIGHER"), GroupType.HIGHER)
-        self.assertEqual(GroupType.parse("高校组"), GroupType.HIGHER)
+        self.assertEqual(GroupType.parse("中学组"), GroupType.MIDDLE)
         self.assertEqual(GroupType.parse("中学"), GroupType.MIDDLE)
         self.assertEqual(GroupType.parse("primary"), GroupType.PRIMARY)
 

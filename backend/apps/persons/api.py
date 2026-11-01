@@ -652,14 +652,19 @@ def my_profile_confirm(request, body: s.ProfileConfirmation):
 # （zuqiu src/api/index.ts:69；权威文档原写分页 TeamPage+active 参数，按前端
 # 实码实现数组）。范围=本人 CURRENT 球员/教练正式关系（EXITED 历史与 mock
 # "自报归属 VERIFIED 合并"均不采用，见 services.list_own_teams）；
-# UNIVERSITY 全校分支依赖 D1 组织映射（A′ 未批）暂缓，权限点仅 ATHLETE/COACH。
+# UNIVERSITY 全校分支依赖 D1 组织映射（A′ 未批）暂缓；
+# TEAM 分支（main 9f92156 保留）：只返回组织节点 code 匹配 team_no 的本队
+# （services.list_team_account_teams），绑定缺失/数据未对齐返回空数组，
+# 保证球队工作台可正常进入。
 # 未绑定档案 → 404（对齐 myProfileGet 口径）；读接口不留审计（同前两个 GET）。
-register_operation("myTeams", (ATHLETE, COACH))
+register_operation("myTeams", (ATHLETE, COACH, TEAM))
 
 
 @router.get("/me/teams", auth=_auth, response=EnvelopeOut, summary="本人所属球队")
 def my_teams(request):
     account = require("myTeams")
+    if TEAM in set(account.roles or ()):
+        return ok(services.list_team_account_teams(account))
     person_id = _own_person_id(account)
     if not person_id:
         raise ApiError(NOT_FOUND, "当前账号未绑定人员档案")

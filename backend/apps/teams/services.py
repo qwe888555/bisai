@@ -11,17 +11,22 @@
 - 学校组织映射（A′-min，2026-10-25 契约确认并交付）：schoolOrgId（Organization
   节点 ID）→ 节点校验（存在/未停用/学校类类型）→ org.code 反查 School 主档；
   create_team 同事务经 accounts.ensure_business_org 建立 TEAM 组织节点
-  （code=team_no，parent=所属学校/高校组织节点）；
+  （code=team_no，parent=所属学校/院校组织节点）；
 - 无冻结承载的前端字段（shortName/gender/campusName/coachName 输入值）：
   声明但不持久化不回显（同 persons education/coachCategory 先例）；
   coachName 输出仅由现役（CURRENT）主教练关系合成（list_own_teams 先例）。
 
 合并说明（2026-10-26 二轮收编 origin/main）：main 曾先行交付只读查询版
-（为对战、报名与门户接口提供球队名称解析，数据范围沿用一期仅 ADMIN 的
-冻结约定）。其独有检索行为已并入本文件：list_teams 的 keyword 同时命中
-队名与球队编号；get_team 的路径标识兼容主键 id 与 team_no 回退解析
-（team_no 形如 T+年份+8位id，与纯数字主键天然不混淆）。注解/范围门卫
-两版实现同构，以本文件完整版为准。
+（为对战、报名与门户接口提供球队名称解析，当时数据范围仅 ADMIN）。其独有
+检索行为已并入本文件：list_teams 的 keyword 同时命中队名与球队编号；
+get_team 的路径标识兼容主键 id 与 team_no 回退解析（team_no 形如
+T+年份+8位id，与纯数字主键天然不混淆）。注解两版实现同构，以本文件完整版为准。
+
+数据范围（2026-10-27 交付）：无组织的全局管理员全量；TEAM 账号仅本队
+（team_no=账号组织节点 code）；其余角色（UNIVERSITY/CITY/PROVINCE_REVIEWER/
+挂组织的 ADMIN）按组织子树内的学校类组织 code 过滤 School（A′-min 约定
+org.code=School.code）。账号无可见学校范围时抛 403 DATA_SCOPE_DENIED，
+不静默返回空列表；详情接口对范围内的不存在/不可见球队统一 404。
 """
 
 from __future__ import annotations
@@ -32,7 +37,7 @@ from django.db import transaction
 from django.db.models import Count, OuterRef, Q, QuerySet, Subquery
 from django.utils import timezone
 
-from apps.common import enums, scopes
+from apps.common import enums
 from apps.common.errors import (
     DATA_SCOPE_DENIED,
     INVALID_ARGUMENT,
@@ -41,7 +46,13 @@ from apps.common.errors import (
     ApiError,
     field_errors,
 )
-from apps.common.permissions import ADMIN
+from apps.common.permissions import TEAM
+from apps.common.scopes import (
+    account_org_code,
+    ensure_org_in_scope,
+    is_global_admin,
+    visible_school_codes,
+)
 from apps.teams.models import Team, TeamCoach, TeamMember, TeamTransfer
 
 # ensure_business_org 已自 origin/main 最小移植进 accounts 域（2026-10-25，
@@ -69,40 +80,39 @@ def _annotate_team(queryset: QuerySet[Team]) -> QuerySet[Team]:
     )
 
 
-def _require_admin_scope(account) -> None:
-    """球队数据范围门卫（A′ 第 2 批扩展，预留扩展点收口在本函数）。
+def visible_teams(
+    account, queryset: Optional[QuerySet[Team]] = None
+) -> QuerySet[Team]:
+    """当前账号可见的球队（未软删）；无任何范围 → 403 DATA_SCOPE_DENIED。
 
-    - 全局 ADMIN（scopes.scope_org_codes 返回 None，即无组织绑定的 ADMIN）
-      全库放行；挂组织 ADMIN 只能访问绑定组织及其子树；
-    - UNIVERSITY / TEAM 等其余账号必须具有有效组织范围（非空编码列表）；
-      空范围（无绑定/绑定不存在/绑定已软删）一律拒绝；
-    - 本函数只做"角色→范围"门卫，具体目标球队是否在范围内由各服务继续
-      执行逐对象校验：scopes.ensure_team_in_scope（模块限定调用，避免与
-      enrollments 域同名函数混淆）；list_teams 用 _team_scope_filter 谓词
-      在查询集层过滤，不做"返回全部后由前端隐藏"。
+    - 无组织的全局管理员：全量；
+    - roles 含 TEAM：仅 team_no=账号组织节点 code 的本队，org code 为空拒绝；
+    - 其余：组织子树内学校类组织的 code 过滤 school（org.code=School.code），
+      可见学校集合为空 → 403（保持原范围拒绝语义，不静默返回空列表）。
     """
-    codes = scopes.scope_org_codes(account)
-    if codes is None or codes:
-        return
-    raise ApiError(DATA_SCOPE_DENIED)
+    qs = queryset if queryset is not None else _team_queryset()
+    if is_global_admin(account):
+        return qs
+    if TEAM in (getattr(account, "roles", ()) or ()):
+        code = account_org_code(account)
+        if not code:
+            raise ApiError(DATA_SCOPE_DENIED, "球队账号未绑定球队组织，无法确定数据范围")
+        return qs.filter(team_no=code)
+    codes = visible_school_codes(account)
+    if not codes:
+        raise ApiError(DATA_SCOPE_DENIED, "当前账号无可访问的学校数据范围")
+    return qs.filter(school__code__in=codes)
 
 
-def _team_scope_filter(account) -> Optional[Q]:
-    """list_teams 范围谓词（与 ensure_team_in_scope 同口径）。
+def ensure_team_visible(account, team) -> None:
+    """球队必须在账号可见范围内，否则 403 DATA_SCOPE_DENIED。
 
-    全局管理员 → None（不过滤）；其余账号 → 限定为账号组织子树内未停用的
-    TEAM 节点（A′ 映射：Organization.code=team_no）对应的球队；节点软删经
-    默认 manager 自然排除。空范围已在门卫处拒绝，不会走到这里；子树内无
-    有效 TEAM 节点时谓词为空集（列表为空而非报错）。
+    供本模块写操作/成员操作与 attachments、persons、materials 复用；
+    与 get_team 的 404 语义不同：已取到球队后按范围拒绝写读，保留原
+    “范围拒绝先于业务校验”的 403 语义。
     """
-    from apps.accounts.models import Organization
-
-    if scopes.scope_org_codes(account) is None:
-        return None
-    team_codes = Organization.objects.filter(
-        pk__in=scopes.org_scope_ids(account), org_type="TEAM", enabled=True
-    ).values_list("code", flat=True)
-    return Q(team_no__in=team_codes)
+    if not visible_teams(account).filter(pk=team.pk).exists():
+        raise ApiError(DATA_SCOPE_DENIED, "球队不在当前账号数据范围内")
 
 
 def verify_team_owner(account, owner_id: str) -> None:
@@ -111,38 +121,28 @@ def verify_team_owner(account, owner_id: str) -> None:
     TEAM 归属文件的上传与读取均由本校验器裁决业务资源所有权
     （attachments._check_owner / can_access 调用）：
     - 归属记录不存在（球队不存在或已软删）→ 404，默认拒绝；
-    - 数据范围：门卫 _require_admin_scope（角色→范围）+ A′ 编码映射
-      逐对象校验 scopes.ensure_team_in_scope（A′ 第 2 批）——全局 ADMIN
-      全库、挂组织 ADMIN 本子树、UNIVERSITY 本校球队、TEAM 仅本队；
-      映射缺失/节点停用/空范围一律拒绝，不因本轮改动放宽跨范围访问。
+    - 数据范围复用 ensure_team_visible：全局管理员全量、TEAM 账号本队、
+      学校/市州/省级按组织子树内的学校范围；不可见 → 403 DATA_SCOPE_DENIED。
     """
     from apps.persons.services import parse_path_id
 
     raw = str(owner_id or "").strip()
     if not raw:
         raise ApiError(DATA_SCOPE_DENIED, "文件归属对象未确定，暂无法校验归属")
-    team = Team.objects.filter(
-        pk=parse_path_id(raw, "ownerId"), is_deleted=False
-    ).first()
+    team = Team.objects.filter(pk=parse_path_id(raw, "ownerId"), is_deleted=False).first()
     if team is None:
         raise ApiError(NOT_FOUND, "归属球队不存在或已删除")
-    _require_admin_scope(account)
-    scopes.ensure_team_in_scope(account, team)
+    ensure_team_visible(account, team)
 
 
 def list_teams(filters: dict, account) -> QuerySet[Team]:
     """GET /teams：keyword/category/status 筛选 + 数据范围 + 分页。
 
-    数据范围（A′ 第 2 批）：服务端谓词过滤（_team_scope_filter），越界球队
-    不出现在查询集中，而非返回全部后由前端隐藏。
     keyword 并集（二轮收编，main 只读版行为）：同时命中队名与球队编号
     （team_no icontains），供前端球队下拉/对阵名称按编号检索。
+    筛选先构造 queryset，再由 visible_teams 套范围，筛选条件不扩大权限。
     """
-    _require_admin_scope(account)
     queryset = _team_queryset()
-    scope_q = _team_scope_filter(account)
-    if scope_q is not None:
-        queryset = queryset.filter(scope_q)
     keyword = filters.get("keyword")
     if keyword:
         queryset = queryset.filter(
@@ -152,21 +152,18 @@ def list_teams(filters: dict, account) -> QuerySet[Team]:
         queryset = queryset.filter(category_code=filters["category"])
     if filters.get("status"):
         queryset = queryset.filter(audit_status=filters["status"])
-    return _annotate_team(queryset).order_by("-created_at", "-id")
+    return _annotate_team(visible_teams(account, queryset)).order_by("-created_at", "-id")
 
 
 def get_team(team_id: str, account) -> Team:
-    """GET /teams/{id}：详情（不存在/软删 → 404；范围外目标球队 → 403
-    DATA_SCOPE_DENIED）。
+    """GET /teams/{id}：详情（不可见/不存在/软删 → 404，不泄露存在性）。
 
     路径标识解析并集（二轮收编，main 只读版行为）：纯数字优先按主键 id，
     未命中或非数字按 team_no 回退——供对战/报名/门户按编号解析球队名称；
     两者均未命中 → 404（软删行被 queryset 排除，同样 404）。
-    解析成功后按 A′ 编码映射执行逐对象范围校验（第 2 批）。
     """
-    _require_admin_scope(account)
     raw = str(team_id or "").strip()
-    queryset = _annotate_team(_team_queryset())
+    queryset = _annotate_team(visible_teams(account))
     team = None
     if raw.isdigit():
         team = queryset.filter(pk=int(raw)).first()
@@ -174,11 +171,37 @@ def get_team(team_id: str, account) -> Team:
         team = queryset.filter(team_no=raw).first()
     if team is None:
         raise ApiError(NOT_FOUND)
-    scopes.ensure_team_in_scope(account, team)
     return team
 
 
 _SCHOOL_ORG_TYPES = ("SCHOOL", "UNIVERSITY")
+
+
+def _ensure_create_org_scope(account, org) -> None:
+    """创建球队的写入范围：schoolOrgId 解析出的学校组织必须在范围内。
+
+    - 全局管理员直接放行；
+    - TEAM 账号允许其绑定 TEAM 节点的父节点（本校学校节点），否则拒绝；
+    - 其余角色（UNIVERSITY/CITY/PROVINCE_REVIEWER/挂组织 ADMIN）用
+      ensure_org_in_scope 按组织子树判定。
+    """
+    if is_global_admin(account):
+        return
+    if TEAM in (getattr(account, "roles", ()) or ()):
+        from apps.accounts.models import Organization
+
+        raw_org_id = getattr(account, "organization_id", None)
+        if not raw_org_id:
+            raise ApiError(DATA_SCOPE_DENIED, "球队账号未绑定球队组织，无法创建球队")
+        parent_id = (
+            Organization.objects.filter(pk=raw_org_id)
+            .values_list("parent_id", flat=True)
+            .first()
+        )
+        if not parent_id or str(parent_id) != str(org.pk):
+            raise ApiError(DATA_SCOPE_DENIED, "球队账号只能在本校组织下创建球队")
+        return
+    ensure_org_in_scope(account, org.pk)
 
 
 def _resolve_school(school_org_id) -> tuple:
@@ -237,30 +260,38 @@ def create_team(data: dict, org, school, account) -> Team:
       独立测试编号回填/媒体映射等规则）；
     - TEAM 组织节点经 accounts.ensure_business_org 在同一事务建立（A′-min
       契约 2026-10-25）：Organization.code=team_no、name=队名、parent=所属
-      学校/高校组织节点；幂等/复活/类型冲突 409/并发唯一约束兜底/层级校验
+      学校/院校组织节点；幂等/复活/类型冲突 409/并发唯一约束兜底/层级校验
       复用 accounts 实现，异常上抛 → 本事务整体回滚，不产生孤立球队或孤立
       组织节点（accounts 侧不吞异常）；
-    - 忽略无承载字段：shortName/gender/campusName（schema 声明以放行前端
-      真实 payload，服务层不写入，不虚构保存结果）；
-    - audit_status 用模型默认 APPROVED（Q2 审核流程不启用）。
+    - 忽略无承载字段：shortName（TeamCreateBody 不含；资料列落库见 update_team）；
+      gender/campusName 自 2026-10-29 起落库（补列，见 models.Team）；
+    - audit_status 用模型默认 APPROVED（Q2 审核流程不启用）；
+    - 写入范围：schoolOrgId 解析出的学校组织须在账号范围内（全局管理员
+      全量、TEAM 限本校父节点、其余按组织子树），否则 403 DATA_SCOPE_DENIED。
     """
     from apps.accounts.services import ensure_business_org
 
-    # A′ 第 2 批：创建球队必须校验目标学校组织节点在当前账号范围内
-    # （全局 ADMIN 全库；其余账号仅限本组织子树；空范围一律拒绝）。
-    # schoolOrgId 的存在性/类型/主档校验在 API 层 _resolve_school（400），
-    # 范围校验在此层（403），职责分层与既有错误码约定不变。
-    scopes.ensure_org_in_scope(account, org.pk)
-
+    _ensure_create_org_scope(account, org)
+    # 归属落库：球队 region 取学校区划沿 parent 上溯的市州（level 2），
+    # 供报名 cityOrgId 解析与市州端数据隔离使用；上溯不到保留学校区县原值
+    region = school.region if school.region_id else None
+    hops = 0
+    while region is not None and region.level != 2 and region.parent_id and hops < 6:
+        region = region.parent
+        hops += 1
     with transaction.atomic():
         team = Team.objects.create(
             name=data["name"],
             category_code=data["groupCategory"],
             school=school,
+            region=region,
             introduction=data.get("intro"),
             flag_file_id=data.get("flagFileId"),
             logo_file_id=data.get("emblemFileId"),
             group_photo_file_id=data.get("groupPhotoFileId"),
+            # 2026-10-29 补列落库：gender/campusName（TeamCreateBody 声明字段）
+            gender=data.get("gender"),
+            campus_name=data.get("campusName"),
             status=enums.EnableStatus.ACTIVE,
         )
         # team_no 按 DDL 列注释回填：T+年份+8位id（person_no 同款；pk 全局唯一
@@ -277,17 +308,18 @@ def create_team(data: dict, org, school, account) -> Team:
 def update_team(team_id: str, payload: dict, account) -> Team:
     """PUT /teams/{id}：version 乐观锁 + 可变字段替换（exclude_unset 语义）。
 
-    可变字段：name/intro/flagFileId/emblemFileId/groupPhotoFileId（均有冻结承载）；
-    接受但忽略：schoolOrgId/groupCategory/gender/campusName/shortName/coachName
-    （前端原样回传的不可变/无承载字段，不因未变化字段导致编辑失败）。
+    可变字段：name/intro/flagFileId/emblemFileId/groupPhotoFileId（均有冻结承载）
+    + shortName/campusName/gender/coachName（2026-10-29 补列落库，保存即回显，
+    避免“保存成功但值消失”）；
+    接受但忽略：schoolOrgId/groupCategory（前端原样回传的不可变/无承载字段，
+    不因未变化字段导致编辑失败）。
     """
     from apps.persons.services import ensure_version, parse_path_id
 
-    _require_admin_scope(account)
     team = _annotate_team(_team_queryset()).filter(pk=parse_path_id(team_id)).first()
     if team is None:
         raise ApiError(NOT_FOUND)
-    scopes.ensure_team_in_scope(account, team)
+    ensure_team_visible(account, team)
     ensure_version(team, payload["version"])
     mapping = {
         "name": "name",
@@ -295,6 +327,11 @@ def update_team(team_id: str, payload: dict, account) -> Team:
         "flagFileId": "flag_file_id",
         "emblemFileId": "logo_file_id",
         "groupPhotoFileId": "group_photo_file_id",
+        # 2026-10-29 补列落库：资料字段（保存即回显）
+        "shortName": "short_name",
+        "campusName": "campus_name",
+        "gender": "gender",
+        "coachName": "coach_name",
     }
     changed = False
     for src, dst in mapping.items():
@@ -318,7 +355,7 @@ _MEMBER_NOT_TEAM = "成员关系不存在或不属于该球队"
 
 
 def _team_or_404(team_id: str) -> Team:
-    """成员操作用：球队必须存在且未软删（数据范围门卫由各服务先调）。"""
+    """成员操作用：球队必须存在且未软删（范围判定由调用方随后 ensure_team_visible）。"""
     from apps.persons.services import parse_path_id
 
     team = Team.objects.filter(pk=parse_path_id(team_id), is_deleted=False).first()
@@ -341,9 +378,8 @@ def member_list(team_id: str, filters: dict, account) -> QuerySet[TeamMember]:
     mock 的 maskedIdNumber 检索与 status 筛选参数为演示逻辑，前端实际
     只传 page/pageSize/keyword（TeamMembersView L55-59），不照搬。
     """
-    _require_admin_scope(account)
     team = _team_or_404(team_id)
-    scopes.ensure_team_in_scope(account, team)
+    ensure_team_visible(account, team)
     queryset = _member_queryset().filter(team=team)
     keyword = (filters.get("keyword") or "").strip()
     if keyword:
@@ -356,13 +392,13 @@ def member_get(team_id: str, member_id: str, account) -> TeamMember:
 
     与 member_list 同一查询事实源（_member_queryset）；成员不属该队/不存在
     → 404（_MEMBER_NOT_TEAM 语义，不泄露他队关系）；EXITED 历史关系可读
-    （状态直出冻结枚举）；数据范围同列表（A′ 第 2 批逐对象校验）。
+    （状态直出冻结枚举）；球队不可见 → 403 DATA_SCOPE_DENIED，成员不属该队
+    → 404（_MEMBER_NOT_TEAM 语义）。
     """
     from apps.persons.services import parse_path_id
 
-    _require_admin_scope(account)
     team = _team_or_404(team_id)
-    scopes.ensure_team_in_scope(account, team)
+    ensure_team_visible(account, team)
     member = _member_queryset().filter(team=team, pk=parse_path_id(member_id)).first()
     if member is None:
         raise ApiError(NOT_FOUND, _MEMBER_NOT_TEAM)
@@ -381,9 +417,8 @@ def member_search(team_id: str, keyword: str, account) -> list:
     from apps.persons.schemas import person_out
     from apps.persons.services import people_queryset
 
-    _require_admin_scope(account)
     team = _team_or_404(team_id)
-    scopes.ensure_team_in_scope(account, team)
+    ensure_team_visible(account, team)
     queryset = people_queryset().filter(athlete_profile_exists=True)
     term = (keyword or "").strip()
     if term:
@@ -407,9 +442,8 @@ def member_add(team_id: str, payload: dict, account) -> TeamMember:
     from apps.persons.models import AthleteProfile, Person
     from apps.persons.services import parse_path_id
 
-    _require_admin_scope(account)
     team = _team_or_404(team_id)
-    scopes.ensure_team_in_scope(account, team)
+    ensure_team_visible(account, team)
     person = Person.objects.filter(
         pk=parse_path_id(payload["athleteId"]), is_deleted=False
     ).first()
@@ -455,9 +489,8 @@ def member_update(team_id: str, member_id: str, payload: dict, account) -> TeamM
     """
     from apps.persons.services import ensure_version, parse_path_id
 
-    _require_admin_scope(account)
     team = _team_or_404(team_id)
-    scopes.ensure_team_in_scope(account, team)
+    ensure_team_visible(account, team)
     member = _member_queryset().filter(team=team, pk=parse_path_id(member_id)).first()
     if member is None:
         raise ApiError(NOT_FOUND, _MEMBER_NOT_TEAM)
@@ -499,9 +532,8 @@ def member_remove(team_id: str, member_id: str, version: int, account) -> TeamMe
     """
     from apps.persons.services import ensure_version, parse_path_id
 
-    _require_admin_scope(account)
     team = _team_or_404(team_id)
-    scopes.ensure_team_in_scope(account, team)
+    ensure_team_visible(account, team)
     member = _member_queryset().filter(team=team, pk=parse_path_id(member_id)).first()
     if member is None:
         raise ApiError(NOT_FOUND, _MEMBER_NOT_TEAM)
@@ -523,3 +555,127 @@ def member_remove(team_id: str, member_id: str, version: int, account) -> TeamMe
         member.left_at = timezone.now()
         member.save()
     return member
+
+
+# ---------------------------------------------------------------- 球队教练（批次 C）
+# 契约对齐 zuqiu teamApi.coaches/addCoach/removeCoach（index.ts L136-139）与
+# TeamCoachesView 实码。category 值域以契约为准（HEAD_COACH/ASSISTANT_COACH/
+# MANAGER/OTHER），duty 冻结列透传存取（position_code 先例：冻结值域与契约
+# 不一致时不做映射，不虚构字典规则）；R4 现役主教练唯一按字面 HEAD_COACH 判定。
+
+_COACH_CATEGORIES = ("HEAD_COACH", "ASSISTANT_COACH", "MANAGER", "OTHER")
+_COACH_NOT_TEAM = "教练关系不存在或不属于该球队"
+
+
+def _coach_queryset() -> QuerySet[TeamCoach]:
+    """教练关系查询：排除软删球队/软删人员 + person 一次取齐。"""
+    return TeamCoach.objects.filter(
+        team__is_deleted=False, person__is_deleted=False
+    ).select_related("person", "team")
+
+
+def coach_list(team_id: str, filters: dict, account) -> QuerySet[TeamCoach]:
+    """GET /teams/{id}/coaches：category/reviewStatus 筛选 + 分页。
+
+    - 只返回现役（CURRENT）关系：前端无状态列、mock 移除即从列表消失，
+      历史行留库可审计（软退出语义与列表口径一致）；
+    - category 透传过滤 duty 列；reviewStatus 按人员审核状态过滤
+      （person_out 先例：直出 audit_status，关联级审核列不存在，
+      审核对象留待 D1 确认，不虚构审核流程）。
+    """
+    team = _team_or_404(team_id)
+    ensure_team_visible(account, team)
+    queryset = _coach_queryset().filter(team=team, status=enums.RelationStatus.CURRENT)
+    category = (filters.get("category") or "").strip()
+    if category:
+        queryset = queryset.filter(duty=category)
+    review = (filters.get("reviewStatus") or "").strip()
+    if review:
+        queryset = queryset.filter(person__audit_status=review)
+    return queryset.order_by("-created_at", "-id")
+
+
+def coach_add(team_id: str, payload: dict, account) -> TeamCoach:
+    """POST /teams/{id}/coaches：校验球队/教练 + 现役唯一 + R4 现役主教练唯一。
+
+    - 人员须存在、未软删且具备 COACH 身份（CoachProfile 行存在性，方案C
+      完整类别事实源，与 member_add 的 AthleteProfile 校验同源）；
+    - category 校验契约 4 值后透传落 duty 列；effectiveFrom（契约必填日期）
+      落 joined_at（生效起期的真实承载）；effectiveTo/reviewStatus 声明但
+      不应用（effectiveTo 无冻结承载列，reviewStatus 关联级审核列不存在）；
+    - 同队现役重复添加 409（R2 同款）；已有现役主教练再加 HEAD_COACH 409（R4）。
+    """
+    from datetime import date as _date
+
+    from apps.persons.models import CoachProfile, Person
+    from apps.persons.services import parse_path_id
+
+    team = _team_or_404(team_id)
+    ensure_team_visible(account, team)
+    category = (payload.get("category") or "").strip()
+    if category not in _COACH_CATEGORIES:
+        raise ApiError(
+            INVALID_ARGUMENT,
+            "教练岗位类别不合法",
+            field_errors([("category", f"取值须为 {'/'.join(_COACH_CATEGORIES)}")]),
+        )
+    raw_from = (payload.get("effectiveFrom") or "").strip()
+    try:
+        joined_at = _date.fromisoformat(raw_from)
+    except ValueError:
+        raise ApiError(
+            INVALID_ARGUMENT,
+            "生效起期格式不合法",
+            field_errors([("effectiveFrom", "须为 YYYY-MM-DD 日期")]),
+        ) from None
+    person = Person.objects.filter(
+        pk=parse_path_id(payload["coachId"], "coachId"), is_deleted=False
+    ).first()
+    if person is None:
+        raise ApiError(NOT_FOUND, "教练不存在或已删除")
+    if not CoachProfile.objects.filter(person=person).exists():
+        raise ApiError(STATE_CONFLICT, "该人员不具备教练身份，不能加入球队教练组")
+    with transaction.atomic():
+        if _coach_queryset().filter(
+            team=team, person=person, status=enums.RelationStatus.CURRENT
+        ).exists():
+            raise ApiError(STATE_CONFLICT, "该教练已是本队现役教练")
+        if category == enums.CoachDuty.HEAD_COACH and _coach_queryset().filter(
+            team=team,
+            status=enums.RelationStatus.CURRENT,
+            duty=enums.CoachDuty.HEAD_COACH,
+        ).exists():
+            raise ApiError(STATE_CONFLICT, "本队已有现役主教练（R4 现役主教练唯一）")
+        coach = TeamCoach.objects.create(
+            team=team,
+            person=person,
+            duty=category,
+            joined_at=joined_at,
+        )
+    return coach
+
+
+def coach_remove(team_id: str, coach_id: str, version: int, account) -> TeamCoach:
+    """DELETE /teams/{id}/coaches/{coach_id}?version=：软退出（CURRENT→EXITED）。
+
+    禁止物理删除（冻结模型，历史关系可审计）；version 乐观锁 + 跨球队归属
+    校验（404）；重复移出（已 EXITED）→ 409（member_remove 同款）。
+    教练关系无转队单关联（F1 方案B，team_transfer 仅运动员），不设转队阻断。
+    """
+    from apps.persons.services import ensure_version, parse_path_id
+
+    team = _team_or_404(team_id)
+    ensure_team_visible(account, team)
+    coach = _coach_queryset().filter(
+        team=team, pk=parse_path_id(coach_id, "coachId")
+    ).first()
+    if coach is None:
+        raise ApiError(NOT_FOUND, _COACH_NOT_TEAM)
+    ensure_version(coach, version)
+    if coach.status != enums.RelationStatus.CURRENT:
+        raise ApiError(STATE_CONFLICT, "该教练已离队，不能重复移出")
+    with transaction.atomic():
+        coach.status = enums.RelationStatus.EXITED
+        coach.left_at = timezone.now()
+        coach.save()
+    return coach

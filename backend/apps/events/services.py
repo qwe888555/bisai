@@ -1,4 +1,4 @@
-"""events 业务逻辑：赛事与赛事组别的查询、创建、更新、软删除。
+﻿"""events 业务逻辑：赛事与赛事组别的查询、创建、更新、软删除。
 
 规则集中在本层，视图只做权限校验与信封包装；写操作带乐观锁 version，
 删除为软删除，存在受保护历史关联时返回 409 STATE_CONFLICT，不级联破坏。
@@ -9,6 +9,7 @@ from __future__ import annotations
 from typing import Optional
 
 from django.utils import timezone
+from django.utils.html import escape
 
 from apps.common.errors import (
     BUSINESS_VALIDATION_FAILED,
@@ -195,7 +196,36 @@ def delete_group(event_id: str, group_id: str, version: Optional[int]) -> EventG
 
 # ---------------------------------------------------------------- 比赛对阵（5.1）
 
-def list_matches(filters: dict):
+def _match_scope_team_ids(account) -> Optional[list]:
+    """TEAM 账号的比赛数据范围：仅本队参与的对阵（2026-10-29 交付）。
+
+    与 teams.visible_teams 的 TEAM 分支同源（team_no=账号组织节点 code）；
+    球队端比赛页（zuqiu matchApi.list，不带 teamId）据此只返回本队赛程，
+    不再全量返回。其余账号（全局管理员/MATCH_RECORDER/学校/市州/省级管理端）
+    暂不限制（返回 None，行为不变）；TEAM 账号未绑定球队组织 → 403
+    DATA_SCOPE_DENIED（visible_teams 同款语义，不静默返回空列表）。
+    """
+    from apps.common.errors import DATA_SCOPE_DENIED
+    from apps.common.permissions import TEAM
+    from apps.common.scopes import account_org_code, is_global_admin
+    from apps.teams.models import Team
+
+    if is_global_admin(account):
+        return None
+    if TEAM not in (getattr(account, "roles", ()) or ()):
+        return None
+    code = account_org_code(account)
+    if not code:
+        raise ApiError(DATA_SCOPE_DENIED, "球队账号未绑定球队组织，无法确定数据范围")
+    return [
+        str(pk)
+        for pk in Team.objects.filter(is_deleted=False, team_no=code).values_list(
+            "pk", flat=True
+        )
+    ]
+
+
+def list_matches(filters: dict, account=None):
     from django.db.models import Q
 
     from .models import Match
@@ -226,6 +256,14 @@ def list_matches(filters: dict):
             )
         else:
             queryset = queryset.none()
+    if account is not None:
+        # 球队账号数据范围（不带 teamId 也只看本队赛程）；显式 teamId 筛选与
+        # 范围取交集，筛选条件不扩大权限。
+        scope_ids = _match_scope_team_ids(account)
+        if scope_ids is not None:
+            queryset = queryset.filter(
+                Q(home_team_id__in=scope_ids) | Q(away_team_id__in=scope_ids)
+            )
     return queryset.order_by("kickoff_at", "id")
 
 
@@ -865,7 +903,8 @@ def unpublish_content(content_id: str, version: int, reason: str):
 # ---------------------------------------------------------------- 门户资源（7.2）
 
 def _validate_resource_target(resource_type: str, image_file_id: str,
-                             target_content_id: str, target_url: str, enabled: bool) -> None:
+                             target_content_id: str, target_url: str, enabled: bool,
+                             video_url: str = "") -> None:
     if target_content_id and target_url:
         raise ApiError(
             BUSINESS_VALIDATION_FAILED,
@@ -878,6 +917,19 @@ def _validate_resource_target(resource_type: str, image_file_id: str,
             "targetUrl 仅支持 http/https",
             [{"field": "targetUrl", "reason": "必须以 http:// 或 https:// 开头"}],
         )
+    if video_url:
+        if resource_type != "CAROUSEL":
+            raise ApiError(
+                BUSINESS_VALIDATION_FAILED,
+                "只有首页轮播支持配置视频",
+                [{"field": "videoUrl", "reason": "仅 CAROUSEL 类型可填"}],
+            )
+        if not (video_url.startswith("http://") or video_url.startswith("https://")):
+            raise ApiError(
+                BUSINESS_VALIDATION_FAILED,
+                "videoUrl 仅支持 http/https",
+                [{"field": "videoUrl", "reason": "必须以 http:// 或 https:// 开头"}],
+            )
     if resource_type in ("CAROUSEL", "NEWS_LINK_IMAGE") and enabled and not image_file_id:
         raise ApiError(
             BUSINESS_VALIDATION_FAILED,
@@ -906,55 +958,173 @@ def get_portal_resource(resource_id: str):
     return resource
 
 
+def _resource_content_body(title: str, description: str) -> tuple[str, str]:
+    paragraph = (description or "").strip() or f"{title} 的详细内容正在整理中，敬请关注。"
+    return sanitize_body_html(f"<p>{escape(paragraph)}</p>")
+
+
+def _create_content_from_resource(resource):
+    """新闻配图没有关联内容时自动建一条同名赛事资讯，让门户资讯页同步出现新条目。"""
+    from .models import Content
+
+    body_html, body_text = _resource_content_body(resource.title, resource.description)
+    content = Content.objects.create(
+        id=new_id("cnt"),
+        content_type="NEWS",
+        title=resource.title[:200],
+        summary=resource.description[:1000],
+        body_html=body_html,
+        body_text=body_text,
+        cover_file_id=resource.image_file_id,
+        status="PUBLISHED" if resource.enabled else "DRAFT",
+        published_at=timezone.now() if resource.enabled else None,
+        revision=1,
+        auto_created=True,
+    )
+    resource.target_content_id = content.pk
+    resource.save(update_fields=["target_content_id", "updated_at"])
+    return content
+
+
+def _sync_auto_content(resource) -> None:
+    """自动创建的资讯跟随配图：标题、介绍、封面、启停状态保持一致。"""
+    from .models import Content
+
+    if resource.resource_type != "NEWS_LINK_IMAGE" or not resource.target_content_id:
+        return
+    content = Content.objects.filter(pk=resource.target_content_id).first()
+    if content is None or not content.auto_created:
+        return
+
+    changed = False
+    title = resource.title[:200]
+    if content.title != title:
+        content.title = title
+        changed = True
+    summary = resource.description[:1000]
+    if content.summary != summary:
+        content.summary = summary
+        changed = True
+        # 只有配图的文字介绍变了才重写正文，避免覆盖在「内容管理」里补写的正文。
+        body_html, body_text = _resource_content_body(resource.title, resource.description)
+        content.body_html = body_html
+        content.body_text = body_text
+    if resource.image_file_id and content.cover_file_id != resource.image_file_id:
+        content.cover_file_id = resource.image_file_id
+        changed = True
+
+    if resource.enabled:
+        content.status = "PUBLISHED"
+        if content.published_at is None:
+            content.published_at = timezone.now()
+    else:
+        content.status = "OFFLINE" if content.published_at else "DRAFT"
+
+    if changed:
+        content.revision = int(content.revision or 1) + 1
+        bump(content)
+    content.save()
+
+
 def create_portal_resource(data: dict):
     from .models import PortalResource
 
     _validate_resource_target(
         data["resourceType"], data.get("imageFileId", ""),
         data.get("targetContentId", ""), data.get("targetUrl", ""),
-        bool(data.get("enabled", True)),
+        bool(data.get("enabled", True)), data.get("videoUrl", ""),
     )
     resource = PortalResource.objects.create(
         id=new_id("pres"),
         resource_type=data["resourceType"],
         title=data["title"],
+        description=data.get("description", ""),
         image_file_id=data.get("imageFileId", ""),
+        video_url=data.get("videoUrl", ""),
         target_content_id=data.get("targetContentId", ""),
         target_url=data.get("targetUrl", ""),
         sort_order=data.get("sortOrder", 0),
         enabled=bool(data.get("enabled", True)),
     )
+    if resource.resource_type == "NEWS_LINK_IMAGE" and not resource.target_content_id:
+        _create_content_from_resource(resource)
     _invalidate_public_cache()
     return resource
 
 
 def update_portal_resource(resource_id: str, data: dict):
+    from .models import Content
+
     resource = get_portal_resource(resource_id)
     check_version(resource, data.get("version"))
     _validate_resource_target(
         data["resourceType"], data.get("imageFileId", ""),
         data.get("targetContentId", ""), data.get("targetUrl", ""),
-        bool(data.get("enabled", True)),
+        bool(data.get("enabled", True)), data.get("videoUrl", ""),
     )
+    # 管理端「先建停用态资源、上传图片后再保存」的第二步不会回传自动关联的资讯，
+    # 这里保留原绑定，避免把刚生成的赛事资讯解绑。
+    previous_target_id = resource.target_content_id
+    auto_linked = None
+    if resource.target_content_id:
+        auto_linked = Content.objects.filter(
+            pk=resource.target_content_id, auto_created=True
+        ).first()
+    target_content_id = data.get("targetContentId", "")
+    if (
+        data["resourceType"] == "NEWS_LINK_IMAGE"
+        and not target_content_id
+        and auto_linked is not None
+    ):
+        target_content_id = auto_linked.pk
+
     resource.resource_type = data["resourceType"]
     resource.title = data["title"]
+    resource.description = data.get("description", "")
     resource.image_file_id = data.get("imageFileId", "")
-    resource.target_content_id = data.get("targetContentId", "")
+    resource.video_url = data.get("videoUrl", "")
+    resource.target_content_id = target_content_id
     resource.target_url = data.get("targetUrl", "")
     resource.sort_order = data.get("sortOrder", 0)
     resource.enabled = bool(data.get("enabled", True))
     bump(resource)
     resource.save()
+
+    # 配图改成别的关联内容或切成其他类型时，原来自动生成的资讯一并下线。
+    if auto_linked is not None and resource.target_content_id != auto_linked.pk:
+        auto_linked.deleted_at = timezone.now()
+        bump(auto_linked)
+        auto_linked.save()
+    elif (
+        resource.resource_type == "NEWS_LINK_IMAGE"
+        and not resource.target_content_id
+        and not previous_target_id
+    ):
+        # 兼容本次改动前建的、还没关联内容的新闻配图：保存后补建资讯。
+        _create_content_from_resource(resource)
+    else:
+        _sync_auto_content(resource)
     _invalidate_public_cache()
     return resource
 
 
 def delete_portal_resource(resource_id: str, version: int):
+    from .models import Content
+
     resource = get_portal_resource(resource_id)
     check_version(resource, version)
+    auto_linked = None
+    if resource.target_content_id:
+        auto_linked = Content.objects.filter(
+            pk=resource.target_content_id, auto_created=True
+        ).first()
     resource.deleted_at = timezone.now()
     bump(resource)
     resource.save()
+    if auto_linked is not None:
+        auto_linked.deleted_at = timezone.now()
+        bump(auto_linked)
+        auto_linked.save()
     _invalidate_public_cache()
     return resource
 
@@ -1116,6 +1286,66 @@ def public_list_events(filters: dict):
     if filters.get("eventCategory"):
         qs = qs.filter(event_category=filters["eventCategory"])
     return qs.order_by("-created_at", "id")
+
+def event_phase(event):
+    """赛季进度派生（教练端赛季进度卡片数据源）。
+
+    阶段与进度定义（对齐赛事状态机；events 域不含初审/终审审核流程）：
+      NOT_STARTED  - DRAFT：筹备中，进度 0
+      REGISTRATION - REGISTRATION_OPEN / REGISTRATION_CLOSED：报名阶段，
+                     progressPercent = 报名窗口已过时间占比（CLOSED 恒 100）
+      COMPETITION  - RUNNING：比赛阶段，
+                     progressPercent = 已结束场次 / 总场次（无比赛场次时 0）
+      FINISHED     - FINISHED：已结束，进度 100
+
+    返回 {currentPhase, phaseStartedAt, phaseEndsAt, progressPercent}。
+    """
+    from django.db.models import Count, Max, Min, Q
+    from django.utils import timezone
+
+    from .models import Match
+
+    now = timezone.now()
+
+    def _aware(dt):
+        if dt is not None and dt.tzinfo is None:
+            return timezone.make_aware(dt)
+        return dt
+
+    status = event.status
+    if status == "DRAFT":
+        return {"currentPhase": "NOT_STARTED", "phaseStartedAt": None,
+                "phaseEndsAt": None, "progressPercent": 0}
+
+    if status in ("REGISTRATION_OPEN", "REGISTRATION_CLOSED"):
+        start = _aware(event.registration_opens_at)
+        end = _aware(event.registration_closes_at)
+        if status == "REGISTRATION_CLOSED":
+            pct = 100
+        else:
+            total = max((end - start).total_seconds(), 1)
+            pct = int(max(0.0, min(100.0, (now - start).total_seconds() / total * 100)))
+        return {"currentPhase": "REGISTRATION", "phaseStartedAt": start,
+                "phaseEndsAt": end, "progressPercent": pct}
+
+    agg = Match.objects.filter(event_id=event.pk).aggregate(
+        first=Min("kickoff_at"), last=Max("kickoff_at"),
+        total=Count("id"), done=Count("id", filter=Q(status="FINISHED")),
+    )
+    first, last = _aware(agg["first"]), _aware(agg["last"])
+    if status == "RUNNING":
+        pct = int(agg["done"] / agg["total"] * 100) if agg["total"] else 0
+        return {"currentPhase": "COMPETITION", "phaseStartedAt": first,
+                "phaseEndsAt": last, "progressPercent": pct}
+
+    # FINISHED
+    if first is None:
+        first = _aware(event.registration_opens_at)
+    if last is None:
+        last = _aware(event.registration_closes_at)
+    return {"currentPhase": "FINISHED", "phaseStartedAt": first,
+            "phaseEndsAt": last, "progressPercent": 100}
+
 
 def public_list_matches(filters: dict):
     from .models import Match

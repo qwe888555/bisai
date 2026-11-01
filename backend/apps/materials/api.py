@@ -4,7 +4,7 @@
 - materialList  GET  /materials                    （page/pageSize/ownerType?/ownerId?）
 - materialCreate POST /materials                  （body 全字段，StrictSchema 多传 400）
 - materialReview POST /materials/{id}/review      （body {decision, reason?, version}）
-- materialRemove DELETE /materials/{id}?version=  （软删）
+- materialDelete DELETE /materials/{id}?version=  （软删）
 - materialGet  GET /materials/{id}                （批次 D-2 补齐：文档契约明确，
   多态双表解析与 review/remove 同口径）
 - materialUpdate PUT /materials/{id}               （批次 D-3 补齐：title→remark、
@@ -69,7 +69,7 @@ register_operation(
 )
 register_operation("materialReview", (UNIVERSITY,))
 register_operation(
-    "materialRemove", (ADMIN, UNIVERSITY, TEAM, PROVINCE_REVIEWER, ATHLETE, COACH, CITY)
+    "materialDelete", (ADMIN, UNIVERSITY, TEAM, PROVINCE_REVIEWER, ATHLETE, COACH, CITY)
 )
 # 审核历史（P1-9 原定任务）：读取类操作，角色集同 materialGet；数据范围同单对象读。
 register_operation(
@@ -180,7 +180,7 @@ def material_review(request, material_id: str, body: s.MaterialReviewBody):
 
 @router.delete("/materials/{material_id}", auth=_auth, response=EnvelopeOut, summary="删除材料")
 def material_remove(request, material_id: str, version: Optional[int] = Query(None, ge=0)):
-    account = require("materialRemove")
+    account = require("materialDelete")
     if version is None:
         raise ApiError(
             INVALID_ARGUMENT,

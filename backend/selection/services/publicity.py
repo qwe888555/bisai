@@ -26,10 +26,11 @@ from ..common import (
     get_field,
     paginated,
     parse_event_id,
+    parse_int,
     to_datetime_str,
 )
 from ..enums import GroupType, PublicityStatus, PublicityType
-from ..models import PublicityRecord
+from ..models import PublicityRecord, ResultBatch
 from .publicity_source import get_publicity_source_client
 
 # Defaults are also written to config/settings.py.  Member 4 can override the
@@ -339,6 +340,54 @@ def publish_registration(data, user_id=""):
     return payload
 
 
+def _publish_selected_sources(
+    sources, event_id, user_id, expected_type=None
+):
+    """Publish a pre-filtered source list, skipping already-published rows."""
+    published = 0
+    skipped = 0
+    failed = 0
+    errors = []
+    records = []
+
+    for source in sources:
+        try:
+            record, action = _publish_source(
+                source,
+                event_id,
+                user_id,
+                expected_type=expected_type,
+                on_published="skip",
+            )
+        except BusinessError as exc:
+            failed += 1
+            errors.append(
+                {
+                    "source_id": str(source.source_id),
+                    "candidate_id": str(
+                        getattr(source, "candidate_id", "") or ""
+                    ),
+                    "message": exc.message,
+                }
+            )
+            continue
+
+        if action == "skipped":
+            skipped += 1
+            continue
+
+        published += 1
+        records.append(_serialize(record, management=True))
+
+    return {
+        "published": published,
+        "skipped": skipped,
+        "failed": failed,
+        "errors": errors,
+        "records": records,
+    }
+
+
 def batch_publish(data, user_id=""):
     """Publish all source records matching a filter.
 
@@ -375,46 +424,133 @@ def batch_publish(data, user_id=""):
         publicity_type=publicity_type,
         event_id=event_id,
     )
+    return _publish_selected_sources(
+        sources, event_id, user_id, expected_type=publicity_type
+    )
 
-    published = 0
-    skipped = 0
-    failed = 0
-    errors = []
-    records = []
 
-    for source in sources:
-        try:
-            record, action = _publish_source(
-                source,
-                event_id,
-                user_id,
-                expected_type=publicity_type,
-                on_published="skip",
-            )
-        except BusinessError as exc:
-            failed += 1
-            errors.append(
-                {
-                    "source_id": str(source.source_id),
-                    "message": exc.message,
-                }
-            )
-            continue
+def publish_result_batch(data, user_id=""):
+    """Publish only the athletes in one active result batch.
 
-        if action == "skipped":
-            skipped += 1
-            continue
+    This is the shortlist → publicity bridge: ``ResultItem.candidate_id`` is
+    the person archive ID used by scoring, while ``PublicityRecord.source_id``
+    is the roster row ID.  Mapping through the roster prevents the old batch
+    endpoint from publishing every approved registration in the group.
+    """
+    batch_id = parse_int(
+        get_field(
+            data,
+            "result_batch_id",
+            "resultBatchId",
+            "batch_id",
+            "batchId",
+            label="结果批次ID",
+        ),
+        "结果批次ID",
+        min_value=1,
+    )
+    batch = (
+        ResultBatch.objects.prefetch_related("items")
+        .filter(pk=batch_id)
+        .first()
+    )
+    if batch is None:
+        raise BusinessError(404, "遴选结果批次不存在")
+    if not batch.active or batch.stale:
+        raise BusinessError(
+            409, "仅现行且未过期的结果批次可以发布公示"
+        )
 
-        published += 1
-        records.append(_serialize(record, management=True))
-
-    return {
-        "published": published,
-        "skipped": skipped,
-        "failed": failed,
-        "errors": errors,
-        "records": records,
+    candidate_ids = {
+        str(item.candidate_id)
+        for item in batch.items.all()
+        if str(item.candidate_id or "").strip()
     }
+    if not candidate_ids:
+        raise BusinessError(400, "结果批次没有入围名单")
+
+    sources = get_publicity_source_client().list_registrations(
+        group_type=batch.group_type,
+        publicity_type=PublicityType.ATHLETE,
+        event_id=batch.event_id,
+    )
+    selected = {}
+    for source in sources:
+        candidate_id = str(
+            getattr(source, "candidate_id", "") or ""
+        ).strip()
+        if candidate_id in candidate_ids and candidate_id not in selected:
+            selected[candidate_id] = source
+
+    result = _publish_selected_sources(
+        selected.values(),
+        batch.event_id,
+        user_id,
+        expected_type=PublicityType.ATHLETE,
+    )
+    missing = sorted(candidate_ids - set(selected))
+    for candidate_id in missing:
+        result["failed"] += 1
+        result["errors"].append(
+            {
+                "candidate_id": candidate_id,
+                "message": "未找到该运动员的有效报名档案",
+            }
+        )
+    result.update(
+        {
+            "result_batch_id": batch.id,
+            "candidate_count": len(candidate_ids),
+        }
+    )
+    return result
+
+
+def list_my_publications(account, page=1, size=10):
+    """Return all publicity rows belonging to the current person.
+
+    The UI used to poll ``/publicity/manage/`` once per event and match masked
+    ID cards by string.  This resolves the account's person once and matches
+    roster/coach relation IDs, so cancelled rows are included without N+1
+    requests and without name-based guessing.
+    """
+    person_id = str(getattr(account, "person_id", "") or "").strip()
+    if not person_id:
+        return paginated([], 0, page, size)
+
+    try:
+        from .main_adapters import (
+            main_data_available,
+            person_publicity_source_ids,
+        )
+
+        if not main_data_available():
+            return paginated([], 0, page, size)
+        source_ids = person_publicity_source_ids(person_id)
+    except Exception:  # pragma: no cover - depends on member4 data
+        return paginated([], 0, page, size)
+
+    athlete_ids = source_ids.get(PublicityType.ATHLETE) or set()
+    coach_ids = source_ids.get(PublicityType.COACH) or set()
+    if not athlete_ids and not coach_ids:
+        return paginated([], 0, page, size)
+
+    queryset = PublicityRecord.objects.filter(
+        Q(
+            publicity_type=PublicityType.ATHLETE,
+            source_id__in=athlete_ids,
+        )
+        | Q(
+            publicity_type=PublicityType.COACH,
+            source_id__in=coach_ids,
+        )
+    )
+    total = queryset.count()
+    records = [
+        _serialize(record, management=True)
+        for record in queryset[(page - 1) * size : page * size]
+    ]
+    return paginated(records, total, page, size)
 
 
 @transaction.atomic

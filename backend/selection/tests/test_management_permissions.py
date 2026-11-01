@@ -29,7 +29,7 @@ PUBLICITY_PATH = f"{API_PREFIX}publicity/"
 
 TEMPLATE_BODY = {
     "name": "鉴权测试模板",
-    "group_type": "HIGHER",
+    "group_type": "MIDDLE",
     "round": "INITIAL",
     "items": [
         {

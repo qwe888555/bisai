@@ -1674,6 +1674,39 @@ def _team_brief_out(team) -> dict:
     }
 
 
+def list_team_account_teams(account) -> list[dict]:
+    """GET /me/teams（TEAM 分支，main 9f92156 保留）：球队端只看绑定的那支队。
+
+    A′-min 约定：TEAM 账号组织节点 code == Team.team_no；不做组织子树，
+    避免球队端看到同校其他队伍。绑定缺失或数据未对齐返回空列表（空态），
+    保证球队工作台能正常进入而不是 403/404。输出与 list_own_teams 同构
+    （复用 _team_brief_out）。
+    """
+    from apps.common.scopes import account_org_code
+
+    team_no = account_org_code(account)
+    if not team_no:
+        return []
+    head_coach_subq = TeamCoach.objects.filter(
+        team=OuterRef("pk"),
+        status=enums.RelationStatus.CURRENT,
+        duty=enums.CoachDuty.HEAD_COACH,
+    ).values("person__full_name")[:1]
+    rows = (
+        Team.objects.filter(team_no=team_no, is_deleted=False)
+        .select_related("school", "region")
+        .annotate(
+            member_count=Count(
+                "teammember",
+                filter=Q(teammember__status=enums.RelationStatus.CURRENT),
+            ),
+            head_coach_name=Subquery(head_coach_subq),
+        )
+        .order_by("created_at", "id")
+    )
+    return [_team_brief_out(row) for row in rows]
+
+
 def delete_person(person_id: str, request_version, account) -> None:
     """DELETE /people/{id}：软删（版本校验 + 现役球队/教练关联保护）。"""
     person = get_person(person_id, account)

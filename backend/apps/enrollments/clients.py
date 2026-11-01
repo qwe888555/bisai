@@ -45,6 +45,32 @@ def mock_enabled() -> bool:
     return os.environ.get("ENROLLMENT_MOCK_CLIENTS", "true").strip().lower() in TRUE_VALUES
 
 
+def _gender_label(value) -> str:
+    """Person.gender (int 0/1/2) → 契约标签。"""
+    from apps.common.enums import Gender
+
+    mapping = {Gender.MALE: "MALE", Gender.FEMALE: "FEMALE", Gender.UNKNOWN: "UNKNOWN"}
+    try:
+        return mapping.get(int(value), "UNKNOWN")
+    except (TypeError, ValueError):
+        return "UNKNOWN"
+
+
+def _resolve_person(athlete_id: str):
+    """athlete_id 可能是 Person.pk 或 person_no，统一解析为 Person 实例。"""
+    from apps.persons.models import Person
+
+    if not athlete_id:
+        return None
+    try:
+        person = Person.objects.filter(pk=int(athlete_id), is_deleted=False).first()
+    except (TypeError, ValueError):
+        person = None
+    if person is None:
+        person = Person.objects.filter(person_no=athlete_id, is_deleted=False).first()
+    return person
+
+
 def _digest(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
@@ -117,13 +143,132 @@ _TEAM_SEED: dict[str, dict[str, Any]] = {
 }
 
 
+def _level2_region(region):
+    """沿 parent 上溯到 level==2（市州）区划；到顶仍找不到时返回原区划。"""
+    seen = 0
+    current = region
+    while current is not None and current.level != 2 and seen < 6:
+        current = current.parent
+        seen += 1
+    return current or region
+
+
+def _city_org_ancestor(team):
+    """沿组织树上溯：球队的学校/球队 org 节点 → 最近的 CITY 祖先节点。"""
+    from apps.accounts.models import Organization
+
+    codes = []
+    school = getattr(team, "school", None)
+    if school is not None and school.code:
+        codes.append(school.code)
+    if getattr(team, "team_no", ""):
+        codes.append(team.team_no)
+    for code in codes:
+        node = Organization.objects.filter(code=code).first()
+        seen = 0
+        while node is not None and seen < 8:
+            if node.org_type == "CITY":
+                return node
+            node = node.parent
+            seen += 1
+    return None
+
+
+def _city_org_for(team) -> tuple[str, str]:
+    """解析球队所属市州组织，返回 (cityOrgId, cityName)。
+
+    Team.region 可空且种子数据常指向区县（level 3），故三级回退：
+    1. region（或缺失时回退 school.region）按 code/name 反查 CITY 组织；
+    2. 沿 region.parent 上溯到 level==2 再反查；
+    3. 沿组织树（school/team org 节点）上溯找 CITY 祖先。
+    全部失败返回 ("", "")，由调用方按空串处理（org 角色将被 403 提示补归属）。
+    """
+    from apps.accounts.models import Organization
+
+    region = getattr(team, "region", None)
+    if region is None:
+        school = getattr(team, "school", None)
+        region = getattr(school, "region", None) if school else None
+    if region is None:
+        return "", ""
+
+    def lookup(reg):
+        org = (
+            Organization.objects.filter(org_type="CITY", code=reg.code).first()
+            or Organization.objects.filter(org_type="CITY", name=reg.name).first()
+        )
+        if org is not None:
+            return org
+        # 市州组织名常带机关后缀（如"示例市州教育局"↔区划"示例市州"），
+        # 且 code 未必用区划码（远程库为 CITY01），做归一化后缀匹配兜底
+        def strip_suffix(name: str) -> str:
+            for suffix in ("教育和体育局", "教育局", "体育局"):
+                if name.endswith(suffix) and len(name) > len(suffix):
+                    return name[: -len(suffix)]
+            return name
+
+        for candidate in Organization.objects.filter(org_type="CITY"):
+            if strip_suffix(candidate.name) == reg.name:
+                return candidate
+        return None
+
+    city_region = _level2_region(region)
+    city_org = lookup(region)
+    if city_org is None and city_region.pk != region.pk:
+        city_org = lookup(city_region)
+    if city_org is None:
+        city_org = _city_org_ancestor(team)
+    if city_org is None:
+        return "", (city_region.name if city_region else "")
+    city_name = city_region.name if city_region and city_region.level == 2 else city_org.name
+    return str(city_org.pk), city_name
+
+
 class TeamClient:
+    @staticmethod
+    def _real_team(team_id: str) -> Optional[dict[str, Any]]:
+        """优先读本库真实球队主档，读不到再走演示数据。"""
+        try:
+            from apps.accounts.models import Organization
+            from apps.teams.models import Team, TeamCoach
+
+            team = Team.objects.filter(pk=str(team_id), is_deleted=False).first()
+            if team is None:
+                return None
+            school = team.school
+            city_org_id, city_name = _city_org_for(team)
+            school_org = None
+            if school is not None and school.code:
+                school_org = Organization.objects.filter(code=school.code).first()
+            coach_ids = [
+                str(person_id)
+                for person_id in TeamCoach.objects.filter(team=team).values_list(
+                    "person_id", flat=True
+                )
+            ]
+            return {
+                "id": str(team.pk),
+                "name": team.name,
+                "orgId": school_org.pk if school_org else (str(school.pk) if school else ""),
+                "cityOrgId": city_org_id,
+                "cityName": city_name,
+                "schoolCode": (school.code if school and school.code else ""),
+                "schoolName": school.name if school else "",
+                "coachIds": coach_ids,
+            }
+        except Exception:  # pragma: no cover - 演示兜底，任何异常都退回 mock
+            logger.debug("读取真实球队失败，回退演示数据", exc_info=True)
+            return None
+
     def get_team(self, team_id: str) -> dict[str, Any]:
         if not team_id:
             from apps.common.errors import INVALID_ARGUMENT, ApiError
 
             raise ApiError(INVALID_ARGUMENT, "缺少球队 ID")
         if mock_enabled():
+            real = self._real_team(team_id)
+            if real is not None:
+                return real
             seed = _TEAM_SEED.get(team_id)
             if seed:
                 return dict(seed)
@@ -138,9 +283,32 @@ class TeamClient:
                 "schoolName": "示例学校",
                 "coachIds": [f"coach_{_suffix(team_id)}"],
             }
-        from apps.common.errors import ApiError, DEPENDENCY_UNAVAILABLE
+        from apps.common.errors import ApiError, NOT_FOUND
+        from apps.accounts.models import Organization
+        from apps.teams.models import Team, TeamCoach
 
-        raise ApiError(DEPENDENCY_UNAVAILABLE, "球队服务尚未接通，请置 ENROLLMENT_MOCK_CLIENTS=true")
+        try:
+            team = Team.objects.get(pk=team_id, is_deleted=False)
+        except (Team.DoesNotExist, TypeError, ValueError):
+            raise ApiError(NOT_FOUND, "球队主档不存在")
+        org = Organization.objects.filter(code=team.team_no).first()
+        school = team.school
+        city_org_id, city_name = _city_org_for(team)
+        coach_ids = list(
+            TeamCoach.objects.filter(team=team, status="CURRENT").values_list(
+                "person_id", flat=True
+            )
+        )
+        return {
+            "id": str(team.pk),
+            "name": team.name,
+            "orgId": str(org.pk) if org else str(team.pk),
+            "cityOrgId": city_org_id,
+            "cityName": city_name,
+            "schoolCode": school.code if school else "",
+            "schoolName": school.name if school else "",
+            "coachIds": [str(pk) for pk in coach_ids],
+        }
 
     def team_ids_for_org(self, org_id: str) -> list[str]:
         """账号组织范围内可报送的球队 ID。"""
@@ -157,10 +325,81 @@ class TeamClient:
                 "org_univ_01": ["org_univ_01"],
                 "org_prov": ["org_team_01", "org_team_02", "org_univ_01"],
             }
-            return list(mapping.get(org_id, [org_id]))
-        from apps.common.errors import ApiError, DEPENDENCY_UNAVAILABLE
+            ids = list(mapping.get(org_id, [org_id]))
+            # mock 叠加真实主档：Organization.code == Team.team_no（唯一），
+            # 球队 org 节点的 parent 即报送主体，子树上挂的真实球队一并放行
+            ids.extend(self._real_team_ids(org_id))
+            return ids
+        from apps.accounts.models import Organization
+        from apps.teams.models import Team
 
-        raise ApiError(DEPENDENCY_UNAVAILABLE, "球队服务尚未接通，请置 ENROLLMENT_MOCK_CLIENTS=true")
+        try:
+            org = Organization.objects.get(pk=org_id)
+        except (Organization.DoesNotExist, TypeError, ValueError):
+            return []
+        if org.org_type == "TEAM":
+            team = Team.objects.filter(team_no=org.code, is_deleted=False).first()
+            return [str(team.pk)] if team else []
+        if org.org_type in ("SCHOOL", "UNIVERSITY"):
+            codes = list(
+                Organization.objects.filter(parent_id=org.pk, org_type="TEAM").values_list(
+                    "code", flat=True
+                )
+            )
+            if not codes:
+                return []
+            return [
+                str(pk)
+                for pk in Team.objects.filter(
+                    team_no__in=codes, is_deleted=False
+                ).values_list("pk", flat=True)
+            ]
+        # CITY / PROVINCE / ADMIN：省/管理员可见全部；
+        # 市州级细化隔离依赖成员4 暴露 org→region 映射，待补
+        logger.warning(
+            "team_ids_for_org 对 %s 返回全量球队（市州隔离待成员4 补 org→region 映射）",
+            org.org_type,
+        )
+        return [
+            str(pk)
+            for pk in Team.objects.filter(is_deleted=False, status="ACTIVE").values_list(
+                "pk", flat=True
+            )
+        ]
+
+    @staticmethod
+    def _real_team_ids(org_id: str) -> list[str]:
+        """球队 org 节点 parent=org_id 的真实 Team 主档 PK（mock 兜底，异常降级为空）。
+
+        球队账号自身绑定的就是 TEAM 组织节点，其 code 即 Team.team_no，
+        因此也要把本节点映射出的球队算进来，否则本队报名单不可见。
+        """
+        try:
+            from apps.accounts.models import Organization
+            from apps.teams.models import Team
+
+            codes = list(
+                Organization.objects.filter(org_type="TEAM", parent_id=org_id).values_list(
+                    "code", flat=True
+                )
+            )
+            own_code = (
+                Organization.objects.filter(pk=org_id, org_type="TEAM")
+                .values_list("code", flat=True)
+                .first()
+            )
+            if own_code:
+                codes.append(own_code)
+            if not codes:
+                return []
+            return [
+                str(pk)
+                for pk in Team.objects.filter(
+                    team_no__in=codes, is_deleted=False
+                ).values_list("pk", flat=True)
+            ]
+        except Exception:
+            return []
 
     def get_coach(self, coach_id: str) -> dict[str, Any]:
         if mock_enabled():
@@ -171,9 +410,21 @@ class TeamClient:
                 "role": "主教练",
                 "maskedPhone": mask_phone(f"1380000{tail[:4]}"),
             }
-        from apps.common.errors import ApiError, DEPENDENCY_UNAVAILABLE
+        from apps.common.errors import ApiError, NOT_FOUND
+        from apps.persons.models import Person
 
-        raise ApiError(DEPENDENCY_UNAVAILABLE, "球队服务尚未接通，请置 ENROLLMENT_MOCK_CLIENTS=true")
+        try:
+            person = Person.objects.get(
+                pk=coach_id, person_category="COACH", is_deleted=False
+            )
+        except (Person.DoesNotExist, TypeError, ValueError):
+            raise ApiError(NOT_FOUND, "教练主档不存在")
+        return {
+            "id": coach_id,
+            "name": person.full_name,
+            "role": "主教练",
+            "maskedPhone": person.phone_masked or "",
+        }
 
 
 team_client = TeamClient()
@@ -186,16 +437,39 @@ _BASE_DATE = date(2010, 1, 1)
 
 
 class PersonClient:
+    @staticmethod
+    def _person_payload(person) -> dict[str, Any]:
+        student_no = ""
+        try:
+            student_no = person.athlete_profile.student_no or ""
+        except Exception:  # noqa: BLE001 - 无扩展档案时退化为空
+            student_no = ""
+        return {
+            "id": str(person.pk),
+            "name": person.full_name,
+            "maskedIdNumber": person.id_card_masked or "",
+            "gender": _gender_label(person.gender),
+            "birthDate": person.birth_date.isoformat() if person.birth_date else "",
+            "maskedStudentNumber": mask_student_number(student_no) if student_no else "",
+            "hasIdConflict": False,
+            "banned": False,
+        }
+
     def get_person(self, athlete_id: str) -> dict[str, Any]:
         if not athlete_id:
             from apps.common.errors import INVALID_ARGUMENT, ApiError
 
             raise ApiError(INVALID_ARGUMENT, "缺少运动员 ID")
+        person = _resolve_person(athlete_id)
+        if person is not None:
+            return self._person_payload(person)
         if mock_enabled():
+            # 真实主档查不到才回退演示数据；假名用 ID 派生数字，
+            # 避免十六进制尾串（运动员0e）冒充真实姓名。
             tail = _suffix(athlete_id)
             return {
                 "id": athlete_id,
-                "name": f"运动员{tail[:2]}",
+                "name": f"运动员{int(tail[:4], 16):04d}",
                 "maskedIdNumber": mask_id_number(f"11010120100101{tail[:4]}"),
                 "gender": "MALE",
                 "birthDate": _BASE_DATE.isoformat(),
@@ -203,9 +477,14 @@ class PersonClient:
                 "hasIdConflict": False,
                 "banned": False,
             }
+        # 生产双保险（2026-10-28）：mock 禁止后人员客户端未接通即 fail-closed，
+        # 503 DEPENDENCY_UNAVAILABLE 拒绝进入业务流程（六阶段验证口径，
+        # 不以 mock 派生数据/未建档 ID 放行终审）。
         from apps.common.errors import ApiError, DEPENDENCY_UNAVAILABLE
 
-        raise ApiError(DEPENDENCY_UNAVAILABLE, "人员服务尚未接通，请置 ENROLLMENT_MOCK_CLIENTS=true")
+        raise ApiError(
+            DEPENDENCY_UNAVAILABLE, "人员服务尚未接通，请置 ENROLLMENT_MOCK_CLIENTS=true"
+        )
 
     def get_persons(self, athlete_ids: list[str]) -> dict[str, dict[str, Any]]:
         return {athlete_id: self.get_person(athlete_id) for athlete_id in athlete_ids}
@@ -233,9 +512,14 @@ class PersonClient:
                 "maskedStudentNumber": mask_student_number(student_number),
                 "created": True,
             }
+        # 真实建档/匹配由成员4 人员服务提供（冻结期不在本模块写主档，
+        # 且身份证哈希含盐无法在本模块复算）。导入新人员请走成员4 接口。
         from apps.common.errors import ApiError, DEPENDENCY_UNAVAILABLE
 
-        raise ApiError(DEPENDENCY_UNAVAILABLE, "人员服务尚未接通，请置 ENROLLMENT_MOCK_CLIENTS=true")
+        raise ApiError(
+            DEPENDENCY_UNAVAILABLE,
+            "人员主档匹配/新建依赖成员4 人员服务，本适配器不直接写主档",
+        )
 
 
 person_client = PersonClient()
@@ -252,9 +536,34 @@ class MaterialClient:
         """
         if mock_enabled():
             return []
-        from apps.common.errors import ApiError, DEPENDENCY_UNAVAILABLE
+        from apps.materials.models import PersonMaterial, TeamMaterial
 
-        raise ApiError(DEPENDENCY_UNAVAILABLE, "材料服务尚未接通，请置 ENROLLMENT_MOCK_CLIENTS=true")
+        try:
+            if owner_type == "TEAM":
+                rows = TeamMaterial.objects.filter(
+                    team_id=owner_id, is_deleted=False
+                ).select_related("type")
+            else:
+                person = _resolve_person(owner_id)
+                if person is None:
+                    return []
+                rows = PersonMaterial.objects.filter(
+                    person_id=person.pk, is_deleted=False
+                ).select_related("type")
+            return [
+                {
+                    "type": m.type.code if m.type else "",
+                    "fileId": m.file_id,
+                    "fileName": m.file_name,
+                    "status": m.status,
+                }
+                for m in rows
+            ]
+        except Exception:  # noqa: BLE001 - 取不到材料只降级空列表，不阻断校验/导出
+            logger.exception(
+                "材料服务查询异常 owner_type=%s owner_id=%s", owner_type, owner_id
+            )
+            return []
 
 
 material_client = MaterialClient()
@@ -281,21 +590,77 @@ def _mock_window() -> tuple[datetime, datetime]:
 
 
 class EventConfigClient:
+    @staticmethod
+    def _real_event(event_id: str) -> Optional[dict[str, Any]]:
+        try:
+            from apps.events.models import Event
+
+            event = Event.objects.filter(pk=str(event_id)).first()
+            if event is None:
+                return None
+            return {
+                "id": event.pk,
+                "name": event.name,
+                "year": event.season,
+                "timezone": "Asia/Shanghai",
+            }
+        except Exception:  # pragma: no cover
+            logger.debug("读取真实赛事失败，回退演示数据", exc_info=True)
+            return None
+
+    @staticmethod
+    def _real_group(event_id: str, group_id: str) -> Optional[dict[str, Any]]:
+        try:
+            from apps.events.models import EventGroup
+
+            group = EventGroup.objects.filter(
+                pk=str(group_id), event_id=str(event_id)
+            ).first()
+            if group is None:
+                group = EventGroup.objects.filter(pk=str(group_id)).first()
+            if group is None:
+                return None
+            return {"id": group.pk, "name": group.name, "eventId": group.event_id}
+        except Exception:  # pragma: no cover
+            logger.debug("读取真实组别失败，回退演示数据", exc_info=True)
+            return None
+
     def get_event(self, event_id: str) -> dict[str, Any]:
         if not event_id:
             from apps.common.errors import INVALID_ARGUMENT, ApiError
 
             raise ApiError(INVALID_ARGUMENT, "缺少赛事 ID")
         if mock_enabled():
+            real = self._real_event(event_id)
+            if real is not None:
+                return real
             return {
                 "id": event_id,
                 "name": f"省级中小学足球赛事{_suffix(event_id)}",
                 "year": timezone.now().year,
                 "timezone": "Asia/Shanghai",
             }
-        from apps.common.errors import ApiError, DEPENDENCY_UNAVAILABLE
+        from apps.events.models import Event
 
-        raise ApiError(DEPENDENCY_UNAVAILABLE, "赛事配置服务尚未接通，请置 ENROLLMENT_MOCK_CLIENTS=true")
+        event = Event.objects.filter(pk=event_id).first()
+        if event is None:
+            logger.warning("赛事 %s 不存在，回退默认配置", event_id)
+            return {
+                "id": event_id,
+                "name": f"赛事{event_id}",
+                "year": timezone.now().year,
+                "timezone": "Asia/Shanghai",
+            }
+        try:
+            year = int(event.season)
+        except (TypeError, ValueError):
+            year = timezone.now().year
+        return {
+            "id": event.id,
+            "name": event.name,
+            "year": year,
+            "timezone": "Asia/Shanghai",
+        }
 
     def get_group(self, event_id: str, group_id: str) -> dict[str, Any]:
         if not group_id:
@@ -303,32 +668,58 @@ class EventConfigClient:
 
             raise ApiError(INVALID_ARGUMENT, "缺少组别 ID")
         if mock_enabled():
+            real = self._real_group(event_id, group_id)
+            if real is not None:
+                return real
             return {
                 "id": group_id,
                 "name": f"组别{_suffix(group_id)}",
                 "eventId": event_id,
             }
-        from apps.common.errors import ApiError, DEPENDENCY_UNAVAILABLE
+        from apps.events.models import EventGroup
 
-        raise ApiError(DEPENDENCY_UNAVAILABLE, "赛事配置服务尚未接通，请置 ENROLLMENT_MOCK_CLIENTS=true")
+        group = EventGroup.objects.filter(pk=group_id, event_id=event_id).first()
+        if group is None:
+            logger.warning("组别 %s(赛事 %s) 不存在，回退默认", group_id, event_id)
+            return {"id": group_id, "name": f"组别{group_id}", "eventId": event_id}
+        return {"id": group.id, "name": group.name, "eventId": group.event_id}
 
     def get_groups(self, event_id: str) -> list[dict[str, Any]]:
         if mock_enabled():
+            try:
+                from apps.events.models import EventGroup
+
+                rows = EventGroup.objects.filter(event_id=str(event_id)).order_by("created_at")
+                if rows.exists():
+                    return [
+                        {"id": item.pk, "name": item.name, "eventId": item.event_id}
+                        for item in rows
+                    ]
+            except Exception:  # pragma: no cover
+                logger.debug("读取真实组别列表失败，回退演示数据", exc_info=True)
             return [
                 {"id": "group_u12", "name": "小学男子组", "eventId": event_id},
                 {"id": "group_u15", "name": "初中男子组", "eventId": event_id},
             ]
-        from apps.common.errors import ApiError, DEPENDENCY_UNAVAILABLE
+        from apps.events.models import EventGroup
 
-        raise ApiError(DEPENDENCY_UNAVAILABLE, "赛事配置服务尚未接通，请置 ENROLLMENT_MOCK_CLIENTS=true")
+        return [
+            {"id": g.id, "name": g.name, "eventId": g.event_id}
+            for g in EventGroup.objects.filter(event_id=event_id)
+        ]
 
     def get_window(self, event_id: str) -> dict[str, datetime]:
         if mock_enabled():
             opens, closes = _mock_window()
             return {"opensAt": opens, "closesAt": closes}
-        from apps.common.errors import ApiError, DEPENDENCY_UNAVAILABLE
+        from apps.events.models import Event
 
-        raise ApiError(DEPENDENCY_UNAVAILABLE, "赛事配置服务尚未接通，请置 ENROLLMENT_MOCK_CLIENTS=true")
+        event = Event.objects.filter(pk=event_id).first()
+        if event is None:
+            logger.warning("赛事 %s 不存在，回退默认窗口", event_id)
+            opens, closes = _mock_window()
+            return {"opensAt": opens, "closesAt": closes}
+        return {"opensAt": event.registration_opens_at, "closesAt": event.registration_closes_at}
 
     def get_group_rules(self, event_id: str, group_id: str) -> dict[str, Any]:
         """组别资格参数。缺失的键表示"参数未确认"，预检归 QUALIFICATION_PENDING。

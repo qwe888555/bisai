@@ -12,6 +12,7 @@ from typing import Literal, Optional
 from pydantic import Field
 
 from apps.common.schemas import StrictSchema
+from .services import event_phase
 
 from . import display
 
@@ -67,6 +68,7 @@ class EventGroupUpdate(EventGroupCreate):
 # ---------------------------------------------------------------- 响应 mapper
 
 def event_out(event) -> dict:
+    phase = event_phase(event)
     data = {
         "id": event.pk,
         "name": event.name,
@@ -75,6 +77,10 @@ def event_out(event) -> dict:
         "registrationOpensAt": event.registration_opens_at,
         "registrationClosesAt": event.registration_closes_at,
         "status": event.status,
+        "currentPhase": phase["currentPhase"],
+        "phaseStartedAt": phase["phaseStartedAt"],
+        "phaseEndsAt": phase["phaseEndsAt"],
+        "progressPercent": phase["progressPercent"],
         "description": event.description,
         "version": int(event.version or 0),
         "createdAt": event.created_at,
@@ -379,7 +385,9 @@ class ContentUpdate(ContentCreate):
 class PortalResourceCreate(StrictSchema):
     resourceType: ResourceType
     title: str = Field(min_length=1, max_length=150)
+    description: str = Field(default="", max_length=300)
     imageFileId: str = Field(default="", max_length=64)
+    videoUrl: str = Field(default="", max_length=2000)
     targetContentId: str = Field(default="", max_length=64)
     targetUrl: str = Field(default="", max_length=2000)
     sortOrder: int = Field(default=0, ge=0)
@@ -457,7 +465,9 @@ def portal_resource_out(resource) -> dict:
         "id": resource.pk,
         "resourceType": resource.resource_type,
         "title": resource.title,
+        "description": resource.description or "",
         "imageFileId": resource.image_file_id or "",
+        "videoUrl": resource.video_url or "",
         "targetContentId": resource.target_content_id or "",
         "targetUrl": resource.target_url or "",
         "sortOrder": int(resource.sort_order or 0),
@@ -474,7 +484,9 @@ def public_resource_out(resource, base_url: str = "") -> dict:
         "id": resource.pk,
         "resourceType": resource.resource_type,
         "title": resource.title,
+        "description": resource.description or "",
         "imageUrl": _portal_image_url(resource.image_file_id, base_url),
+        "videoUrl": resource.video_url or "",
         "targetContentId": resource.target_content_id or "",
         "targetUrl": resource.target_url or "",
         "sortOrder": int(resource.sort_order or 0),
@@ -520,12 +532,17 @@ def goal_ranking_row_out(rank: int, athlete_id: str, athlete_name: str,
 def public_event_out(event) -> dict:
     """PublicEvent 安全投影：不含 version/createdAt/updatedAt 内部字段；
     status 保留（访客需据此判断报名/进行状态）。"""
+    phase = event_phase(event)
     return {
         "id": event.pk,
         "name": event.name,
         "season": event.season,
         "eventCategory": event.event_category,
         "status": event.status,
+        "currentPhase": phase["currentPhase"],
+        "phaseStartedAt": phase["phaseStartedAt"],
+        "phaseEndsAt": phase["phaseEndsAt"],
+        "progressPercent": phase["progressPercent"],
         "registrationOpensAt": event.registration_opens_at,
         "registrationClosesAt": event.registration_closes_at,
         "description": event.description or "",
