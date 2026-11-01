@@ -297,10 +297,13 @@ class TeamApiTests(TestCase):
         self.assertEqual(data["intro"], "校主力队")
         self.assertEqual(data["status"], "APPROVED")
         self.assertIsInstance(data["version"], int)
-        # 2026-10-29 补列落库字段回显（未设置时为 None）
+        # 补列落库字段（HEAD 侧扩展）+ 媒体三键（9b5676d 补齐）均应输出
         for present in ("shortName", "campusName", "gender"):
             self.assertIn(present, data)
             self.assertIsNone(data[present])
+        self.assertEqual(data["flagFileId"], "file-flag-1")
+        self.assertEqual(data["emblemFileId"], "file-logo-1")
+        self.assertEqual(data["groupPhotoFileId"], "file-photo-1")
         # 无承载/无契约键不输出（联调待办：媒体受控 url/orgId）
         for absent in ("orgId", "cityOrgId", "flagUrl"):
             self.assertNotIn(absent, data)

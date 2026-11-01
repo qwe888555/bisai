@@ -19,9 +19,11 @@ from apps.accounts.models import VersionedModel
 
 # ---------------------------------------------------------------- 枚举
 
+# 2026-10-28 待决 11 方案二 2a：报送主体收敛 SCHOOL_TEAM/CITY（无高校主体）；
+# 历史迁移中的 UNIVERSITY choices 不回改，由 state-only 迁移同步模型状态。
+# 历史数据按 UNIVERSITY 的读侧筛选兼容见 api._HISTORICAL_SUBJECT_TYPES。
 SUBJECT_TYPES = (
     ("SCHOOL_TEAM", "中小学球队"),
-    ("UNIVERSITY", "高校"),
     ("CITY", "市州代报"),
 )
 
@@ -62,6 +64,15 @@ QUALIFICATION_STATUSES = (
     (QUALIFICATION_PENDING, "待核实"),
     (QUALIFICATION_DISQUALIFIED, "资格不符"),
     (QUALIFICATION_EXCLUDED, "已剔除"),
+)
+
+# E-2 资格操作（v7）：CONFIRM 确认 / REJECT 驳回 / EXCLUDE 剔除（不可逆）
+# / REVOKE 撤销凭证（状态不变）。
+QUALIFICATION_ACTIONS = (
+    ("CONFIRM", "确认资格"),
+    ("REJECT", "驳回资格"),
+    ("EXCLUDE", "剔除名单"),
+    ("REVOKE", "撤销资格凭证"),
 )
 
 REVIEW_STAGES = (
@@ -150,6 +161,10 @@ class RosterItem(VersionedModel):
     qualification_reason = models.CharField(
         max_length=500, null=True, blank=True, default=None
     )
+    # E-2 资格确认凭证（v7）：QUALIFIED 状态本身不代表已确认，终审须
+    # confirmed_at 与 confirmed_by 同时有效；REVOKE 清凭证不改状态值。
+    confirmed_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    confirmed_by = models.CharField(max_length=64, blank=True, default="")
 
     class Meta:
         db_table = "enrollments_roster_item"
@@ -160,6 +175,42 @@ class RosterItem(VersionedModel):
 
     def __str__(self) -> str:  # pragma: no cover
         return f"{self.id}({self.athlete_id})"
+
+
+class RosterQualificationLog(VersionedModel):
+    """E-2 资格操作追加式审计日志（独立表，不混入 ReviewRecord）。
+
+    v7 设计：roster_item 删除（软删/级联）置 NULL 后，凭
+    roster_item_id_snapshot + athlete_id 保留人员维度历史追溯；
+    append-only：业务代码只 create，不 update/delete。
+    """
+
+    id = models.CharField(primary_key=True, max_length=64)
+    roster_item = models.ForeignKey(
+        RosterItem,
+        on_delete=models.SET_NULL,
+        related_name="qualification_logs",
+        db_column="roster_item_id",
+        null=True,
+        blank=True,
+    )
+    roster_item_id_snapshot = models.CharField(max_length=64, db_index=True)
+    athlete_id = models.CharField(max_length=64, blank=True, default="")
+    action = models.CharField(max_length=20, choices=QUALIFICATION_ACTIONS)
+    reason = models.TextField(blank=True, default="")
+    operator_account_id = models.CharField(max_length=64, blank=True, default="")
+
+    class Meta:
+        db_table = "enrollments_roster_qualification_log"
+        verbose_name = "名单资格操作日志"
+        verbose_name_plural = "名单资格操作日志"
+        ordering = ["-created_at", "id"]
+        indexes = [
+            models.Index(fields=["roster_item", "-created_at"]),
+        ]
+
+    def __str__(self) -> str:  # pragma: no cover
+        return f"{self.id}({self.action}/{self.roster_item_id_snapshot})"
 
 
 class EnrollmentAttachment(VersionedModel):

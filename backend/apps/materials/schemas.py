@@ -104,3 +104,20 @@ def material_out(material, kind: str) -> dict:
         "version": material_version(material),
         "createdAt": material.created_at.isoformat() if material.created_at else None,
     }
+
+
+def audit_log_out(log, kind: str) -> dict:
+    """审核历史条目（P1-9 原定任务，GET /materials/{id}/audit-logs）。
+
+    多态归属由调用方解析（kind: PERSON/TEAM）；auditor 逻辑引用直出。
+    """
+    return {
+        "id": log.pk,
+        "materialType": kind,
+        "materialId": str(log.material_id),
+        "fromStatus": log.from_status,
+        "toStatus": log.to_status,
+        "auditor": str(log.auditor) if log.auditor else None,
+        "comment": log.comment or "",
+        "createdAt": log.created_at.isoformat() if log.created_at else None,
+    }

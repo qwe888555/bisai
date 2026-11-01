@@ -1,4 +1,4 @@
-﻿"""events 请求模型与响应 mapper（django-ninja / pydantic v2）。
+"""events 请求模型与响应 mapper（django-ninja / pydantic v2）。
 
 请求模型继承 StrictSchema（多传未知字段直接 400 INVALID_ARGUMENT）；
 响应由 mapper 转契约 camelCase，禁止改名、禁止加字段。
@@ -17,6 +17,9 @@ from .services import event_phase
 from . import display
 
 EventStatus = Literal["DRAFT", "REGISTRATION_OPEN", "REGISTRATION_CLOSED", "RUNNING", "FINISHED"]
+# 2026-10-28 业务规则：本项目无"高校组"，学段仅小学/初中/高中（PRIMARY/MIDDLE）；
+# 原 UNIVERSITY"高校组"值在服务端（schema 层）明确拒绝，不做静默转换。
+# 模型 GROUP_CATEGORIES choices 的收敛涉迁移，BLOCKED 登记（规则文档待决 11）。
 GroupCategory = Literal["PRIMARY", "MIDDLE"]
 GroupGender = Literal["MALE", "FEMALE", "MIXED"]
 
@@ -48,10 +51,18 @@ class EventGroupCreate(StrictSchema):
     maxAge: Optional[int] = Field(default=None, ge=0, le=60)
     maxPlayers: int = Field(ge=1, le=100)
     requiredMaterialTypes: list[str]
+    # P0-3 资格规则结构化值列（可空；为空表示未配置）
+    minPlayers: Optional[int] = Field(default=None, ge=1, le=100)
+    minGoalkeepers: Optional[int] = Field(default=None, ge=0, le=20)
+    birthDateFrom: Optional[date] = None
+    birthDateTo: Optional[date] = None
+    rulesConfirmed: bool = False
 
 
 class EventGroupUpdate(EventGroupCreate):
     version: int = Field(ge=0)
+    # 更新时未显式提供则不改动既有确认状态，避免普通编辑静默清除已确认规则
+    rulesConfirmed: Optional[bool] = None
 
 
 # ---------------------------------------------------------------- 响应 mapper
@@ -79,6 +90,8 @@ def event_out(event) -> dict:
 
 
 def group_out(group) -> dict:
+    from .models import derive_rules_status
+
     data = {
         "id": group.pk,
         "eventId": group.event_id,
@@ -88,6 +101,12 @@ def group_out(group) -> dict:
         "quota": int(group.quota or 0),
         "maxPlayers": int(group.max_players or 0),
         "requiredMaterialTypes": list(group.required_material_types or []),
+        "rulesConfirmed": bool(group.rules_confirmed),
+        "rulesStatus": derive_rules_status(
+            min_players=group.min_players,
+            max_players=group.max_players,
+            rules_confirmed=bool(group.rules_confirmed),
+        ),
         "version": int(group.version or 0),
         "createdAt": group.created_at,
         "updatedAt": group.updated_at,
@@ -96,6 +115,14 @@ def group_out(group) -> dict:
         data["minAge"] = int(group.min_age)
     if group.max_age is not None:
         data["maxAge"] = int(group.max_age)
+    if group.min_players is not None:
+        data["minPlayers"] = int(group.min_players)
+    if group.min_goalkeepers is not None:
+        data["minGoalkeepers"] = int(group.min_goalkeepers)
+    if group.birth_date_from is not None:
+        data["birthDateFrom"] = group.birth_date_from.isoformat()
+    if group.birth_date_to is not None:
+        data["birthDateTo"] = group.birth_date_to.isoformat()
     return data
 
 # ---------------------------------------------------------------- 比赛对阵（5.1）

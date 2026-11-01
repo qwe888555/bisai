@@ -25,7 +25,7 @@ from apps.common.errors import (
     field_errors,
 )
 from apps.common.middleware import audit_state
-from apps.common.pagination import paginate, paginate_list
+from apps.common.pagination import paginate, paginate_list, read_page_params
 from apps.common.permissions import (
     ADMIN,
     ALL_ROLES,
@@ -395,13 +395,13 @@ def dict_item_disable(request, dict_item_id: str):
 
 
 # ---------------------------------------------------------------- 人员主档（/people）
-# 契约对齐 zuqiu 前端 personApi（src/api/index.ts L118-125）；读链与写链
-# 均按契约角色登记，数据范围由服务层统一裁决。
+# 契约对齐 zuqiu 前端 personApi（src/api/index.ts L118-125）；写链（create/update/
+# remove）依赖 B1/B4 等待确认项，未实施。
 
 # 前端实际调用方角色：PeopleManageView(ADMIN) / EnrollmentDetailView(UNIVERSITY) /
 # TeamCoachesView、TeamMembersView(TEAM)；CITY / PROVINCE_REVIEWER 按文档审核
-# 场景预留。ATHLETE/COACH 的自服务走 /me/profile，不登记本组接口。
-# 数据范围过滤集中在 services.apply_person_scope（按角色/组织子树收敛）。
+# 场景预留。ATHLETE/COACH/MATCH_RECORDER 前端无调用且范围规则未定义，不登记。
+# 非管理员的数据范围过滤集中在 services.apply_person_scope（方案A′ 待确认）。
 _PERSON_QUERY_ROLES = (ADMIN, UNIVERSITY, CITY, PROVINCE_REVIEWER, TEAM)
 
 register_operation("personList", _PERSON_QUERY_ROLES)
@@ -415,12 +415,33 @@ def people_list(
     keyword: Optional[str] = None,
     kind: Optional[str] = None,
     reviewStatus: Optional[str] = None,
+    coachDuty: Optional[str] = None,
 ):
+    """D-CAT：coachDuty 按现役任职筛选（任一命中返回一次）；列表项附带
+    coachDuties（现役岗位集合，去重枚举序，无现役任职=空数组）。
+
+    coachDuties 仅注入本列表响应：person_out 为详情/本人档案共用映射，
+    本批不扩展其输出（边界：详情与个人资料响应不变）。
+    """
     account = require("personList")
     queryset = services.list_people(
-        {"keyword": keyword, "kind": kind, "reviewStatus": reviewStatus}, account
+        {
+            "keyword": keyword,
+            "kind": kind,
+            "reviewStatus": reviewStatus,
+            "coachDuty": coachDuty,
+        },
+        account,
     )
-    return paginate(request, queryset, mapper=s.person_out)
+    page_number, page_size = read_page_params(request)
+    total = queryset.count()
+    rows = list(queryset[(page_number - 1) * page_size : page_number * page_size])
+    duties = services.coach_duties_map([row.pk for row in rows])
+    items = [
+        {**s.person_out(row), "coachDuties": duties.get(row.pk, [])}
+        for row in rows
+    ]
+    return page(items, page_number, page_size, total)
 
 
 @router.post(
@@ -444,30 +465,56 @@ def people_search(request, body: s.PersonSearchBody):
     "/people/{person_id}", auth=_auth, response=EnvelopeOut, summary="人员档案详情"
 )
 def people_get(request, person_id: str):
+    """详情在 person_out 基础上追加只读派生字段 coachQualification
+    （问题#7，2026-10-31 裁定 B 口径移植：仅 GET /people/{id} 输出，列表/
+    搜索契约不扩散，取代 A 版三态 certificateValidity；四态语义见
+    services.coach_qualification）。"""
     account = require("personGet")
-    return ok(s.person_out(services.get_person(person_id, account)))
+    person = services.get_person(person_id, account)
+    data = s.person_out(person)
+    data["coachQualification"] = services.coach_qualification(person)
+    return ok(data)
 
 
-# 写操作权限点按契约文档登记（personCreate/personUpdate/personDelete：
-# TEAM/UNIVERSITY/CITY/PROVINCE_REVIEWER/ADMIN）；数据范围在服务层
-# （_get_person_for_write / _ensure_school_in_scope）二次校验，接口层放行
-# 不等于可写越界对象。
-register_operation("personCreate", (TEAM, UNIVERSITY, CITY, PROVINCE_REVIEWER, ADMIN))
-register_operation("personUpdate", (TEAM, UNIVERSITY, CITY, PROVINCE_REVIEWER, ADMIN))
-register_operation("personDelete", (TEAM, UNIVERSITY, CITY, PROVINCE_REVIEWER, ADMIN))
+# P0-2（2026-10-28）：学校端档案审核。学校端是人员资格与履历的最终审核方
+# （统一业务规则），权限点口径对齐 D1：仅 UNIVERSITY，ADMIN 不因数据范围
+# 获得审核权，CITY/PROVINCE_REVIEWER 只审报名，TEAM 维护权限≠审核权限。
+# 数据范围在服务层按本校组织子树过滤（同材料域 D1/D5 口径）；
+# 留痕复用 PersonChangeLog（change_type=AUDIT），不新增模型/迁移。
+register_operation("personReview", (UNIVERSITY,))
+
+
+@router.post(
+    "/people/{person_id}/review", auth=_auth, response=EnvelopeOut, summary="审核人员档案"
+)
+def people_review(request, person_id: str, body: s.PersonReviewBody):
+    account = require("personReview")
+    person = services.review_person(person_id, body.model_dump(), account)
+    audit_state(
+        request,
+        "person.review",
+        object_type="Person",
+        object_id=str(person.pk),
+        summary=f"审核人员 {person.full_name}：{body.decision}",
+    )
+    return ok(s.person_out(person))
+
+
+# 写操作仅 ADMIN（PeopleManageView 为管理端页面；学校端可否创建人员待确认④）
+register_operation("personCreate", (ADMIN,))
+register_operation("personUpdate", (ADMIN,))
+register_operation("personDelete", (ADMIN,))
 
 
 @router.post("/people", auth=_auth, response=EnvelopeOut, summary="创建人员档案")
 def people_create(request, body: s.PersonCreate):
     account = require("personCreate")
+    # 风险5 修订（2026-10-31 裁定 B 口径移植）：审计声明前置（服务层成功返回前
+    # 无法预知 object_id）——服务层事务内写 SUCCESS 审计并在此撤销声明防
+    # 中间件重复；服务层异常时不撤销，中间件按原行为落 FAILURE（无 object_id）。
+    audit_state(request, "person.create", object_type="Person", summary="创建人员档案")
     person = services.create_person(body.model_dump(), account)
-    audit_state(
-        request,
-        "person.create",
-        object_type="Person",
-        object_id=str(person.pk),
-        summary=f"创建人员 {person.full_name}({person.person_no})",
-    )
+    audit_state(request, None)
     return ok(s.person_out(person))
 
 
@@ -515,8 +562,10 @@ def people_delete(request, person_id: str, version: Optional[int] = Query(None, 
 # GET：自读对象=服务端账号 person_id 绑定档案，无客户端传入 id，无数据范围歧义。
 # PUT（2026-10-24 用户裁定）：version 必填乐观锁（缺失/非法=400 统一校验错误，
 # 不匹配=409 VERSION_CONFLICT）；字段集=MyProfileUpdate（前端实际提交集），
-# 身份/归属/联系方式/证件不在本人可改集；education/coachCategory 落扩展档案
-# ext_json 回显，schoolName 派生只读（改成别值→422）——5.txt 问题一已闭环。
+# 身份/归属/联系方式/证件不在本人可改集；education 已持久化（E1）；
+# schoolName 不再接受——提交即 400 INVALID_ARGUMENT（批次 A 2026-10-28
+# 用户批准，静默忽略已消除）；coachCategory 声明不持久化（D2 在案，
+# 2026-10-28 恢复原口径，E2 待签发）。
 register_operation("myProfileGet", (ATHLETE, COACH))
 register_operation("myProfileUpdate", (ATHLETE, COACH))
 
@@ -587,48 +636,45 @@ def my_profile_confirm(request, body: s.ProfileConfirmation):
     person_id = _own_person_id(account)
     if not person_id:
         raise ApiError(PROFILE_BINDING_REQUIRED)
-    person = services.confirm_own_person(person_id, body.version)
+    # 风险5 修订（2026-10-31 裁定 B 口径移植）：审计声明前置（object_id 服务层
+    # 成功前不可预知）——服务层事务内写 SUCCESS 审计，成功返回后撤销声明防
+    # 中间件重复；异常不撤销，中间件按原行为落 FAILURE。account 入参供
+    # operator_account_id 取值。
     audit_state(
-        request,
-        "person.self_confirm",
-        object_type="Person",
-        object_id=str(person.pk),
-        summary=f"本人确认档案 {person.full_name}",
+        request, "person.self_confirm", object_type="Person", summary="本人确认档案"
     )
+    person = services.confirm_own_person(person_id, body.version, account)
+    audit_state(request, None)
     return ok(s.person_out(person))
 
 
 # GET /me/teams（契约清单 B4）：前端 meApi.teams() 无参数、Team[] 直出
 # （zuqiu src/api/index.ts:69；权威文档原写分页 TeamPage+active 参数，按前端
-# 实码实现数组）。
-# - ATHLETE/COACH：本人 CURRENT 球员/教练正式关系（EXITED 历史与 mock
-#   "自报归属 VERIFIED 合并"均不采用，见 services.list_own_teams）；未绑定
-#   personId → 空数组（个人中心空态，不拒绝）。
-# - UNIVERSITY：本校组织子树内球队（services.list_university_teams，复用
-#   teams.services.visible_teams），响应字段与本人视图完全一致。
-# - TEAM：只返回组织节点 code 匹配 team_no 的本队（services.list_team_account_teams）；
-#   绑定缺失/数据未对齐返回空数组，保证球队工作台可正常进入。
-# 读接口不留审计（同前两个 GET）。
-register_operation("myTeams", (ATHLETE, COACH, UNIVERSITY, TEAM))
+# 实码实现数组）。范围=本人 CURRENT 球员/教练正式关系（EXITED 历史与 mock
+# "自报归属 VERIFIED 合并"均不采用，见 services.list_own_teams）；
+# UNIVERSITY 全校分支依赖 D1 组织映射（A′ 未批）暂缓；
+# TEAM 分支（main 9f92156 保留）：只返回组织节点 code 匹配 team_no 的本队
+# （services.list_team_account_teams），绑定缺失/数据未对齐返回空数组，
+# 保证球队工作台可正常进入。
+# 未绑定档案 → 404（对齐 myProfileGet 口径）；读接口不留审计（同前两个 GET）。
+register_operation("myTeams", (ATHLETE, COACH, TEAM))
 
 
 @router.get("/me/teams", auth=_auth, response=EnvelopeOut, summary="本人所属球队")
 def my_teams(request):
     account = require("myTeams")
-    if set(account.roles or ()) & {ATHLETE, COACH}:
-        person_id = _own_person_id(account)
-        if not person_id:
-            return ok([])
-        # dict 直出（EnvelopeOut.data=Any），字段口径见 services._team_brief_out
-        return ok(services.list_own_teams(person_id))
     if TEAM in set(account.roles or ()):
         return ok(services.list_team_account_teams(account))
-    return ok(services.list_university_teams(account))
+    person_id = _own_person_id(account)
+    if not person_id:
+        raise ApiError(NOT_FOUND, "当前账号未绑定人员档案")
+    # dict 直出（EnvelopeOut.data=Any），字段口径见 services._team_brief_out
+    return ok(services.list_own_teams(person_id))
 
 
 # §6.8 档案聚合（批次 D-1）：文档角色 ADMIN/PROVINCE_REVIEWER（接口文档
-# L1740/L1762）；数据范围复用 apply_person_scope（按角色/组织子树收敛，
-# 无可见学校范围的账号 403 DATA_SCOPE_DENIED）。
+# L1740/L1762）；数据范围复用 apply_person_scope（非 ADMIN → 403
+# DATA_SCOPE_DENIED，D5 同口径，PROVINCE_REVIEWER 权限点通过但范围拒绝）。
 # 读接口不留审计（同 GET /people）；检索正文不入审计（同 POST /people/search）。
 register_operation("dossierSearch", (ADMIN, PROVINCE_REVIEWER))
 register_operation("dossierGet", (ADMIN, PROVINCE_REVIEWER))

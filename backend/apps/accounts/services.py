@@ -57,6 +57,8 @@ from apps.common.scopes import (
 )
 from apps.common.versioning import bump, check_version
 
+from apps.persons.models import Person
+
 from .models import Account, AuditLog, DictionaryItem, Organization, RegistrationInvitation
 
 
@@ -124,6 +126,8 @@ def register(data: dict) -> Account:
             "该人员已绑定其他账号",
             [{"field": "personId", "reason": "一个人员只能绑定一个账号"}],
         )
+    # 邀请激活建立绑定前重新校验：签发后人员可能被软删（解绑/重绑同理，走服务端重验）
+    _ensure_person_bindable(invitation.person_id)
 
     with transaction.atomic():
         account = Account.objects.create(
@@ -606,6 +610,31 @@ ROLE_ORG_TYPES: dict[str, set[str]] = {
 }
 
 
+def _ensure_person_bindable(person_id: str) -> None:
+    """非空 personId 绑定前必须确认目标人员存在且未软删（幽灵绑定防线）。
+
+    Person 主键为数值型自增，字符串值无法对应任何主键时同样视为不存在；
+    软删行按不存在处理（与 persons 域 people_queryset 口径一致）。
+    创建账号 / 更新账号绑定 / 邀请签发 / 邀请激活四条链路共用本规则。
+    """
+    if not person_id:
+        return
+    try:
+        pk = int(str(person_id))
+    except (TypeError, ValueError):
+        raise ApiError(
+            INVALID_ARGUMENT,
+            "绑定的人员不存在",
+            [{"field": "personId", "reason": "不存在或已删除"}],
+        ) from None
+    if pk <= 0 or not Person.objects.filter(pk=pk, is_deleted=False).exists():
+        raise ApiError(
+            INVALID_ARGUMENT,
+            "绑定的人员不存在",
+            [{"field": "personId", "reason": "不存在或已删除"}],
+        )
+
+
 def _validate_account_refs(
     org_id: str,
     person_id: Optional[str],
@@ -637,6 +666,8 @@ def _validate_account_refs(
             [{"field": "orgId", "reason": f"当前为 {organization.org_type}"}],
         )
     if person_id:
+        # 幽灵绑定防线：目标 Person 必须存在且未软删
+        _ensure_person_bindable(person_id)
         duplicated = Account.objects.filter(person_id=person_id)
         if exclude_account_id:
             duplicated = duplicated.exclude(pk=exclude_account_id)

@@ -24,7 +24,7 @@ main 只读投影的展示契约。
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import Field
 
@@ -36,7 +36,10 @@ class TeamCreateBody(StrictSchema):
     """POST /teams 请求体（键名与前端 createTeam payload 一致）。"""
 
     name: str = Field(min_length=1, max_length=100)
-    groupCategory: str = Field(min_length=1, max_length=20)
+    # 2026-10-28 业务规则：无"高校组"，组别仅 PRIMARY/MIDDLE（原 UNIVERSITY
+    # 高校组在服务端拒绝，不静默转换）；字典 team_category CSV 收敛 BLOCKED
+    # 登记（规则文档待决 11）。
+    groupCategory: Literal["PRIMARY", "MIDDLE"]
     schoolOrgId: Optional[str] = Field(None, min_length=1, max_length=64)
     intro: Optional[str] = None
     # ---- 2026-10-29 起落库（补列）：gender/campusName ----
@@ -62,7 +65,7 @@ class TeamUpdateBody(StrictSchema):
     gender: Optional[str] = Field(None, max_length=20)
     coachName: Optional[str] = Field(None, max_length=100)
     schoolOrgId: Optional[str] = Field(None, min_length=1, max_length=64)
-    groupCategory: Optional[str] = Field(None, max_length=20)
+    groupCategory: Optional[Literal["PRIMARY", "MIDDLE"]] = Field(None)  # 回传原值：同 create 无高校组
     version: int = Field(ge=0)
 
 
@@ -173,10 +176,12 @@ def team_out(team) -> dict:
     """球队输出（dict 直出，EnvelopeOut.data=Any 不进 components）。
 
     member_count/head_coach_name 由 services._annotate_team 注解提供；
-    shortName/campusName/gender/coachName 为 2026-10-29 补列落库字段（回显）。
-    coachName 优先取落库值 coach_name（保存即回显，不消失），为空时回退
-    现役主教练关系合成值 head_coach_name（保留旧有资料展示口径）。
-    输出不含 orgId/cityOrgId/媒体 url（联调待办）。
+    shortName/campusName/gender/coachName 为补列落库字段（HEAD 侧扩展）；
+    媒体三键（flagFileId/emblemFileId/groupPhotoFileId）为 9b5676d 成员4
+    专项修复⑤补齐（列→键映射：flagFileId←flag_file_id、
+    emblemFileId←logo_file_id、groupPhotoFileId←group_photo_file_id）；
+    输出不含 orgId/cityOrgId 与 url（flagUrl/emblemUrl/groupPhotoUrl，
+    受控下载契约无公开直链，联调待办）。
     """
     return {
         "id": str(team.pk),
@@ -191,6 +196,9 @@ def team_out(team) -> dict:
         "gender": team.gender,
         "coachName": team.coach_name or getattr(team, "head_coach_name", None),
         "memberCount": getattr(team, "member_count", 0),
+        "flagFileId": team.flag_file_id,
+        "emblemFileId": team.logo_file_id,
+        "groupPhotoFileId": team.group_photo_file_id,
         "status": team.audit_status,
         "version": int(team.updated_at.timestamp() * 1_000_000),
         "createdAt": team.created_at.isoformat(),

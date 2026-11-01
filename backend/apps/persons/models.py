@@ -207,6 +207,9 @@ class Person(models.Model):
         db_comment="所属学校(运动员业务必填,服务层)",
     )
     photo_file_id = models.CharField(max_length=64, null=True, blank=True, db_comment="照片(逻辑引用文件服务)")
+    education = models.CharField(
+        max_length=100, null=True, blank=True, db_comment="学历(自由文本,可选,E1冻结评审批准加列)"
+    )
     import_batch = models.ForeignKey(
         "infra.ImportBatch",
         null=True,

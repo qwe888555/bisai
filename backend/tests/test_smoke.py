@@ -380,6 +380,26 @@ class ApiSmokeTests(TestCase):
 
         person = make_person("P202699999901", "110101200001010011")
         token = self.login()
+        # 唯一绑定约束需要真实存在的 Person：经 ORM 创建真实人员档案。
+        # （旧实现引用 seed 中不存在的 "person_bind_demo"，依赖幽灵 personId
+        #   宽容忍忍；绑定完整性校验上线后必须改用真实人员主键。
+        #   seed_demo 只建 Organization 不建 School 主档，无法走 /people 接口
+        #   创建，故此处与 apps.persons 测试一致直接用 ORM 三件套加密字段）
+        from apps.common.crypto import encrypt_text, lookup_hash, mask_id_number
+        from apps.persons.models import Person
+
+        person = Person.objects.create(
+            person_no="P202600000100",
+            full_name="绑定演示人员",
+            id_card_cipher=encrypt_text("110101200001010010"),
+            id_card_hash=lookup_hash("110101200001010010"),
+            id_card_masked=mask_id_number("110101200001010010"),
+            person_category="ATHLETE",
+            audit_status="APPROVED",
+            school=school,  # 邀请校验要求人员所属学校与组织 code（SCH001）一致
+        )
+        person_id = str(person.pk)
+
         first = {
             "username": "athlete_bound_a",
             "displayName": "绑定人员A",

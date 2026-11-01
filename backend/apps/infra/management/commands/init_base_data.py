@@ -35,11 +35,17 @@ import re
 import sys
 from pathlib import Path
 
+from django.conf import settings
 from django.core.management.base import BaseCommand, CommandError
 from django.db import connection, transaction
 
 from apps.materials.models import MaterialType
 from apps.persons.models import DictItem, DictType, Region, School
+
+# 材料类型默认清单（P1-10 定案，2026-10-30 方案A）：仓库根 docs/csv/material_types.csv，
+# 13 行正式清单已于 2026-10-26 批文签发（2026-10-29 问题⑥确认维持 13 类）。
+# --material-csv 显式参数优先；未传时回退到该默认路径；默认文件缺失则维持跳过不编造。
+DEFAULT_MATERIAL_CSV = Path(settings.BASE_DIR).parent / "docs" / "csv" / "material_types.csv"
 
 # 字典项 value 稳定编码格式：字母/数字开头，仅含字母数字下划线连字符，≤50（列宽上限）。
 # 现有全部既有值域（GK/DF/MF/FW、HEAD/ASSISTANT/...、PRIMARY/MIDDLE_VOC 等）均满足。
@@ -294,10 +300,20 @@ class Command(BaseCommand):
 
     def _run_material_types(self) -> dict:
         self.stdout.write("\n== 阶段4: material_type 材料类型导入 ==")
-        if not self.csv_paths.get("material"):
-            self.stdout.write("  [跳过] 缺少 --material-csv（材料类型规则未经产品确认，不编造）")
+        csv_path = self.csv_paths.get("material")
+        source = "参数 --material-csv"
+        if not csv_path:
+            csv_path = (str(DEFAULT_MATERIAL_CSV)
+                        if DEFAULT_MATERIAL_CSV.is_file() else None)
+            if csv_path:
+                source = "默认路径（已签发 13 类清单）"
+        if not csv_path:
+            self.stdout.write(
+                "  [跳过] 缺少 --material-csv 且默认清单不存在"
+                "（材料类型规则未经产品确认，不编造）")
             return {"created": 0, "skipped": 0, "failed": []}
-        rows = _read_csv(self.csv_paths["material"])
+        self.stdout.write(f"  数据源: {csv_path} ({source})")
+        rows = _read_csv(csv_path)
         self.stdout.write(f"  唯一键: code | 行数: {len(rows)}")
 
         def row_fn(row: dict) -> str:

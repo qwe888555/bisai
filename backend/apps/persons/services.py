@@ -17,16 +17,17 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Optional
 
+from django.core.exceptions import ObjectDoesNotExist
 from django.db import transaction
-from django.db.models import Count, Exists, JSONField, OuterRef, Q, QuerySet, Subquery
+from django.db.models import Count, Exists, OuterRef, Q, QuerySet, Subquery
 from django.utils import timezone
 
 from apps.common import crypto, enums
 from apps.common.enums import RegionLevel
 from apps.common.errors import (
-    BUSINESS_VALIDATION_FAILED,
     DATA_SCOPE_DENIED,
     DUPLICATE_RESOURCE,
+    FORBIDDEN,
     INVALID_ARGUMENT,
     NOT_FOUND,
     PROFILE_BINDING_REQUIRED,
@@ -35,9 +36,8 @@ from apps.common.errors import (
     ApiError,
     field_errors,
 )
-from apps.common.permissions import ATHLETE, COACH, TEAM
-from apps.common.scopes import account_org_code, is_global_admin, visible_school_codes
-from apps.accounts.models import Organization
+from apps.common.ids import new_id
+from apps.accounts.models import AuditLog, Organization
 from apps.persons.models import (
     AthleteProfile,
     CoachProfile,
@@ -265,10 +265,10 @@ def update_school(school_id: str, data: dict) -> School:
     region = _resolve_school_region(data["regionId"])
     _check_school_type(data["schoolType"])
     _check_school_unique(
-        data["name"], data.get("code") or None, region, exclude_id=school.pk
+        data["name"], school.code, region, exclude_id=school.pk
     )
     school.name = data["name"]
-    school.code = data.get("code") or None
+    # code 创建后禁改（Q1#2 一期不可变；绑定组织后改码会导致 org.code 映射失配）
     school.school_type = data["schoolType"]
     school.region = region
     school.address = data.get("address")
@@ -432,127 +432,163 @@ def people_queryset() -> QuerySet:
                 AthleteProfile.objects.filter(person=OuterRef("pk"))
             ),
             coach_profile_exists=Exists(CoachProfile.objects.filter(person=OuterRef("pk"))),
-            # schoolOrgId 输出：School.code → 组织节点主键（免 N+1；
+            # P1-7 证书只读派生（免 N+1；仅 COACH 输出，仅供展示、不参与判断）
+            coach_certificate_no_val=Subquery(
+                CoachProfile.objects.filter(person=OuterRef("pk")).values("certificate_no")[:1]
+            ),
+            coach_certificate_expire_val=Subquery(
+                CoachProfile.objects.filter(person=OuterRef("pk")).values(
+                    "certificate_expire_date"
+                )[:1]
+            ),
+            # schoolOrgId 输出（A′-min）：School.code → 组织节点主键（免 N+1；
             # Organization.code 唯一，至多一命中）
             school_org_id_val=Subquery(
                 Organization.objects.filter(code=OuterRef("school__code")).values("pk")[:1]
-            ),
-            # education/coachCategory 输出：承载在扩展档案 ext_json（预留扩展列），
-            # 免 N+1 一次取回（无档案行 → NULL → 输出 None）
-            athlete_ext_val=Subquery(
-                AthleteProfile.objects.filter(person=OuterRef("pk")).values("ext_json")[:1],
-                output_field=JSONField(),
-            ),
-            coach_ext_val=Subquery(
-                CoachProfile.objects.filter(person=OuterRef("pk")).values("ext_json")[:1],
-                output_field=JSONField(),
             ),
         )
     )
 
 
 def apply_person_scope(queryset: QuerySet, account) -> QuerySet:
-    """人员数据范围过滤（集中一处，读接口统一复用）。
+    """人员数据范围过滤（集中一处；A′ 第三批 2026-10-29 起仅改本函数）。
 
-    - 无组织的全局管理员：不过滤；
-    - roles 含 TEAM：仅本队（Organization.code=team_no 且未软删的 Team）成员
-      关系内人员，CURRENT/EXITED 均视为历史可见；队伍或组织 code 缺失 → 403；
-    - roles 含 ATHLETE/COACH：仅账号绑定的本人；未绑定 → 空集（个人中心空态，
-      不拒绝）；
-    - 其余（UNIVERSITY/CITY/PROVINCE_REVIEWER/挂组织的 ADMIN）：按组织子树
-      内学校类组织 code 过滤 school（org.code=School.code）；可见学校集合为空
-      → 403 DATA_SCOPE_DENIED，不静默放行全量。
+    口径（成员4 专项① 第三批，业务决定 5+6 项确认）：
+
+    - ADMIN：保持第一批行为不变（不增加学校类型筛选、不重构）——
+      scope_org_codes 三态语义（common/scopes.py，不做 `codes or fallback`
+      式放大）：
+      * None（全局 ADMIN，无组织绑定）→ 全库；
+      * []（无组织绑定/绑定不存在/绑定已软删，即幽灵绑定）→ 默认拒绝，
+        不得退化为全库；
+      * 非空子树编码 → 经 Person.school（School.code）与 Organization.code
+        的真实映射过滤，仅可见授权组织子树内学校归属的人员（school 为空
+        的人员对挂组织 ADMIN 不可见：deny-by-default）。
+
+    - UNIVERSITY（第三批新增）：绑定节点必须存在且 org_type ∈ {SCHOOL,
+      UNIVERSITY}（学校类，同 _resolve_school 口径），否则 403；仅可见
+      其组织子树中学校类节点 code 对应的人员。节点类型仅作范围识别，
+      授权仍以 Person.school.code 编码映射为准；无 school 归属人员不可见
+      （不经任职球队的学校归属反推）。
+
+    - TEAM（第三批新增）：绑定节点必须存在且 org_type == "TEAM"
+      （A′-min：TEAM 节点 code == team_no），否则 403；仅可见**绑定球队**
+      的正式 CURRENT 球员与教练（TeamMember / TeamCoach 两条关联路径
+      各自独立按 CURRENT 过滤），不经学校归属反推，不因组织子树扩展到
+      其他球队（多队授权未立项）。
+
+    - CITY / PROVINCE_REVIEWER：403 DATA_SCOPE_DENIED（市级/省级人员
+      范围留待独立评审，契约文案不区分角色）。
+
+    角色门禁必须在 scope_org_codes 之前：该 helper 不校验角色，若颠倒
+    顺序，UNIVERSITY 等有组织绑定的账号会被其非空子树编码误放行。
     """
+    from apps.common.enums import RelationStatus
+    from apps.common.permissions import ADMIN
+    from apps.common.scopes import org_scope_ids, scope_org_codes
+
     roles = set(getattr(account, "roles", ()) or ())
-    if is_global_admin(account):
-        return queryset
-    if TEAM in roles:
-        code = account_org_code(account)
-        team = (
-            Team.objects.filter(team_no=code, is_deleted=False).first() if code else None
-        )
-        if team is None:
+    if ADMIN in roles:
+        codes = scope_org_codes(account)
+        if codes is None:
+            return queryset
+        if not codes:
             raise ApiError(
-                DATA_SCOPE_DENIED, "球队账号未绑定有效球队组织，无法确定人员数据范围"
+                DATA_SCOPE_DENIED,
+                "当前账号无有效组织范围，禁止访问人员数据",
             )
-        person_ids = TeamMember.objects.filter(team=team).values("person_id")
-        return queryset.filter(pk__in=person_ids)
-    if roles & {ATHLETE, COACH}:
-        raw = str(getattr(account, "person_id", "") or "").strip()
-        try:
-            person_pk = int(raw) if raw else 0
-        except ValueError:
-            person_pk = 0
-        if person_pk <= 0:
-            return queryset.none()
-        return queryset.filter(pk=person_pk)
-    codes = visible_school_codes(account)
-    if not codes:
-        raise ApiError(DATA_SCOPE_DENIED, "当前账号无可访问的学校数据范围")
-    return queryset.filter(school__code__in=codes)
+        return queryset.filter(school__code__in=codes)
+
+    if "UNIVERSITY" not in roles and "TEAM" not in roles:
+        raise ApiError(
+            DATA_SCOPE_DENIED,
+            "市级/省级人员数据范围尚未开放，当前仅管理员及学校/球队端可查询",
+        )
+
+    from apps.accounts.models import Organization
+    from apps.teams.models import TeamCoach, TeamMember
+
+    org_id = getattr(account, "organization_id", None)
+    org = Organization.objects.filter(pk=org_id).first() if org_id else None
+    if org is None:
+        raise ApiError(
+            DATA_SCOPE_DENIED,
+            "当前账号无有效组织范围，禁止访问人员数据",
+        )
+
+    if "UNIVERSITY" in roles:
+        if org.org_type not in ("SCHOOL", "UNIVERSITY"):
+            raise ApiError(
+                DATA_SCOPE_DENIED,
+                "学校端账号必须绑定学校类组织节点，禁止访问人员数据",
+            )
+        # 子树内学校类节点 code（剔除 TEAM 等非学校类子节点，防止脏编码）
+        school_codes = list(
+            Organization.objects.filter(pk__in=org_scope_ids(account))
+            .filter(org_type__in=("SCHOOL", "UNIVERSITY"))
+            .values_list("code", flat=True)
+        )
+        if not school_codes:
+            raise ApiError(
+                DATA_SCOPE_DENIED,
+                "当前账号无有效组织范围，禁止访问人员数据",
+            )
+        return queryset.filter(school__code__in=school_codes)
+
+    # TEAM 分支：仅绑定节点自身（org.code == team_no），不取子树
+    if org.org_type != "TEAM":
+        raise ApiError(
+            DATA_SCOPE_DENIED,
+            "球队端账号必须绑定球队组织节点，禁止访问人员数据",
+        )
+    return queryset.filter(
+        Exists(
+            TeamMember.objects.filter(
+                person=OuterRef("pk"),
+                team__team_no=org.code,
+                status=RelationStatus.CURRENT,
+            )
+        )
+        | Exists(
+            TeamCoach.objects.filter(
+                person=OuterRef("pk"),
+                team__team_no=org.code,
+                status=RelationStatus.CURRENT,
+            )
+        )
+    )
 
 
 def verify_person_owner(account, owner_id) -> None:
     """PERSON 附件归属校验器（经 PersonsConfig.ready() 注册进 attachments）。
 
-    归属裁决与 apply_person_scope 同口径：
+    PERSON 归属文件的上传与读取均由本校验器裁决业务资源所有权
+    （attachments._check_owner / can_access 调用），规则复用既有已确认口径：
     - 归属记录不存在（人员不存在或已软删）→ 404，默认拒绝；
-    - 全局管理员 / 组织学校范围内 / TEAM 本队成员 / 账号绑定本人 → 放行；
-    - 其余（含无可见学校范围、TEAM 未绑定球队、非本人）→ 403 DATA_SCOPE_DENIED。
+    - ADMIN → 放行（A′ 一期数据范围仅 ADMIN 全量，同 apply_person_scope）；
+    - 账号绑定本人档案（account.person_id 服务端签发，与 /me/profile 同源）
+      → 放行（本人材料上传/查看，对应 materialList/Create 含 ATHLETE/COACH
+      的自服务场景）；
+    - 其余一律 DATA_SCOPE_DENIED——本市/本校/本队范围依赖 A′ 映射，未交付
+      前不得放行，不发明组织层级授权。
     """
+    from apps.common.permissions import ADMIN
+
     raw = str(owner_id or "").strip()
     if not raw:
         raise ApiError(DATA_SCOPE_DENIED, "文件归属对象未确定，暂无法校验归属")
-    person = Person.objects.filter(
+    if not Person.objects.filter(
         pk=parse_path_id(raw, "ownerId"), is_deleted=False
-    ).first()
-    if person is None:
+    ).exists():
         raise ApiError(NOT_FOUND, "归属人员不存在或已删除")
-    if not apply_person_scope(Person.objects.filter(pk=person.pk), account).exists():
-        raise ApiError(DATA_SCOPE_DENIED, "人员不在当前账号数据范围内")
-
-
-def _ensure_school_in_scope(account, school) -> None:
-    """写链：提交的所属学校必须在账号人员数据范围内（与 apply_person_scope 同口径）。
-
-    - 全局管理员放行；
-    - TEAM 账号仅允许本队所属学校；
-    - 其余按组织子树内学校 code 判定；无可见学校范围 → 403。
-    """
-    if is_global_admin(account):
+    if ADMIN in (getattr(account, "roles", ()) or ()):
         return
-    roles = set(getattr(account, "roles", ()) or ())
-    if TEAM in roles:
-        code = account_org_code(account)
-        team = (
-            Team.objects.filter(team_no=code, is_deleted=False).first() if code else None
-        )
-        if team is None:
-            raise ApiError(
-                DATA_SCOPE_DENIED, "球队账号未绑定有效球队组织，无法确定人员数据范围"
-            )
-        if school is None or team.school_id != school.pk:
-            raise ApiError(DATA_SCOPE_DENIED, "提交的所属学校不在本队范围内")
+    if str(getattr(account, "person_id", "") or "") == raw:
         return
-    codes = visible_school_codes(account)
-    if not codes:
-        raise ApiError(DATA_SCOPE_DENIED, "当前账号无可访问的学校数据范围")
-    if school is None or school.code not in codes:
-        raise ApiError(DATA_SCOPE_DENIED, "提交的所属学校不在当前账号数据范围内")
-
-
-def _get_person_for_write(person_id: str, account) -> Person:
-    """写链对象解析：不存在/软删 → 404；存在但不在范围内 → 403。
-
-    与读详情（get_person）的 404 口径不同：写操作显式区分"不可见"与"不存在"，
-    拒绝越界写入且不通过接口层放行绕过服务层校验。
-    """
-    person = people_queryset().filter(pk=parse_path_id(person_id)).first()
-    if person is None:
-        raise ApiError(NOT_FOUND)
-    if not apply_person_scope(Person.objects.filter(pk=person.pk), account).exists():
-        raise ApiError(DATA_SCOPE_DENIED, "人员不在当前账号数据范围内")
-    return person
+    raise ApiError(
+        DATA_SCOPE_DENIED,
+        "人员数据范围待组织映射方案确认后开放，当前仅管理员与本人可访问",
+    )
 
 
 def _check_enum(value: Optional[str], allowed: tuple, field: str) -> None:
@@ -572,12 +608,15 @@ def list_people(filters: dict, account) -> QuerySet:
     kind/reviewStatus。kind=ATHLETE/COACH 与 kinds 合成同源（档案行存在性），
     双类别人员在两种过滤下均命中。mock 的 maskedIdNumber 包含匹配与 teamId
     过滤为演示逻辑，不照搬（maskedIdNumber 是敏感掩码，不得作为检索键；
-    teamId 依赖成员关系查询，待球队读服务就绪后一并补充）。
+    球队读服务已就绪；人员列表 teamId 筛选确认不实现——2026-10-26 前端确认
+    不传该参数，契约清单第 12 项已关闭，按球队筛人走 /selection-dossiers/search）。
     """
     kind = filters.get("kind")
     _check_enum(kind, tuple(enums.PersonCategory.values), "kind")
     review_status = filters.get("reviewStatus")
     _check_enum(review_status, tuple(enums.AuditStatus.values), "reviewStatus")
+    coach_duty = filters.get("coachDuty")
+    _check_enum(coach_duty, tuple(enums.CoachDuty.values), "coachDuty")
     queryset = apply_person_scope(people_queryset(), account)
     keyword = (filters.get("keyword") or "").strip()
     if keyword:
@@ -588,7 +627,42 @@ def list_people(filters: dict, account) -> QuerySet:
         queryset = queryset.filter(coach_profile_exists=True)
     if review_status:
         queryset = queryset.filter(audit_status=review_status)
+    if coach_duty:
+        # D-CAT：仅按现役任职（status=CURRENT）筛选；任一现役任职命中即返回
+        # 该人员一次（Exists 子查询去重，EXITED 历史关系不参与）。
+        queryset = queryset.filter(
+            Exists(
+                TeamCoach.objects.filter(
+                    person=OuterRef("pk"),
+                    status=enums.RelationStatus.CURRENT,
+                    duty=coach_duty,
+                )
+            )
+        )
     return queryset.order_by("-id")
+
+
+def coach_duties_map(person_ids: list) -> dict:
+    """D-CAT：当页人员的现役岗位集合（status=CURRENT 去重，枚举序输出）。
+
+    仅供人员管理列表使用（输出 coachDuties）；当页一次查询内存分组，
+    不用 ArrayAgg/GROUP_CONCAT（SQLite/MySQL 双兼容，无 N+1）。
+    无现役任职的人员不出现在结果中（调用方缺省为空数组）。
+    """
+    if not person_ids:
+        return {}
+    rows = TeamCoach.objects.filter(
+        person_id__in=person_ids,
+        status=enums.RelationStatus.CURRENT,
+    ).values_list("person_id", "duty")
+    grouped: dict = {}
+    for person_id, duty in rows:
+        grouped.setdefault(person_id, set()).add(duty)
+    order = list(enums.CoachDuty.values)
+    return {
+        person_id: sorted(duties, key=order.index)
+        for person_id, duties in grouped.items()
+    }
 
 
 def search_people(keyword: str, account) -> list:
@@ -602,6 +676,38 @@ def search_people(keyword: str, account) -> list:
     if term:
         queryset = queryset.filter(full_name__icontains=term)
     return list(queryset.order_by("-id")[:20])
+
+
+def coach_qualification(person) -> str:
+    """教练资格派生（问题#7，2026-10-31 裁定 B 口径移植）：四态只读派生。
+
+    零落库零迁移，不新增第五种状态：
+    - MISSING：无教练扩展档案行（非教练/未建教练档案），或证书编号与
+      有效期均未登记（certificate_no 与 certificate_expire_date 皆空）；
+    - UNKNOWN：证书信息不完整——有证书编号但未登记有效期，或仅有有效期
+      而未登记证书编号（二轮修正：原先"有日期无证号"归 MISSING，
+      按裁定改为 UNKNOWN，视为证书信息不完整而非无证书）；
+    - VALID / EXPIRED：证书编号已登记，以当前业务日期为基准
+      （settings.TIME_ZONE=Asia/Shanghai，timezone.localdate() 随配置生效）：
+      certificate_expire_date >= 今日 → VALID（有效期至当日含当日有效，
+      次日零点起过期），< 今日 → EXPIRED；
+    - 派生字段只读：不新增数据库字段、不写 CoachProfile、不参与
+      audit_status 与报名资格（enrollments.qualification_status）逻辑；
+    - 仅 GET /people/{id} 详情接口输出（api.people_get 追加），
+      列表/搜索契约不扩散（取代 A 版 person_out 三态 certificateValidity）。
+    """
+    try:
+        profile = person.coach_profile
+    except ObjectDoesNotExist:
+        return "MISSING"
+    cert_no = (profile.certificate_no or "").strip()
+    expire = profile.certificate_expire_date
+    if not cert_no:
+        # 证号+有效期皆空=无证书 MISSING；仅有有效期=信息不完整 UNKNOWN
+        return "UNKNOWN" if expire is not None else "MISSING"
+    if expire is None:
+        return "UNKNOWN"
+    return "VALID" if expire >= timezone.localdate() else "EXPIRED"
 
 
 def get_person(person_id: str, account):
@@ -667,6 +773,59 @@ def get_profile_match(account) -> dict:
 # （POST/PUT/DELETE /people；kinds 方案C 多类别 1..2 由扩展档案行承载；
 #   乐观锁=B4 派生版本）
 
+# P0-4 关键审核字段（2026-10-28 批准）：任一变化使原审核结论失效（APPROVED → PENDING）。
+# coachCategory 当前"接受不持久化"（D2 在案），无法可靠检测变化，暂不入集（已报告）。
+KEY_AUDIT_FIELDS = frozenset(
+    {"realName", "birthDate", "school", "personCategory", "kinds", "gender"}
+)
+
+
+def _invalidate_audit_on_key_change(person, changes: list) -> bool:
+    """关键字段变更且档案已 APPROVED → 原审核结论失效，回 PENDING。
+
+    必须与字段写入同一事务、同一次 person.save() 执行，并向 changes 追加
+    audit_status 变更条目（同一份 PersonChangeLog，不新增日志）；
+    并发过期写入由 ensure_version 在入口拦截。返回是否触发失效。
+    """
+    if person.audit_status != enums.AuditStatus.APPROVED:
+        return False
+    if not any(c["field"] in KEY_AUDIT_FIELDS for c in changes):
+        return False
+    old = str(person.audit_status)
+    person.audit_status = enums.AuditStatus.PENDING
+    changes.append({"field": "audit_status", "old": old, "new": str(person.audit_status)})
+    return True
+
+
+def person_audit_snapshot(person_ids) -> dict:
+    """报名域直连查询（P0-3 决策 A，2026-10-28）：人员档案审核快照。
+
+    输入 athlete_id 字符串集合；仅返回可解析为 Person 主键、未软删的行，
+    值为 {"auditStatus", "status", "personCategory"}。查不到的 id 不出现
+    在结果中，由调用方按各自阶段语义处置（提交 WARNING / 终审阻断）。
+    只读，不触碰任何 persons 写链。
+    """
+    parsed = {}
+    for raw in person_ids:
+        try:
+            parsed[int(str(raw))] = str(raw)
+        except (TypeError, ValueError):
+            continue
+    if not parsed:
+        return {}
+    rows = Person.objects.filter(
+        pk__in=parsed.keys(), is_deleted=False
+    ).values_list("pk", "audit_status", "status", "person_category")
+    return {
+        parsed[pk]: {
+            "auditStatus": audit_status,
+            "status": status,
+            "personCategory": person_category,
+        }
+        for pk, audit_status, status, person_category in rows
+    }
+
+
 def ensure_version(person, request_version) -> None:
     """乐观锁校验：提交版本与当前派生版本不一致 → 409 VERSION_CONFLICT。"""
     from apps.persons.schemas import person_version
@@ -696,16 +855,22 @@ def _gender_in(value: Optional[str], field: str) -> int:
 
 
 def _kind_list(kinds) -> list[str]:
-    """方案C（2026-10-24 用户拍板：前端多选为准）：kinds 数组 1..2 项。
+    """一人一身份（问题 11，2026-10-30 批准收紧）：kinds 数组恰好 1 项。
 
-    值域校验+去重，不静默丢弃；person_category 存主类别（首项），
+    值域校验+去重+单项校验，不静默丢弃；person_category 存该类别，
     完整类别集合由扩展档案行存在性承载（见 _apply_kinds/_synthesized_kinds）。
     """
     if not isinstance(kinds, list) or not kinds:
         raise ApiError(
             INVALID_ARGUMENT,
-            "kinds 必填（1-2 项）",
+            "kinds 必填（1 项）",
             field_errors([("kinds", "至少一项")]),
+        )
+    if len(kinds) > 1:
+        raise ApiError(
+            INVALID_ARGUMENT,
+            "kinds 仅允许一项（一人一身份）",
+            field_errors([("kinds", "只能选择一个身份类别")]),
         )
     unknown = [k for k in kinds if k not in enums.PersonCategory.values]
     if unknown:
@@ -777,7 +942,7 @@ def _apply_kinds(person, new_kinds: list[str], old_kinds: list[str]) -> None:
 
 
 def _resolve_school(school_org_id):
-    """schoolOrgId（Organization 节点 ID）→ School 主档（2026-10-25 契约确认）。
+    """schoolOrgId（Organization 节点 ID）→ School 主档（A′-min 契约）。
 
     2026-10-25 契约确认：按组织节点主键查询，不把该值当作 School.code 或
     Organization.code；节点必须存在、未删除未停用、类型属于学校类
@@ -899,6 +1064,36 @@ def _current_kinds(person) -> list[str]:
     return kinds
 
 
+def _ensure_school_in_operator_scope(school_org_id, account, *, required: bool) -> None:
+    """schoolOrgId 目标学校的操作者授权范围校验（创建/转校共用）。
+
+    目标学校组织节点必须落在操作者授权组织范围内（复用 ensure_org_in_scope，
+    其内部按 is_global_admin 放行全局 ADMIN）：
+    - 全局 ADMIN（无组织绑定）：保持原语义，schoolOrgId 可选、范围不限；
+    - 挂组织 ADMIN：
+      - 创建（required=True）：schoolOrgId 未传 → 目标 school=None 必然在
+        子树之外（deny-by-default，无学校归属即无法证明在授权范围内），拒绝；
+      - 转校（required=False）：未传保持"不修改学校归属"既有语义，跳过校验；
+        已传 → 节点不在授权子树内时拒绝，禁止跨授权边界迁移人员。
+    挂组织 ADMIN 之外的角色本就过不了 apply_person_scope 角色门禁，
+    此处按"目标写入口"再校验一次，防止单独走写链的路径绕过读范围。
+    """
+    from apps.common.scopes import ensure_org_in_scope, is_global_admin
+
+    if is_global_admin(account):
+        return
+    raw = str(school_org_id or "").strip()
+    if not raw:
+        if required:
+            raise ApiError(
+                DATA_SCOPE_DENIED,
+                "创建人员必须指定数据范围内的学校组织",
+                field_errors([("schoolOrgId", "必填")]),
+            )
+        return
+    ensure_org_in_scope(account, raw)
+
+
 def create_person(payload: dict, account):
     """POST /people：创建人员主档（DRAFT 起步）+ 变更留痕。
 
@@ -910,8 +1105,8 @@ def create_person(payload: dict, account):
     kind_list = _kind_list(payload.get("kinds"))
     id_number = (payload.get("idNumber") or "").strip().upper() or None
     phone = (payload.get("phone") or "").strip() or None
+    _ensure_school_in_operator_scope(payload.get("schoolOrgId"), account, required=True)
     school = _resolve_school(payload.get("schoolOrgId"))
-    _ensure_school_in_scope(account, school)
     avatar = _resolve_avatar_file(payload.get("avatarFileId"))
     if not id_number:
         raise ApiError(
@@ -947,6 +1142,7 @@ def create_person(payload: dict, account):
             **_phone_fields(phone),
             school=school,
             photo_file_id=avatar,
+            education=(payload.get("education") or "").strip() or None,
             audit_status=enums.AuditStatus.DRAFT,
             status=enums.EnableStatus.ACTIVE,
         )
@@ -959,17 +1155,17 @@ def create_person(payload: dict, account):
             AthleteProfile.objects.create(person=person, grade_level="")
         if "COACH" in kind_list:
             CoachProfile.objects.create(person=person)
-        # education/coachCategory 落扩展档案 ext_json（须在档案行建好之后）
-        save_profile_ext_values(
-            person,
-            {
-                EDUCATION_EXT_KEY: _ext_text(payload.get("education")),
-                COACH_CATEGORY_EXT_KEY: _ext_text(payload.get("coachCategory")),
-            },
-        )
         if avatar:
             _bind_avatar(avatar, person)
         _log_change(person, enums.ChangeType.CREATE, None)
+        # 风险5（2026-10-31 裁定 B 口径移植）：person.create 审计与建档同事务，
+        # 审计写失败业务整体回滚；字段口径对齐 AuditMiddleware._write 实码。
+        _audit_in_transaction(
+            "person.create",
+            person.pk,
+            getattr(account, "pk", "") or "",
+            f"创建人员 {person.full_name}({person.person_no})",
+        )
     return person
 
 
@@ -977,15 +1173,18 @@ def update_person(person_id: str, payload: dict, account):
     """PUT /people/{id}：版本校验 → 必填字段全量替换 + 可选字段缺省保留 → diff 留痕。
 
     idNumber 不接受（身份证变更走更正流程，一期不开放）；
-    education/coachCategory 落扩展档案 ext_json（预留扩展列，未传=保留原值）。
+    education 已持久化（E1：未传保留原值、传值含空串=覆盖清空）；
+    coachCategory 声明接受但不持久化、不回显（正式字典 E2 待签发，承载待业务决策）。
     """
-    person = _get_person_for_write(person_id, account)
+    person = get_person(person_id, account)
     ensure_version(person, payload["version"])
-    kind_list = _kind_list(payload.get("kinds"))
+    # 问题 11 方案 B：kinds 可选。未传=保留现有身份（不调 _apply_kinds、
+    # 不改 person_category、不生身份变更日志）；传值=显式变更身份（限 1 项）。
+    raw_kinds = payload.get("kinds")
+    kind_list = _kind_list(raw_kinds) if raw_kinds is not None else None
     old_kinds = _current_kinds(person)
-    old_ext = read_profile_ext_values(person)
     gender_value = _gender_in(payload.get("gender"), "gender")
-    primary_category = kind_list[0]
+    primary_category = kind_list[0] if kind_list is not None else person.person_category
 
     changes: list[dict] = []
 
@@ -1008,35 +1207,43 @@ def update_person(person_id: str, payload: dict, account):
         track("birthDate", person.birth_date, payload.get("birthDate"))
         person.birth_date = payload.get("birthDate")
 
-        track("kinds", old_kinds, kind_list)
-        track("personCategory", person.person_category, primary_category)
-        person.person_category = primary_category
+        # 问题 11 方案 B：仅显式传 kinds 时才记录身份变更并更新主类别
+        if kind_list is not None:
+            track("kinds", old_kinds, kind_list)
+            track("personCategory", person.person_category, primary_category)
+            person.person_category = primary_category
 
         # 可选字段：请求未传 → 保留原值（编辑表单无对应输入，缺省清空=静默丢数据）
+        # 转校（schoolOrgId 已传）必须落在操作者授权范围内；未传则保持
+        # "不修改学校归属"既有语义，不做额外校验
+        _ensure_school_in_operator_scope(payload.get("schoolOrgId"), account, required=False)
         school = _resolve_school(payload.get("schoolOrgId"))
         if school is not None:
-            _ensure_school_in_scope(account, school)
             track("school", person.school_id, school.pk)
             person.school = school
         avatar = _resolve_avatar_file(payload.get("avatarFileId"))
         if avatar is not None:
             track("photoFileId", person.photo_file_id, avatar)
             person.photo_file_id = avatar
+        # education：未传（None）→ 保留原值（编辑表单缺省不丢数据）；
+        # 传值（含空串）→ 覆盖写入（表单有输入框，可主动清空）
+        education_value = payload.get("education")
+        if education_value is not None:
+            education_value = education_value.strip() or None
+            track("education", person.education, education_value)
+            person.education = education_value
         phone = (payload.get("phone") or "").strip() or None
         if phone:
             track("phoneMasked", person.phone_masked, crypto.mask_phone(phone))
             person.__dict__.update(_phone_fields(phone))
 
+        # P0-4：关键字段变化使原审核结论失效（同一事务、同一份留痕）
+        _invalidate_audit_on_key_change(person, changes)
+
         person.save()
-        _apply_kinds(person, kind_list, old_kinds)
-        ext_updates = {
-            EDUCATION_EXT_KEY: _ext_text(payload.get("education")),
-            COACH_CATEGORY_EXT_KEY: _ext_text(payload.get("coachCategory")),
-        }
-        for key, value in ext_updates.items():
-            if value is not None:
-                track(key, old_ext.get(key), value)
-        save_profile_ext_values(person, ext_updates)
+        # 问题 11 方案 B：仅显式传 kinds 时才执行身份增删
+        if kind_list is not None:
+            _apply_kinds(person, kind_list, old_kinds)
         if avatar:
             _bind_avatar(avatar, person)
         _log_change(
@@ -1060,81 +1267,6 @@ def _change_entry(field: str, old, new) -> Optional[dict]:
     return {"field": field, "old": old_out, "new": new_out}
 
 
-# ---- education / coachCategory 承载（扩展档案 ext_json 预留扩展列）----------
-# 冻结 DDL 无独立列；person_athlete_profile / person_coach_profile 的 ext_json
-# 列注释即"预留扩展"，按 person 已有档案行读写，不新增列、不动 DDL
-# （5.txt 问题一：前端提交后刷新不回显）。
-EDUCATION_EXT_KEY = "education"
-COACH_CATEGORY_EXT_KEY = "coachCategory"
-EXT_TEXT_KEYS: tuple[str, ...] = (EDUCATION_EXT_KEY, COACH_CATEGORY_EXT_KEY)
-
-
-def _ext_text(value) -> Optional[str]:
-    """扩展文本归一：None/空白 → None（未传=保留原值，与 /people 可选字段同口径）。"""
-    if value is None:
-        return None
-    return str(value).strip() or None
-
-
-def _profile_rows(person) -> list:
-    """person 已存在的扩展档案行（方案C：行存在性=类别事实源，各 0..1 行）。"""
-    return [
-        row
-        for row in (
-            AthleteProfile.objects.filter(person=person).first(),
-            CoachProfile.objects.filter(person=person).first(),
-        )
-        if row is not None
-    ]
-
-
-def read_profile_ext_values(person) -> dict:
-    """读 education/coachCategory（先运动员档案后教练档案，取首个非空）。"""
-    values: dict = {}
-    for row in _profile_rows(person):
-        data = row.ext_json if isinstance(row.ext_json, dict) else {}
-        for key in EXT_TEXT_KEYS:
-            if key not in values and data.get(key) not in (None, ""):
-                values[key] = data[key]
-    return values
-
-
-def save_profile_ext_values(person, updates: dict) -> None:
-    """把 education/coachCategory 落到扩展档案 ext_json。
-
-    - 只写请求明确给出的键（None=未传→保留原值，不清空）；
-    - 无对应档案行的键无处承载则跳过（不新建行：grade_level 为冻结 NOT NULL 占位列）；
-    - 一人两类别时两个档案行都写，保证任一档案链读回一致。
-    """
-    pending = {k: v for k, v in updates.items() if v is not None}
-    if not pending:
-        return
-    for row in _profile_rows(person):
-        data = dict(row.ext_json) if isinstance(row.ext_json, dict) else {}
-        if any(data.get(k) != v for k, v in pending.items()):
-            data.update(pending)
-            row.ext_json = data
-            row.save(update_fields=["ext_json", "updated_at"])
-
-
-def _ensure_own_school_name(person, submitted) -> None:
-    """本人档案 schoolName 为派生只读字段（=person.school.name）。
-
-    前端表单会原样回传 → 放行；试图改成别的值 → 422 明确业务错误。
-    修复"200 OK 但字段未保存"（5.txt 问题一）。
-    """
-    if submitted is None:
-        return
-    current = person.school.name if person.school_id else ""
-    if str(submitted).strip() == current:
-        return
-    raise ApiError(
-        BUSINESS_VALIDATION_FAILED,
-        "学校归属由档案所属学校派生，本人不可直接修改",
-        field_errors([("schoolName", "不可编辑：需变更学校归属请联系管理员调整档案所属学校")]),
-    )
-
-
 def update_own_person(person_id: str, payload: dict):
     """PUT /me/profile：本人档案更新（字段集=MyProfileUpdate，前端实际提交集）。
 
@@ -1142,10 +1274,10 @@ def update_own_person(person_id: str, payload: dict):
     - version 必填乐观锁（与 /people 写链同规则：缺失/非法=400 统一校验错误，不匹配=409）；
     - 身份字段边界：kinds/schoolOrgId/phone/idNumber/avatarFileId 不在本人可改集
       （身份与归属变更走管理员链路；手机号/身份证按页面声明走复核更正）；
-    - schoolName：派生只读（=person.school.name）。原值回传放行；改成别值 → 422
-      业务错误（不再"200 OK 但字段未保存"，5.txt 问题一）；
-    - education/coachCategory：落扩展档案 ext_json（预留扩展列，不动 DDL），
-      未传=保留原值；读回见 person_out；
+    - education：E1 持久化（未传保留原值、传值覆盖，留痕走 _change_entry）；
+    - schoolName：不再接受——提交即 400 INVALID_ARGUMENT（批次 A 2026-10-28
+      用户批准；响应中的 schoolName 仍按实际学校关联派生回显）；
+    - coachCategory：接受不持久化（D2 在案），不回显；
     - 留痕复用 _log_change；审计走 API 层 audit_state。
     """
     person = people_queryset().filter(pk=parse_path_id(person_id)).first()
@@ -1153,12 +1285,6 @@ def update_own_person(person_id: str, payload: dict):
         raise ApiError(NOT_FOUND)
     ensure_version(person, payload["version"])
     gender_value = _gender_in(payload.get("gender"), "gender")
-    _ensure_own_school_name(person, payload.get("schoolName"))
-    ext_updates = {
-        EDUCATION_EXT_KEY: _ext_text(payload.get("education")),
-        COACH_CATEGORY_EXT_KEY: _ext_text(payload.get("coachCategory")),
-    }
-    old_ext = read_profile_ext_values(person)
 
     changes: list[dict] = []
     with transaction.atomic():
@@ -1178,12 +1304,19 @@ def update_own_person(person_id: str, payload: dict):
             changes.append(entry)
         person.birth_date = payload.get("birthDate")
 
-        person.save()
-        for key, value in ext_updates.items():
-            entry = _change_entry(key, old_ext.get(key), value if value is not None else old_ext.get(key))
+        # education：未传 → 保留原值；传值（含空串）→ 覆盖写入（E1 持久化）
+        education_value = payload.get("education")
+        if education_value is not None:
+            education_value = education_value.strip() or None
+            entry = _change_entry("education", person.education, education_value)
             if entry:
                 changes.append(entry)
-        save_profile_ext_values(person, ext_updates)
+            person.education = education_value
+
+        # P0-4：关键字段变化使原审核结论失效（本人与管理员链路同规则，同一事务）
+        _invalidate_audit_on_key_change(person, changes)
+
+        person.save()
         _log_change(
             person,
             enums.ChangeType.UPDATE,
@@ -1194,7 +1327,7 @@ def update_own_person(person_id: str, payload: dict):
     return people_queryset().filter(pk=person.pk).first()
 
 
-def confirm_own_person(person_id: str, version: int):
+def confirm_own_person(person_id: str, version: int, account):
     """POST /me/profile-confirmation：本人确认档案，提交进入复核。
 
     语义依据链：create_person 初值 audit_status=DRAFT（本模块写链）+ 前端
@@ -1209,24 +1342,78 @@ def confirm_own_person(person_id: str, version: int):
       DRAFT → PENDING（提交复核）；
       APPROVED → 409 STATE_CONFLICT（前端按钮 disabled=reviewStatus==='APPROVED'，
       重复确认无业务意义）；
-      REJECTED → 409（驳回后本人能否自行重新提交待业务确认，保守拒绝，
-      待管理员链路；未决项在契约清单 B3 在案）；
+      REJECTED → PENDING（P0-2 统一规则 2026-10-28 批准：本人修改后重新提交，
+      reason 记"驳回后重新提交"，旧审核留痕保留不覆盖）；
       PENDING → 幂等成功（前端按钮该状态可点，重复提交无副作用：状态不变、
       不重复写 ChangeLog；实现选择在案）；
-    - 留痕：状态变化写 _log_change（audit_status old/new）；审计走 API 层。
+    - 留痕：状态变化写 _log_change（audit_status old/new）。
+
+    风险5 修订（2026-10-31 裁定 B 口径移植）：
+    - 锁协议：绑定解析与全部校验移入 transaction.atomic 并对 Person 行
+      select_for_update 锁行重查——获锁后重检绑定（未绑定/软删→403）、
+      版本号、状态机；与 review_person 锁同一行，构成"提交先提交、审核后
+      获锁"的串行顺序（SQLite 无行锁语义，验证边界见测试与报告）；
+    - 审计事务化：atomic 内经 _audit_in_transaction 写 person.self_confirm
+      SUCCESS 审计，与 Person/PersonChangeLog 同连接同事务，写审计失败
+      业务整体回滚；幂等重复确认同样写 SUCCESS 审计（语义=请求成功处理
+      而非状态变化）；API 层成功返回后 audit_state(request, None) 撤销
+      中间件声明防重复，服务层异常不撤销。
     """
-    person = people_queryset().filter(pk=parse_path_id(person_id)).first()
-    if person is None:
-        raise ApiError(PROFILE_BINDING_REQUIRED)
-    ensure_version(person, version)
-    current = person.audit_status
-    if current == enums.AuditStatus.APPROVED:
-        raise ApiError(STATE_CONFLICT, "档案已复核，无需重复确认")
-    if current == enums.AuditStatus.REJECTED:
-        raise ApiError(STATE_CONFLICT, "档案已被驳回，请联系管理员处理")
-    if current == enums.AuditStatus.PENDING:
-        return person  # 幂等：已处于待复核，无状态变化
     with transaction.atomic():
+        # 行锁内首读（原"锁外预读+锁内 get"两段式并入单段）：并发 confirm
+        # 串行化——后到者在锁内看到 PENDING 走幂等，不会同读 REJECTED 各自
+        # 重提（2026-10-28 防重复重提加固，语义不变）。
+        person = (
+            people_queryset()
+            .select_for_update()
+            .filter(pk=parse_path_id(person_id))
+            .first()
+        )
+        if person is None:
+            raise ApiError(PROFILE_BINDING_REQUIRED)
+        ensure_version(person, version)
+        current = person.audit_status
+        if current == enums.AuditStatus.APPROVED:
+            raise ApiError(STATE_CONFLICT, "档案已复核，无需重复确认")
+        if current == enums.AuditStatus.PENDING:
+            # 幂等：已处于待复核，无状态变化；审计仍记请求成功，不写 ChangeLog
+            _audit_in_transaction(
+                "person.self_confirm",
+                person.pk,
+                getattr(account, "pk", "") or "",
+                f"本人确认档案 {person.full_name}",
+            )
+            return person
+        # REJECTED → PENDING（P0-2 统一规则 2026-10-28 批准）：本人修改后重新提交；
+        # 旧 AUDIT/UPDATE 留痕为 append-only，不覆盖、不删除。
+        # 防滥用加固（2026-10-28 批准）：重提必须以"最近一次驳回之后发生了有效
+        # 资料修改"为前提。证据只取服务端 PersonChangeLog——update_own_person
+        # 仅在值实际变化时生成 field_changes 条目（无变化时日志 field_changes
+        # 为 None，自动不构成证据）；confirm 自身的 audit_status-only 重提日志
+        # 亦不构成证据。不信任前端标记、提交次数或时间戳。
+        last_audit = (
+            PersonChangeLog.objects.filter(
+                person_id=person.pk, change_type=enums.ChangeType.AUDIT
+            )
+            .order_by("-created_at", "-id")
+            .first()
+        )
+        if last_audit is not None:
+            recent_rows = PersonChangeLog.objects.filter(
+                person_id=person.pk,
+                change_type=enums.ChangeType.UPDATE,
+                created_at__gt=last_audit.created_at,
+            ).values_list("field_changes", flat=True)
+            has_valid_change = any(
+                (entry or {}).get("field") != "audit_status"
+                for changes in recent_rows
+                for entry in (changes or [])
+            )
+            if not has_valid_change:
+                raise ApiError(
+                    STATE_CONFLICT,
+                    "驳回后未发生有效资料修改，请先修改档案再重新提交",
+                )
         person.audit_status = enums.AuditStatus.PENDING
         person.save()
         _log_change(
@@ -1239,14 +1426,188 @@ def confirm_own_person(person_id: str, version: int):
                     "new": enums.AuditStatus.PENDING.value,
                 }
             ],
-            reason="本人确认档案",
+            reason=(
+                "驳回后重新提交"
+                if current == enums.AuditStatus.REJECTED
+                else "本人确认档案"
+            ),
+        )
+        # 风险5：self_confirm 审计与状态写入同事务（幂等路径之外的主路径）
+        _audit_in_transaction(
+            "person.self_confirm",
+            person.pk,
+            getattr(account, "pk", "") or "",
+            f"本人确认档案 {person.full_name}",
+        )
+    # 重查取 save 后的 updated_at（派生 version 与持久化结果一致）
+    return people_queryset().filter(pk=person.pk).first()
+
+
+def _audit_in_transaction(
+    action: str, person_pk, operator_account_id: str, summary: str
+) -> None:
+    """服务层事务内审计（风险5 修订方案，2026-10-31 裁定 B 口径移植）。
+
+    与业务写链同一数据库连接、同一 atomic 块：AuditLog 与 Person/
+    PersonChangeLog 同生共死——审计写失败向外抛异常、业务整体回滚，
+    消除"业务成功、审计丢失"的静默窗口（原 AuditMiddleware._write 在
+    get_response 返回后另起写入且整体 try/except 吞错）。
+    字段赋值对齐 AuditMiddleware._write 实码（common/middleware.py）：
+    id=new_id("log")、log_type="OPERATION"（中间件默认值）、
+    action/object_type/object_id 截断口径一致、summary 直出（中间件同样
+    不截断）、outcome 由响应码映射——事务内业务成立恒 SUCCESS。
+    中间件防重复：API 层在服务层成功返回后 audit_state(request, None)
+    撤销本请求的审计声明，_write 首行守卫（action 为空即跳过）自然生效
+    ——零通用模块修改、无 ContextVar；服务层异常时不撤销，中间件按原
+    行为落 FAILURE。action/object_type/object_id 与 _assert_not_self_review
+    查询口径逐字一致（"person.create"/"person.self_confirm" + "Person"）。
+    """
+    AuditLog.objects.create(
+        id=new_id("log"),
+        log_type="OPERATION",
+        operator_account_id=operator_account_id,
+        action=action[:100],
+        object_type="Person",
+        object_id=str(person_pk)[:64],
+        summary=summary or "",
+        outcome="SUCCESS",
+    )
+
+
+def _assert_not_self_review(person, account) -> None:
+    """防自审自批（问题#5，2026-10-31 裁定 B 口径移植）：禁止审核自己创建或最近一次提交的档案。
+
+    追溯口径（AuditLog 只读查询，不新增表/字段/迁移）：
+    - 入口覆盖：person.create（POST /people，服务层事务内审计）为唯一建档
+      入口；person.self_confirm（POST /me/profile-confirmation）为唯一
+      DRAFT/REJECTED→PENDING 提交入口，驳回后重提走同一入口
+      （services.confirm_own_person）；seed 脚本直造数据不经 API、无审计
+      日志（属缺日志场景，见下）；
+    - 查询限定：object_type="Person" + object_id=人员ID + outcome="SUCCESS"
+      （失败请求审计落 FAILURE，不构成创建/提交事实），三条件同时命中方计入；
+    - 最近一次提交：created_at 倒序取首条（AuditLog.id 为随机 uuid 非时间序，
+      不可作排序键）；PENDING 幂等重复确认同样落 SUCCESS 日志，但操作者恒
+      为档案绑定本人，与最近一次提交者同向，不漏判；
+    - 缺日志处理：查无创建/提交记录时无法确立可比较的操作者身份，不做拦截
+      ——这是"无证据可判"，不是绕过：数据范围、状态机、乐观锁与本函数
+      之后的事务 PersonChangeLog(AUDIT) 行保护全部保留；
+    - 仅作用于人员档案审批（review_person）；材料域同账号分离未批准，
+      common.permissions.assert_not_self_review（缺日志阻断的通用版）保留
+      供材料域使用，两套口径并存但作用域互斥（2026-10-31 裁定）。
+    """
+    entries = AuditLog.objects.filter(
+        object_type="Person",
+        object_id=str(person.pk),
+        outcome="SUCCESS",
+    ).filter(Q(action="person.create") | Q(action="person.self_confirm"))
+    creator_id = (
+        entries.filter(action="person.create")
+        .order_by("-created_at")
+        .values_list("operator_account_id", flat=True)
+        .first()
+    )
+    last_submitter_id = (
+        entries.filter(action="person.self_confirm")
+        .order_by("-created_at")
+        .values_list("operator_account_id", flat=True)
+        .first()
+    )
+    account_id = getattr(account, "pk", "") or ""
+    # account_id 非空才比较：日志 operator 缺失（空串）不得与空值账号互相命中
+    if account_id and account_id in (creator_id, last_submitter_id):
+        raise ApiError(FORBIDDEN, "不得审核自己创建或提交的人员档案")
+
+
+def review_person(person_id: str, payload: dict, account):
+    """POST /people/{id}/review（P0-2，2026-10-28）：学校端档案审核。
+
+    业务依据（2026-10-28 统一规则 + D1 口径）：
+    - 权限点 personReview=UNIVERSITY（学校端是人员资格与履历的最终审核方；
+      ADMIN 不因数据范围获得审核权；CITY/PROVINCE_REVIEWER 只审报名；
+      TEAM 维护权限≠审核权限）——由 API 层 require() 强制，本函数只裁决
+      数据范围；
+    - 数据范围：UNIVERSITY 所属组织子树（scope_org_codes ↔ Person.school.code
+      编码映射，同材料域 D1/D5 已验证口径）；无有效组织范围（无绑定/绑定
+      已软删）默认拒绝不退化全库；范围外档案不可见（404，不泄露存在性，
+      同 get_person A′ 口径）。不复用 apply_person_scope（该函数当前仅放行
+      ADMIN，属既有 persons 查询接口 A′ 一批口径；对 UNIVERSITY 开放
+      personList/personGet/personSearch 影响既有接口面，列为待决事项，
+      不随本接口一并放开）；
+    - 状态机：仅 PENDING → APPROVED/REJECTED；DRAFT（尚未提交复核，走
+      profileConfirm）/APPROVED（重复审核）/REJECTED（重新提交链路 B3
+      待业务确认，保守拒绝）→ 409 STATE_CONFLICT；
+    - REJECT 必填 reason（同材料域审核口径）；
+    - 留痕复用既有 PersonChangeLog（change_type=AUDIT，field_changes 记
+      audit_status old/new，reason 记审核意见），不新增模型/迁移；
+      changed_by 为 BigInteger 逻辑引用恒空（D4 待批），操作人追溯由通用
+      AuditLog（API 层 audit_state）承载；
+    - 状态变更与留痕同一事务：留痕失败 → 状态整体回滚，不留半完成审核。
+    """
+    from apps.common.scopes import scope_org_codes
+
+    codes = scope_org_codes(account)
+    if not codes:
+        raise ApiError(
+            DATA_SCOPE_DENIED,
+            "当前账号无有效组织范围，禁止审核人员档案",
+        )
+    # P1-5 防自审：对象读取、版本校验、状态校验、自审审计校验、状态变更与留痕
+    # 全部在同一事务内执行，select_for_update 锁定待审核人员行，防止并发
+    # 创建/修改与审核之间的 TOCTOU 竞态。
+    with transaction.atomic():
+        person = (
+            people_queryset()
+            .select_for_update()
+            .filter(pk=parse_path_id(person_id), school__code__in=codes)
+            .first()
+        )
+        if person is None:
+            raise ApiError(NOT_FOUND)
+        ensure_version(person, payload["version"])
+        current = person.audit_status
+        if current != enums.AuditStatus.PENDING:
+            raise ApiError(
+                STATE_CONFLICT,
+                f"档案当前状态为 {current}，仅待审核（PENDING）档案可处理",
+            )
+        # 防自审（问题#5，2026-10-31 裁定 B 口径移植）：证据=person.create
+        # （创建人）+ person.self_confirm（最近一次提交人），仅取 SUCCESS 记录；
+        # person.update / person.self_update 不构成证据；缺日志=无可比较
+        # 操作者身份，放行。查询位于 select_for_update 获锁之后（裁定：
+        # 锁前不得读自审依据）。
+        _assert_not_self_review(person, account)
+        decision = payload["decision"]
+        reason = (payload.get("reason") or "").strip()
+        if decision == "REJECT" and not reason:
+            raise ApiError(
+                INVALID_ARGUMENT,
+                "驳回档案必须填写审核意见",
+                [{"field": "reason", "reason": "REJECT 时必填"}],
+            )
+        person.audit_status = (
+            enums.AuditStatus.APPROVED
+            if decision == "APPROVE"
+            else enums.AuditStatus.REJECTED
+        )
+        person.save()
+        _log_change(
+            person,
+            enums.ChangeType.AUDIT,
+            [
+                {
+                    "field": "audit_status",
+                    "old": str(current),
+                    "new": str(person.audit_status),
+                }
+            ],
+            reason=reason or "审核通过",
         )
     # 重查取 save 后的 updated_at（派生 version 与持久化结果一致）
     return people_queryset().filter(pk=person.pk).first()
 
 
 def list_own_teams(person_id: str) -> list[dict]:
-    """GET /me/teams（ATHLETE/COACH）：本人现役（CURRENT）球员/教练关系的球队。
+    """GET /me/teams：本人现役（CURRENT）球员/教练关系的球队，数组直出。
 
     契约依据（前端实码优先，契约清单 B4）：
     - meApi.teams() 无任何请求参数、响应 Team[]（zuqiu src/api/index.ts:69）；
@@ -1254,6 +1615,8 @@ def list_own_teams(person_id: str) -> list[dict]:
     - 范围=正式关系 TeamMember/TeamCoach 且 status=CURRENT：mock 将"自报归属
       VERIFIED"并入（adapter.ts:340-343），冻结模型无申请表（B5），不采用；
       EXITED 历史关系属履历（/me/team-affiliations 域），不进本接口；
+    - UNIVERSITY 全校分支（mock adapter.ts:335-337 按 orgId 过滤全校球队）
+      依赖 org→school 映射（D1/方案A′ 未批），暂停实现，权限点仅 ATHLETE/COACH；
     - 字段适配（前端 Team 类型 types.ts:185-206 vs 冻结 Team 模型）：
       无承载且页面未消费的字段不输出（shortName/campusName/gender/orgId/
       cityOrgId）；flagUrl/emblemUrl/groupPhotoUrl 属受控下载契约（无公开
@@ -1274,45 +1637,14 @@ def list_own_teams(person_id: str) -> list[dict]:
     )
     if not team_ids:
         return []
-    return _team_brief_rows(Team.objects.filter(pk__in=team_ids, is_deleted=False))
-
-
-def list_university_teams(account) -> list[dict]:
-    """GET /me/teams（UNIVERSITY）：本校组织子树内球队，输出与本人视图同构。
-
-    复用 teams.services.visible_teams（公开入口）做范围过滤：全局管理员全量、
-    学校类组织 code 子树、无可见范围 → 403 DATA_SCOPE_DENIED。
-    """
-    from apps.teams.services import visible_teams
-
-    return _team_brief_rows(visible_teams(account))
-
-
-def list_team_account_teams(account) -> list[dict]:
-    """GET /me/teams（TEAM）：球队端只看自己绑定的那支队。
-
-    按 A′-min 约定，TEAM 账号组织节点 code == Team.team_no；不做组织子树，
-    避免球队端看到同校其他队伍。绑定缺失或数据未对齐时返回空列表，
-    让球队工作台能正常进入而不是 403。
-    """
-    from apps.common.scopes import account_org_code
-    from apps.teams.models import Team
-
-    team_no = account_org_code(account)
-    if not team_no:
-        return []
-    return _team_brief_rows(Team.objects.filter(team_no=team_no, is_deleted=False))
-
-
-def _team_brief_rows(queryset: QuerySet) -> list[dict]:
-    """球队行 → /me/teams 输出（memberCount 与现役主教练姓名一次取齐）。"""
     head_coach_subq = TeamCoach.objects.filter(
         team=OuterRef("pk"),
         status=enums.RelationStatus.CURRENT,
         duty=enums.CoachDuty.HEAD_COACH,
     ).values("person__full_name")[:1]
     rows = (
-        queryset.select_related("school", "region")
+        Team.objects.filter(pk__in=team_ids, is_deleted=False)
+        .select_related("school", "region")
         .annotate(
             member_count=Count(
                 "teammember",
@@ -1342,9 +1674,42 @@ def _team_brief_out(team) -> dict:
     }
 
 
+def list_team_account_teams(account) -> list[dict]:
+    """GET /me/teams（TEAM 分支，main 9f92156 保留）：球队端只看绑定的那支队。
+
+    A′-min 约定：TEAM 账号组织节点 code == Team.team_no；不做组织子树，
+    避免球队端看到同校其他队伍。绑定缺失或数据未对齐返回空列表（空态），
+    保证球队工作台能正常进入而不是 403/404。输出与 list_own_teams 同构
+    （复用 _team_brief_out）。
+    """
+    from apps.common.scopes import account_org_code
+
+    team_no = account_org_code(account)
+    if not team_no:
+        return []
+    head_coach_subq = TeamCoach.objects.filter(
+        team=OuterRef("pk"),
+        status=enums.RelationStatus.CURRENT,
+        duty=enums.CoachDuty.HEAD_COACH,
+    ).values("person__full_name")[:1]
+    rows = (
+        Team.objects.filter(team_no=team_no, is_deleted=False)
+        .select_related("school", "region")
+        .annotate(
+            member_count=Count(
+                "teammember",
+                filter=Q(teammember__status=enums.RelationStatus.CURRENT),
+            ),
+            head_coach_name=Subquery(head_coach_subq),
+        )
+        .order_by("created_at", "id")
+    )
+    return [_team_brief_out(row) for row in rows]
+
+
 def delete_person(person_id: str, request_version, account) -> None:
     """DELETE /people/{id}：软删（版本校验 + 现役球队/教练关联保护）。"""
-    person = _get_person_for_write(person_id, account)
+    person = get_person(person_id, account)
     ensure_version(person, request_version)
     if TeamMember.objects.filter(person=person, status=enums.RelationStatus.CURRENT).exists():
         raise ApiError(
@@ -1387,8 +1752,8 @@ def _reject_undeployed_event_filters(payload: dict) -> None:
 def dossier_search_queryset(payload: dict, account) -> QuerySet:
     """POST /selection-dossiers/search 查询构建（§6.8 L1736-1756 + §7 DossierSearch）。
 
-    复用：people_queryset（软删排除+档案行注解）、apply_person_scope（角色/
-    组织范围口径）、list_people 的 -id 排序先例、create_person 的
+    复用：people_queryset（软删排除+档案行注解）、apply_person_scope（一期仅
+    ADMIN，D5 口径）、list_people 的 -id 排序先例、create_person 的
     lookup_hash 受控检索链路；teamId=现役 TeamMember 关系（CURRENT 口径同
     /me/teams）。检索资格：文档 L4708"仅运动员遴选档案受控检索，不允许借用
     教练员或其他人员过滤字段扩大数据范围"→ 强制 athlete_profile_exists=True。

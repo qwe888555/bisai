@@ -108,11 +108,14 @@ def subject_type_allowed(account, subject_type: str) -> None:
             "当前角色无报送权限",
             [{"field": "subjectType", "reason": "仅学校端可报送"}],
         )
-    if subject_type not in allowed:
+    # 2026-10-28 业务规则：本项目无"高校组"，报送主体仅中小学球队
+    # （CITY 代报是否放行属 D-1 契约，仍走原 403 分支）；UNIVERSITY
+    # 高校主体在服务端拒绝，不静默转换。
+    if subject_type != "SCHOOL_TEAM":
         raise ApiError(
             FORBIDDEN,
-            "报送主体类型与当前角色不匹配",
-            [{"field": "subjectType", "reason": f"当前角色可选：{sorted(allowed)}"}],
+            "报送主体类型非法",
+            [{"field": "subjectType", "reason": "本项目无高校组，仅支持中小学球队报送"}],
         )
 
 

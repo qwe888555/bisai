@@ -32,6 +32,16 @@ TRUE_VALUES = {"1", "true", "yes", "on"}
 
 
 def mock_enabled() -> bool:
+    """mock 替身开关（环境变量直读，模块 docstring 约定）。
+
+    生产双保险（2026-10-28 加固）：DJANGO_ENV=prod 时强制 False——即使
+    ENROLLMENT_MOCK_CLIENTS 被误开或配置校验被绕过，mock 也不得成为报名
+    资格校验（人员审核状态/禁用状态/必需附件）的替身；启动期另有
+    apps.common.production.validate_production_settings 的硬校验（缺失/
+    开启/非法均拒绝启动）。两者独立生效，不可互相替代。
+    """
+    if os.environ.get("DJANGO_ENV", "dev").strip().lower() == "prod":
+        return False
     return os.environ.get("ENROLLMENT_MOCK_CLIENTS", "true").strip().lower() in TRUE_VALUES
 
 
@@ -467,9 +477,14 @@ class PersonClient:
                 "hasIdConflict": False,
                 "banned": False,
             }
-        from apps.common.errors import ApiError, NOT_FOUND
+        # 生产双保险（2026-10-28）：mock 禁止后人员客户端未接通即 fail-closed，
+        # 503 DEPENDENCY_UNAVAILABLE 拒绝进入业务流程（六阶段验证口径，
+        # 不以 mock 派生数据/未建档 ID 放行终审）。
+        from apps.common.errors import ApiError, DEPENDENCY_UNAVAILABLE
 
-        raise ApiError(NOT_FOUND, "运动员主档不存在，请先在人员系统建档")
+        raise ApiError(
+            DEPENDENCY_UNAVAILABLE, "人员服务尚未接通，请置 ENROLLMENT_MOCK_CLIENTS=true"
+        )
 
     def get_persons(self, athlete_ids: list[str]) -> dict[str, dict[str, Any]]:
         return {athlete_id: self.get_person(athlete_id) for athlete_id in athlete_ids}
@@ -707,7 +722,12 @@ class EventConfigClient:
         return {"opensAt": event.registration_opens_at, "closesAt": event.registration_closes_at}
 
     def get_group_rules(self, event_id: str, group_id: str) -> dict[str, Any]:
-        """组别资格参数。缺失的键表示"参数未确认"，预检归 QUALIFICATION_PENDING。"""
+        """组别资格参数。缺失的键表示"参数未确认"，预检归 QUALIFICATION_PENDING。
+
+        P0-3 D 批：非 mock 分支直连本域 EventGroup（同进程单体），返回
+        结构化规则值；confirmed 映射 EventGroup.rules_confirmed（保留
+        precheck 既有键名，不改变预检 WARNING/ERROR 逻辑）。
+        """
         if mock_enabled():
             return {
                 "minPlayers": 5,
@@ -718,31 +738,22 @@ class EventConfigClient:
                 "requiredMaterialTypes": ["STAMPED_FORM", "STUDENT_STATUS"],
                 "confirmed": True,
             }
-        from apps.events.models import EventGroup
+        from apps.events import services as event_services
 
-        group = EventGroup.objects.filter(pk=group_id, event_id=event_id).first()
-        if group is None:
-            logger.warning("组别 %s(赛事 %s) 不存在，回退未确认规则", group_id, event_id)
-            return {
-                "minPlayers": None,
-                "maxPlayers": None,
-                "minGoalkeepers": None,
-                "birthDateFrom": None,
-                "birthDateTo": None,
-                "requiredMaterialTypes": [],
-                "confirmed": False,
-            }
-        # 模型仅含 max_players / min_age / max_age / quota / required_material_types；
-        # min_players / min_goalkeepers / 出生日期闭区间需成员5 配置或按年龄换算，
-        # 缺失归 QUALIFICATION_PENDING（与预检降级逻辑一致）。
+        # 走赛事域服务层：同时校验 event_id 与 group_id 归属，避免跨赛事读取组别
+        group = event_services.get_group(event_id, group_id)
         return {
-            "minPlayers": None,
+            "minPlayers": group.min_players,
             "maxPlayers": group.max_players,
-            "minGoalkeepers": None,
-            "birthDateFrom": None,
-            "birthDateTo": None,
+            "minGoalkeepers": group.min_goalkeepers,
+            "birthDateFrom": group.birth_date_from.isoformat()
+            if group.birth_date_from
+            else None,
+            "birthDateTo": group.birth_date_to.isoformat()
+            if group.birth_date_to
+            else None,
             "requiredMaterialTypes": list(group.required_material_types or []),
-            "confirmed": True,
+            "confirmed": bool(group.rules_confirmed),
         }
 
     def get_submission_route(self, subject_type: str) -> list[str]:

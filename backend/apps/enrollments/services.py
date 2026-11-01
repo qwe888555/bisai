@@ -19,15 +19,19 @@ from apps.common.errors import (
     BATCH_LIMIT_EXCEEDED,
     BUSINESS_VALIDATION_FAILED,
     DATA_SCOPE_DENIED,
+    DEPENDENCY_UNAVAILABLE,
     DUPLICATE_RESOURCE,
     FORBIDDEN,
     INVALID_ARGUMENT,
     NOT_FOUND,
+    RULES_UNCONFIGURED,
     STATE_CONFLICT,
     ApiError,
 )
 from apps.common.ids import new_id
 from apps.common.versioning import bump, check_version
+from apps.events.models import RULES_STATUS_CONFIGURED, derive_rules_status
+from apps.persons.services import person_audit_snapshot
 
 from . import precheck, scope
 from .clients import (
@@ -49,7 +53,11 @@ from .models import (
     Enrollment,
     EnrollmentAttachment,
     EnrollmentSnapshot,
+    QUALIFICATION_DISQUALIFIED,
+    QUALIFICATION_EXCLUDED,
+    QUALIFICATION_QUALIFIED,
     RosterItem,
+    RosterQualificationLog,
 )
 
 # ---------------------------------------------------------------- 序列化
@@ -218,13 +226,23 @@ def to_summary(
 
 
 def to_detail(enrollment: Enrollment) -> dict:
-    players = [to_roster(item) for item in enrollment.players.all()]
+    roster = list(enrollment.players.all())
+    players = [to_roster(item) for item in roster]
     data = to_summary(enrollment, player_count=len(players))
     data["players"] = players
     data["attachments"] = [
         to_attachment(item) for item in enrollment.attachments.all()
     ]
     data["latestReviewReason"] = _latest_review_reason(enrollment)
+    # P0-3：实时人员审核状态（只读展示）；终审判断仍由
+    # double_track_issues 在审核事务内实时复验，本字段不参与任何判断。
+    audit_states = person_audit_snapshot({str(item.athlete_id) for item in roster})
+    data["currentAuditStatuses"] = {
+        str(item.athlete_id): (audit_states.get(str(item.athlete_id)) or {}).get(
+            "auditStatus"
+        )
+        for item in roster
+    }
     return data
 
 
@@ -528,15 +546,24 @@ def update_roster(actor, enrollment_id: str, roster_id: str, payload) -> dict:
             actor, enrollment, [payload.photoFileId], "ROSTER_PHOTO"
         )
 
-    item.athlete_id = payload.athleteId
-    item.athlete_name = person.get("name") or ""
-    item.masked_id_number = person.get("maskedIdNumber") or ""
-    item.jersey_number = payload.jerseyNumber
-    item.position = payload.position or ""
-    item.photo_file_id = payload.photoFileId or ""
-    item.student_status_file_ids = list(payload.studentStatusFileIds or [])
-    bump(item)
-    item.save()
+    # E-2 凭证绑定（2026-10-29 批准）：凭证对应当前球员，athleteId 实际变化
+    # 即清空 confirmed_at/confirmed_by；同一球员的无变化更新不清凭证。
+    # 不改 qualification_status、不自动 REVOKE、不删除或改写历史资格日志；
+    # 换人与凭证失效同一事务（单行 save 原子落库）。
+    athlete_changed = payload.athleteId != item.athlete_id
+    with transaction.atomic():
+        if athlete_changed:
+            item.confirmed_at = None
+            item.confirmed_by = ""
+        item.athlete_id = payload.athleteId
+        item.athlete_name = person.get("name") or ""
+        item.masked_id_number = person.get("maskedIdNumber") or ""
+        item.jersey_number = payload.jerseyNumber
+        item.position = payload.position or ""
+        item.photo_file_id = payload.photoFileId or ""
+        item.student_status_file_ids = list(payload.studentStatusFileIds or [])
+        bump(item)
+        item.save()
     return to_roster(item)
 
 
@@ -553,6 +580,145 @@ def delete_roster(
     return item.pk, item.version
 
 
+# ---------------------------------------------------------------- E-2 资格确认
+
+
+def to_qualification(item: RosterItem) -> dict:
+    """E-2 资格操作响应：状态 + 确认凭证（双字段成对判定有效性）。"""
+    return {
+        "qualificationStatus": item.qualification_status,
+        "confirmedAt": item.confirmed_at,
+        "confirmedBy": item.confirmed_by or "",
+    }
+
+
+def _has_valid_credential(item: RosterItem) -> bool:
+    """v7：confirmed_at 与 confirmed_by 双条件同时有效，防单侧脏数据。"""
+    return item.confirmed_at is not None and bool(item.confirmed_by)
+
+
+def _append_qualification_log(
+    item: RosterItem, action: str, reason: str, operator_account_id: str
+) -> None:
+    """资格操作追加式审计日志（独立表，不写 ReviewRecord；仅 create）。"""
+    RosterQualificationLog.objects.create(
+        id=new_id("rstql"),
+        roster_item=item,
+        roster_item_id_snapshot=item.pk,
+        athlete_id=item.athlete_id,
+        action=action,
+        reason=reason or "",
+        operator_account_id=operator_account_id,
+    )
+
+
+def _reject_if_approved(status: str) -> None:
+    """D-2：APPROVED 名单禁止资格操作（统一 409 + 结构化原因）。"""
+    if status == STATUS_APPROVED:
+        raise ApiError(
+            STATE_CONFLICT,
+            "报名单已终审通过，不允许资格操作",
+            [{"field": "enrollment", "reason": "ENROLLMENT_APPROVED"}],
+        )
+
+
+def qualify_roster(actor, enrollment_id: str, roster_id: str, payload) -> dict:
+    """E-2 四种资格操作（CONFIRM/REJECT/EXCLUDE/REVOKE），v7 状态机。
+
+    - 事务 + 行锁（select_for_update）+ 乐观锁版本校验（409）；
+    - CONFIRM：非 EXCLUDED 均可（DISQUALIFIED 重新确认允许）；已有有效凭证
+      时幂等 no-op（不再追加日志）；否则写凭证 + QUALIFIED + 新日志；
+    - P0-3 D 批：CONFIRM 幂等 no-op 之后、写凭证之前，校验组别资格规则
+      状态为 CONFIGURED，否则 422 RULES_UNCONFIGURED；REJECT/EXCLUDE/
+      REVOKE 不做该校验；组别不存在时 NOT_FOUND 原样传播；
+    - REJECT：→ DISQUALIFIED，清凭证，原因必填（历史驳回记录保留在日志）；
+    - EXCLUDE：→ EXCLUDED，原因必填；资格操作层不可逆（后续四操作均 409）；
+    - REVOKE：仅 QUALIFIED 且有有效凭证；清凭证不改状态值，原因必填。
+    - D-2（2026-10-29 批准）：enrollment.status == APPROVED 时四种操作全部
+      409 STATE_CONFLICT（ENROLLMENT_APPROVED），禁令优先于幂等 no-op；
+      REJECTED/WITHDRAWN 不纳入禁令（重审场景保留现状）。
+    """
+    enrollment = scope.get_enrollment(actor, enrollment_id)
+    _reject_if_approved(enrollment.status)
+    with transaction.atomic():
+        # D-2 锁内复判：防"读链判断后、终审并发通过"窗口内提交资格操作。
+        # 锁序 enrollment→roster_item 与终审 approve 链（仅锁 enrollment）一致。
+        locked = Enrollment.objects.select_for_update().get(pk=enrollment.pk)
+        _reject_if_approved(locked.status)
+        item = (
+            RosterItem.objects.select_for_update()
+            .filter(pk=roster_id, enrollment_id=enrollment.pk)
+            .first()
+        )
+        if item is None:
+            raise ApiError(NOT_FOUND)
+        check_version(item, payload.version)
+
+        action = payload.action
+        reason = (payload.reason or "").strip()
+        if action in ("REJECT", "EXCLUDE", "REVOKE") and not reason:
+            raise ApiError(
+                INVALID_ARGUMENT,
+                "该资格操作必须填写原因",
+                [{"field": "reason", "reason": "REJECT/EXCLUDE/REVOKE 必填"}],
+            )
+
+        if item.qualification_status == QUALIFICATION_EXCLUDED:
+            raise ApiError(
+                STATE_CONFLICT,
+                "名单条目已剔除，资格操作不可逆，重新纳入仅走名单编辑",
+                [{"field": "action", "reason": "EXCLUDED 不可逆"}],
+            )
+
+        if action == "CONFIRM":
+            # 幂等 no-op 优先：已有有效凭证时不重复校验规则，直接返回当前状态。
+            if item.qualification_status == QUALIFICATION_QUALIFIED and _has_valid_credential(item):
+                return to_qualification(item)
+            # P0-3 D 批：规则未配置/未确认时禁止写入资格凭证。
+            # 仅 CONFIRM 受此前置校验约束，REJECT / EXCLUDE / REVOKE 不受影响。
+            rules = event_config_client.get_group_rules(
+                enrollment.event_id, enrollment.group_id
+            )
+            rules_status = derive_rules_status(
+                min_players=rules.get("minPlayers"),
+                max_players=rules.get("maxPlayers"),
+                rules_confirmed=bool(rules.get("confirmed")),
+            )
+            if rules_status != RULES_STATUS_CONFIGURED:
+                raise ApiError(RULES_UNCONFIGURED)
+            item.qualification_status = QUALIFICATION_QUALIFIED
+            item.confirmed_at = timezone.now()
+            item.confirmed_by = actor.pk
+            log_action = "CONFIRM"
+        elif action == "REJECT":
+            item.qualification_status = QUALIFICATION_DISQUALIFIED
+            item.confirmed_at = None
+            item.confirmed_by = ""
+            log_action = "REJECT"
+        elif action == "EXCLUDE":
+            item.qualification_status = QUALIFICATION_EXCLUDED
+            item.confirmed_at = None
+            item.confirmed_by = ""
+            log_action = "EXCLUDE"
+        elif action == "REVOKE":
+            if not _has_valid_credential(item):
+                raise ApiError(
+                    STATE_CONFLICT,
+                    "当前无有效资格凭证，无法撤销",
+                    [{"field": "action", "reason": "仅限 QUALIFIED 且已确认"}],
+                )
+            item.confirmed_at = None
+            item.confirmed_by = ""
+            log_action = "REVOKE"
+        else:  # pragma: no cover - schema 层 Literal 已拦截
+            raise ApiError(INVALID_ARGUMENT, "action 取值非法")
+
+        bump(item)
+        item.save()
+        _append_qualification_log(item, log_action, reason, actor.pk)
+        return to_qualification(item)
+
+
 # ---------------------------------------------------------------- 预检 / 提交 / 撤回 / 审核
 
 
@@ -564,8 +730,12 @@ def precheck_enrollment(actor, enrollment_id: str, version: int) -> dict:
 
 def build_snapshot_payload(enrollment: Enrollment) -> dict:
     team = team_client.get_team(enrollment.team_id)
+    roster = list(enrollment.players.all())
+    # P0-3：提交时冻结人员审核状态，仅供快照展示，不参与终审判断
+    # （终审仍由 double_track_issues 实时查询）。查不到的 id 记为 None。
+    audit_states = person_audit_snapshot({str(item.athlete_id) for item in roster})
     players: list[dict] = []
-    for item in enrollment.players.all():
+    for item in roster:
         person = person_client.get_person(item.athlete_id)
         players.append(
             {
@@ -575,6 +745,9 @@ def build_snapshot_payload(enrollment: Enrollment) -> dict:
                 "gender": person.get("gender"),
                 "birthDate": person.get("birthDate"),
                 "maskedStudentNumber": person.get("maskedStudentNumber"),
+                "auditStatus": (audit_states.get(str(item.athlete_id)) or {}).get(
+                    "auditStatus"
+                ),
             }
         )
     coach_ids = list(team.get("coachIds") or [])
@@ -588,6 +761,8 @@ def build_snapshot_payload(enrollment: Enrollment) -> dict:
         "attachments": [
             to_attachment(item) for item in enrollment.attachments.all()
         ],
+        # 明确标注：以上 auditStatus 为提交时冻结值，仅供展示
+        "displayOnlyFields": ["players[].auditStatus"],
     }
     # 快照落 JSONField：datetime 等先转 ISO 字符串，冻结后不再变化
     return json.loads(json.dumps(payload, cls=DjangoJSONEncoder))
@@ -724,7 +899,18 @@ def review_enrollment(actor, enrollment_id: str, payload) -> dict:
         target_status = approve_target
         if stage == "PROVINCE":
             # 省级终审：绑定具体名单版本 + 双轨合规（8.1）
-            result = precheck.run_precheck(enrollment)
+            # 生产双保险（2026-10-28）：mock 禁止后，预检链中任何依赖（人员/球队/
+            # 组别规则）未接通或未建档（mock 派生 ID）时 fail-closed，503 拒绝终审；
+            # 资格操作层（qualify_roster）仍按 B3 契约对组别缺失原样传播 NOT_FOUND。
+            try:
+                result = precheck.run_precheck(enrollment)
+            except ApiError as exc:
+                if exc.code == NOT_FOUND:
+                    raise ApiError(
+                        DEPENDENCY_UNAVAILABLE,
+                        "报名终审依赖的跨域数据尚未接通，请置 ENROLLMENT_MOCK_CLIENTS=true",
+                    )
+                raise
             if not result["passed"]:
                 errors = [
                     i for i in result["issues"] if i["severity"] == precheck.ERROR

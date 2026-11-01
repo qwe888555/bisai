@@ -14,12 +14,18 @@ from unittest import TestCase
 
 from django.apps import apps as django_apps
 from django.core.exceptions import ImproperlyConfigured
+from django.utils import timezone
 
+from apps.accounts.models import Account, Organization
+from apps.common.errors import DATA_SCOPE_DENIED, ApiError
 from apps.common.production import (
     DEV_DEFAULT_SECRET_KEY,
     assert_valid_env,
     validate_production_settings,
 )
+from apps.common.scopes import ensure_team_in_scope, scope_org_codes
+from apps.teams.models import Team
+from django.test import TestCase as DjangoTestCase  # noqa: E402  需要 setUpTestData 类级夹具
 
 
 def make_settings(**overrides):
@@ -35,6 +41,9 @@ def make_settings(**overrides):
         CORS_ORIGINS=["https://front.example.edu.cn"],
         REDIS_URL="redis://cache:6379/0",
         TIME_ZONE="Asia/Shanghai",
+        # 2026-10-29 对齐 production.py 第 6 项（P0 加固）：安全基线显式关闭
+        # mock 客户端替身；仅显式 False 通过校验。不删除/弱化任何生产校验项。
+        ENROLLMENT_MOCK_CLIENTS=False,
     )
     base.update(overrides)
     return SimpleNamespace(**base)
@@ -203,3 +212,203 @@ class ReadyEnforcementTests(TestCase):
 
     def test_prod_mode_safe_config_passes(self):
         self.config._enforce_production(make_settings())  # 不抛
+
+
+# ============================================================================
+# A′ 组织范围 helper（common/scopes.py）：scope_org_codes / ensure_team_in_scope
+#
+# 组织树夹具：
+#   ORG-P(省) → ORG-C(市) → ORG-SA(学校A,code=SCH-A) → ORG-TA1/TA2(球队,code=team_no)
+#                        → ORG-SB(学校B,code=SCH-B) → ORG-TB1(球队)
+# A′-min 契约（2026-10-25）：TEAM 组织节点 code == team.team_no。
+# ============================================================================
+
+TEAM_A1 = "T202600000001"
+TEAM_A2 = "T202600000002"
+TEAM_B1 = "T202600000003"
+TEAM_NO_MAPPING = "T202699999999"
+
+
+def _soft_delete(obj) -> None:
+    obj.deleted_at = timezone.now()
+    obj.save()
+
+
+class OrgScopeHelperDataTests(DjangoTestCase):
+    """scope_org_codes 三态语义与 deny-by-default。"""
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.prov = Organization.objects.create(
+            id="ORG-P", code="P-CODE", name="省", org_type="PROVINCE"
+        )
+        cls.city = Organization.objects.create(
+            id="ORG-C", code="C-CODE", name="市", org_type="CITY", parent=cls.prov
+        )
+        cls.school_a = Organization.objects.create(
+            id="ORG-SA", code="SCH-A", name="学校A", org_type="SCHOOL", parent=cls.city
+        )
+        cls.team_a1 = Organization.objects.create(
+            id="ORG-TA1", code=TEAM_A1, name="A1队", org_type="TEAM", parent=cls.school_a
+        )
+        cls.team_a2 = Organization.objects.create(
+            id="ORG-TA2", code=TEAM_A2, name="A2队", org_type="TEAM", parent=cls.school_a
+        )
+        cls.school_b = Organization.objects.create(
+            id="ORG-SB", code="SCH-B", name="学校B", org_type="SCHOOL", parent=cls.city
+        )
+        cls.team_b1 = Organization.objects.create(
+            id="ORG-TB1", code=TEAM_B1, name="B1队", org_type="TEAM", parent=cls.school_b
+        )
+        cls.soft_deleted_org = Organization.objects.create(
+            id="ORG-SD", code="SD-CODE", name="已软删", org_type="SCHOOL", parent=cls.city
+        )
+        _soft_delete(cls.soft_deleted_org)
+
+        cls.global_admin = Account.objects.create(
+            id="ACC-GA", username="ga", password="x", roles=["ADMIN"]
+        )
+        cls.school_admin = Account.objects.create(
+            id="ACC-SA", username="sa", password="x", roles=["UNIVERSITY"],
+            organization=cls.school_a,
+        )
+        cls.admin_with_org = Account.objects.create(
+            id="ACC-AO", username="ao", password="x", roles=["ADMIN"],
+            organization=cls.school_a,
+        )
+        cls.no_org_account = Account.objects.create(
+            id="ACC-NO", username="no", password="x", roles=["CITY"]
+        )
+        cls.soft_deleted_binding = Account.objects.create(
+            id="ACC-SD", username="sd", password="x", roles=["CITY"],
+            organization=cls.soft_deleted_org,
+        )
+
+    def test_global_admin_returns_none(self):
+        """无组织的 ADMIN = 全局管理员 → None（全库范围）。"""
+        self.assertIsNone(scope_org_codes(self.global_admin))
+
+    def test_admin_with_org_gets_subtree_not_none(self):
+        """挂组织的 ADMIN 不是全局管理员（is_global_admin 复用）→ 受限子树编码。"""
+        codes = scope_org_codes(self.admin_with_org)
+        self.assertIsNotNone(codes)
+        self.assertEqual(codes, ["SCH-A", TEAM_A1, TEAM_A2])
+
+    def test_scoped_account_returns_subtree_codes(self):
+        """非全局管理员有有效组织范围 → 所属子树全部节点编码。"""
+        self.assertEqual(
+            scope_org_codes(self.school_admin), ["SCH-A", TEAM_A1, TEAM_A2]
+        )
+
+    def test_account_without_org_returns_empty_list(self):
+        """无组织绑定的非管理员 → []，必须拒绝访问。"""
+        self.assertEqual(scope_org_codes(self.no_org_account), [])
+
+    def test_account_with_nonexistent_org_returns_empty_list(self):
+        """绑定组织 ID 在库中不存在（未落库实例模拟）→ []，不放大为全库。"""
+        ghost = Account(organization_id="ORG-GHOST", roles=["CITY"])
+        self.assertEqual(scope_org_codes(ghost), [])
+
+    def test_account_with_soft_deleted_org_returns_empty_list(self):
+        """绑定组织已软删除 → []，deny-by-default。"""
+        self.assertEqual(scope_org_codes(self.soft_deleted_binding), [])
+
+
+class EnsureTeamInScopeTests(DjangoTestCase):
+    """ensure_team_in_scope：A′ 编码映射（TEAM 节点 code == team_no）校验。"""
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.prov = Organization.objects.create(
+            id="ORG-P", code="P-CODE", name="省", org_type="PROVINCE"
+        )
+        cls.city = Organization.objects.create(
+            id="ORG-C", code="C-CODE", name="市", org_type="CITY", parent=cls.prov
+        )
+        cls.school_a = Organization.objects.create(
+            id="ORG-SA", code="SCH-A", name="学校A", org_type="SCHOOL", parent=cls.city
+        )
+        cls.team_a1_org = Organization.objects.create(
+            id="ORG-TA1", code=TEAM_A1, name="A1队", org_type="TEAM", parent=cls.school_a
+        )
+        cls.team_a2_org = Organization.objects.create(
+            id="ORG-TA2", code=TEAM_A2, name="A2队", org_type="TEAM", parent=cls.school_a
+        )
+        cls.school_b = Organization.objects.create(
+            id="ORG-SB", code="SCH-B", name="学校B", org_type="SCHOOL", parent=cls.city
+        )
+        Organization.objects.create(
+            id="ORG-TB1", code=TEAM_B1, name="B1队", org_type="TEAM", parent=cls.school_b
+        )
+
+        cls.global_admin = Account.objects.create(
+            id="ACC-GA", username="ga", password="x", roles=["ADMIN"]
+        )
+        cls.school_admin = Account.objects.create(
+            id="ACC-SA", username="sa", password="x", roles=["UNIVERSITY"],
+            organization=cls.school_a,
+        )
+        cls.no_org_account = Account.objects.create(
+            id="ACC-NO", username="no", password="x", roles=["CITY"]
+        )
+        cls.team_account = Account.objects.create(
+            id="ACC-TA", username="ta", password="x", roles=["TEAM"],
+            organization=cls.team_a1_org,
+        )
+
+        cls.team_a1 = Team.objects.create(team_no=TEAM_A1, name="A1队", category_code="U12")
+        cls.team_a2 = Team.objects.create(team_no=TEAM_A2, name="A2队", category_code="U12")
+        cls.team_b1 = Team.objects.create(team_no=TEAM_B1, name="B1队", category_code="U12")
+        cls.team_no_mapping = Team.objects.create(
+            team_no=TEAM_NO_MAPPING, name="无映射队", category_code="U12"
+        )
+
+    def _assert_denied(self, account, team):
+        with self.assertRaises(ApiError) as ctx:
+            ensure_team_in_scope(account, team)
+        self.assertEqual(ctx.exception.code, DATA_SCOPE_DENIED)
+        self.assertEqual(ctx.exception.status, 403)
+
+    def test_global_admin_allowed_even_without_team_mapping(self):
+        """全局管理员提前放行：即使球队无组织映射也不依赖映射。"""
+        ensure_team_in_scope(self.global_admin, self.team_no_mapping)  # 不抛
+
+    def test_team_in_scope_allowed(self):
+        """学校A 账号访问本队（映射在本校子树内）→ 允许。"""
+        ensure_team_in_scope(self.school_admin, self.team_a1)  # 不抛
+
+    def test_team_out_of_scope_denied(self):
+        """学校A 账号访问学校B 的球队 → 403 DATA_SCOPE_DENIED。"""
+        self._assert_denied(self.school_admin, self.team_b1)
+
+    def test_team_missing_mapping_denied(self):
+        """team_no 解析不出有效 TEAM 节点（映射缺失）→ 拒绝，不得放行。"""
+        self._assert_denied(self.school_admin, self.team_no_mapping)
+
+    def test_team_org_soft_deleted_denied(self):
+        """TEAM 组织节点已软删除（映射失效）→ 拒绝。"""
+        _soft_delete(self.team_a2_org)
+        try:
+            self._assert_denied(self.school_admin, self.team_a2)
+        finally:
+            self.team_a2_org.deleted_at = None
+            self.team_a2_org.save()
+
+    def test_team_org_disabled_denied(self):
+        """TEAM 组织节点已停用（映射失效）→ 拒绝（deny-by-default）。"""
+        self.team_a2_org.enabled = False
+        self.team_a2_org.save()
+        try:
+            self._assert_denied(self.school_admin, self.team_a2)
+        finally:
+            self.team_a2_org.enabled = True
+            self.team_a2_org.save()
+
+    def test_account_without_org_denied(self):
+        """账号无组织绑定（codes=[]）→ 即使球队映射完好也拒绝。"""
+        self._assert_denied(self.no_org_account, self.team_a1)
+
+    def test_team_role_account_own_team_allowed_sibling_denied(self):
+        """球队端账号绑定本队 TEAM 节点：本队允许，同校兄弟队拒绝。"""
+        ensure_team_in_scope(self.team_account, self.team_a1)  # 不抛
+        self._assert_denied(self.team_account, self.team_a2)
