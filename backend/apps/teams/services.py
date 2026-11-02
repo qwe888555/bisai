@@ -152,6 +152,8 @@ def list_teams(filters: dict, account) -> QuerySet[Team]:
         queryset = queryset.filter(category_code=filters["category"])
     if filters.get("status"):
         queryset = queryset.filter(audit_status=filters["status"])
+    if filters.get("cityOrgId"):
+        queryset = _filter_teams_by_city(queryset, filters["cityOrgId"])
     return _annotate_team(visible_teams(account, queryset)).order_by("-created_at", "-id")
 
 
@@ -175,6 +177,136 @@ def get_team(team_id: str, account) -> Team:
 
 
 _SCHOOL_ORG_TYPES = ("SCHOOL", "UNIVERSITY")
+
+
+# ---------------------------------------------------------------- 市州归属
+# 2026-11-02：管理端「参赛队伍」页的市州筛选与创建表单都会提交 cityOrgId
+# （docs teamList/teamCreate 契约），而此前后端既未声明也未使用该字段——
+# 创建直接 400 extra=forbid，筛选被静默忽略。以下辅助统一按组织节点解析。
+
+def _descendant_school_codes(city_org) -> list[str]:
+    """市州组织子树内学校类节点的 code（A′-min：org.code=School.code）。"""
+    from apps.accounts.models import Organization
+
+    codes: list[str] = []
+    seen: set[str] = set()
+    queue = [city_org.pk]
+    while queue:
+        current = queue.pop()
+        if not current or current in seen:
+            continue
+        seen.add(current)
+        node = Organization.objects.filter(pk=current).first()
+        if node is None:
+            continue
+        if node.org_type in _SCHOOL_ORG_TYPES and node.code:
+            codes.append(node.code)
+        queue.extend(
+            Organization.objects.filter(parent_id=current).values_list("id", flat=True)
+        )
+    return codes
+
+
+def _city_ancestor(org):
+    """学校组织沿 parent 上溯最近的 CITY 节点；无则 None（省直属学校等）。"""
+    from apps.accounts.models import Organization
+
+    current_id = getattr(org, "parent_id", None)
+    hops = 0
+    while current_id and hops < 8:
+        node = Organization.objects.filter(pk=current_id).first()
+        if node is None:
+            return None
+        if node.org_type == "CITY":
+            return node
+        current_id = node.parent_id
+        hops += 1
+    return None
+
+
+def _resolve_city(city_org_id):
+    """创建/筛选用：cityOrgId → CITY 组织节点；空值返回 None，非法值 400。
+
+    筛选场景由 list_teams 静默处理（空结果），写操作必须给出可定位字段错误。
+    """
+    from apps.accounts.models import Organization
+
+    raw = str(city_org_id or "").strip()
+    if not raw:
+        return None
+    city = Organization.objects.filter(pk=raw).first()
+    if city is None:
+        raise ApiError(
+            INVALID_ARGUMENT,
+            "所属市州组织不存在",
+            field_errors([("cityOrgId", "组织节点不存在")]),
+        )
+    if city.deleted_at is not None or not city.enabled:
+        raise ApiError(
+            INVALID_ARGUMENT,
+            "所属市州组织已停用",
+            field_errors([("cityOrgId", "组织节点已停用或已删除")]),
+        )
+    if city.org_type != "CITY":
+        raise ApiError(
+            INVALID_ARGUMENT,
+            "所属市州组织类型不符",
+            field_errors([("cityOrgId", f"必须为 CITY 节点，当前为 {city.org_type}")]),
+        )
+    return city
+
+
+def _city_region(city):
+    """CITY 组织 → 区划表中的市州（level=2，code 优先、名称兜底）。"""
+    from apps.persons.models import Region
+
+    region = Region.objects.filter(level=2, code=city.code).first()
+    if region is not None:
+        return region
+    region = Region.objects.filter(level=2, name=city.name).first()
+    if region is not None:
+        return region
+
+    def strip_suffix(name: str) -> str:
+        for suffix in ("教育和体育局", "教育局", "体育局"):
+            if name.endswith(suffix) and len(name) > len(suffix):
+                return name[: -len(suffix)]
+        return name
+
+    wanted = strip_suffix(city.name)
+    for candidate in Region.objects.filter(level=2):
+        if candidate.name == wanted:
+            return candidate
+    return None
+
+
+def _filter_teams_by_city(queryset, city_org_id) -> QuerySet[Team]:
+    """按市州组织过滤球队：region 直接命中/区县上溯命中/学校组织子树命中。
+
+    三条并集覆盖历史数据（region 可能停在区县）与新建数据（region=市州）。
+    组织不存在或无法映射时返回空集，避免"筛选失效=返回全量"。
+    """
+    from apps.accounts.models import Organization
+    from apps.persons.models import Region
+
+    raw = str(city_org_id or "").strip()
+    if not raw:
+        return queryset
+    city = Organization.objects.filter(pk=raw).first()
+    if city is None:
+        return queryset.none()
+    region_ids = list(
+        Region.objects.filter(level=2)
+        .filter(Q(code=city.code) | Q(name=city.name))
+        .values_list("pk", flat=True)
+    )
+    school_codes = _descendant_school_codes(city)
+    condition = Q(pk__in=[])
+    if region_ids:
+        condition = Q(region_id__in=region_ids) | Q(region__parent_id__in=region_ids)
+    if school_codes:
+        condition = condition | Q(school__code__in=school_codes)
+    return queryset.filter(condition).distinct()
 
 
 def _ensure_create_org_scope(account, org) -> None:
@@ -273,12 +405,28 @@ def create_team(data: dict, org, school, account) -> Team:
 
     _ensure_create_org_scope(account, org)
     # 归属落库：球队 region 取学校区划沿 parent 上溯的市州（level 2），
-    # 供报名 cityOrgId 解析与市州端数据隔离使用；上溯不到保留学校区县原值
+    # 供报名 cityOrgId 解析与市州端数据隔离使用；上溯不到保留学校区县原值。
+    # 2026-11-02：显式选择市州时以 cityOrgId 为准（前端创建表单/筛选回填），
+    # 但必须与学校所在市州一致，防止球队落到与学校无关的市州、破坏数据隔离。
     region = school.region if school.region_id else None
     hops = 0
     while region is not None and region.level != 2 and region.parent_id and hops < 6:
         region = region.parent
         hops += 1
+    city = _resolve_city(data.get("cityOrgId"))
+    if city is not None:
+        school_city = _city_ancestor(org)
+        if school_city is not None and str(school_city.pk) != str(city.pk):
+            raise ApiError(
+                INVALID_ARGUMENT,
+                "所选市州与所属学校所在市州不一致",
+                field_errors(
+                    [("cityOrgId", f"学校属于 {school_city.name}，当前选择 {city.name}")]
+                ),
+            )
+        city_region = _city_region(city)
+        if city_region is not None:
+            region = city_region
     with transaction.atomic():
         team = Team.objects.create(
             name=data["name"],
@@ -341,6 +489,37 @@ def update_team(team_id: str, payload: dict, account) -> Team:
     if changed:
         team.save()
     return _annotate_team(_team_queryset()).filter(pk=team.pk).first()
+
+
+def delete_team(team_id: str, version: int, account) -> Team:
+    """DELETE /teams/{id}：version 乐观锁 + 软删（存在报名/比赛记录→409）。
+
+    契约见 docs/后端接口文档.md §teamDelete：按版本软删除；存在受保护历史
+    关联时 409，不级联破坏报名快照、比赛或评分记录。本实现以“存在任一条
+    报名单（含草稿/已撤销，报名快照须保留）或任一场比赛（主/客队）”为
+    受保护关联；球队成员/教练关系、转队单均为关系行，软删不破坏其外键，
+    因此不阻断（转队单另有 from_team/to_team PROTECT 约束兜底）。
+    TEAM 组织节点保留（历史引用仍能解析队名），组织停用另行治理。
+    """
+    from apps.enrollments.models import Enrollment
+    from apps.events.models import Match
+    from apps.persons.services import ensure_version, parse_path_id
+
+    team = _team_queryset().filter(pk=parse_path_id(team_id)).first()
+    if team is None:
+        raise ApiError(NOT_FOUND)
+    ensure_team_visible(account, team)
+    ensure_version(team, version)
+    if Enrollment.objects.filter(team_id=str(team.pk)).exists():
+        raise ApiError(STATE_CONFLICT, "球队存在报名记录，无法删除")
+    if Match.objects.filter(
+        Q(home_team_id=str(team.pk)) | Q(away_team_id=str(team.pk))
+    ).exists():
+        raise ApiError(STATE_CONFLICT, "球队存在比赛记录，无法删除")
+    team.is_deleted = True
+    team.deleted_at = timezone.now()
+    team.save()
+    return team
 
 
 # ---------------------------------------------------------------- 球队成员（批次 B）

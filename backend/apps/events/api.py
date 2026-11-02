@@ -366,6 +366,20 @@ register_operation("matchEventCreate", _MATCH_ROLES)
 register_operation("matchEventGet", _MATCH_ROLES)
 register_operation("matchEventUpdate", _MATCH_ROLES)
 register_operation("matchEventDelete", _MATCH_ROLES)
+# 记录台球员选择器：记录员可读取本场两队现役名单（仅姓名/球衣号/档案 ID）。
+register_operation("matchRoster", _MATCH_ROLES)
+
+
+@router.get(
+    "/matches/{match_id}/rosters",
+    auth=_auth,
+    response=EnvelopeOut,
+    summary="本场双方球员名单（记录台选择器）",
+)
+def match_roster_list(request, match_id: str):
+    require("matchRoster")
+    members = services.match_rosters(match_id)
+    return ok([s.match_roster_out(member) for member in members])
 
 
 @router.get(

@@ -657,6 +657,47 @@ class OrganizationBehaviorTests(AccountScopeTestBase):
             Organization.all_objects.filter(parent_id=disabled.pk).count(), 0
         )
 
+    def test_parent_enable_state_cascades_to_descendants(self):
+        """父级启停级联整棵子树：学校停用时其下的球队组织同步停用。
+
+        用户要求：停用中小学时，把该学校对应的独立球队节点一起停用；
+        重新启用时同步恢复。级联逐层处理，子树内每个节点版本各自递增，
+        避免“父级已停用、子级仍启用”的矛盾状态。
+        """
+        token = self._admin_token()
+        parent = self._org("EF00", "待停用市", "CITY", self.P)
+        child = self._org("EF10", "下属学校", "UNIVERSITY", parent)
+        grandchild = self._org("EF11", "下属球队", "TEAM", child)
+
+        resp = self._put(
+            f"{BASE}/organizations/{parent.pk}",
+            self._org_body("EF00", "待停用市", "CITY", parent_id=self.P.pk, enabled=False, version=0),
+            token=token,
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        for node in (parent, child, grandchild):
+            node.refresh_from_db()
+            self.assertFalse(node.enabled, f"{node.code} 应随父级停用")
+            self.assertGreaterEqual(node.version, 1)
+
+        parent.refresh_from_db()
+        resp = self._put(
+            f"{BASE}/organizations/{parent.pk}",
+            self._org_body(
+                "EF00",
+                "待停用市",
+                "CITY",
+                parent_id=self.P.pk,
+                enabled=True,
+                version=parent.version,
+            ),
+            token=token,
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        for node in (parent, child, grandchild):
+            node.refresh_from_db()
+            self.assertTrue(node.enabled, f"{node.code} 应随父级启用")
+
     def test_illegal_parent_type_combo_rejected(self):
         """越级组合（TEAM 挂 PROVINCE）创建被拒（400），库中无残留。
 

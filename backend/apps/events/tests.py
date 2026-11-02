@@ -379,6 +379,24 @@ class ResultNewsTests(TestCase):
         )
         self.group = group
         self.match = _make_match(self.event, group, "1", "2", 2, 1, result_published=False)
+        MatchEvent.objects.create(
+            id=new_id("mev"),
+            match_id=self.match.pk,
+            event_type="GOAL",
+            minute=12,
+            team_id="1",
+            scorer_athlete_id="ath_1",
+        )
+        MatchEvent.objects.create(
+            id=new_id("mev"),
+            match_id=self.match.pk,
+            event_type="PENALTY",
+            minute=40,
+            team_id="2",
+            athlete_id="ath_2",
+            penalty_type="YELLOW_CARD",
+            reason="拉人",
+        )
 
     def test_publish_creates_news_and_delete_offlines(self):
         services.publish_match_result(self.match.pk, 0)
@@ -387,6 +405,11 @@ class ResultNewsTests(TestCase):
         self.assertEqual(news.status, "PUBLISHED")
         self.assertEqual(news.content_type, "HIGHLIGHT")
         self.assertIn("2:1", news.title)
+        # 自动快讯必须包含进球球员名单与红黄牌，而不只是比分。
+        self.assertIn("ath_1", news.body_html)
+        self.assertIn("黄牌", news.body_html)
+        self.assertIn("拉人", news.body_html)
+        self.assertIn("ath_1", news.body_text)
 
         self.match.refresh_from_db()
         services.publish_match_result(self.match.pk, self.match.version)

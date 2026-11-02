@@ -954,22 +954,36 @@ def update_organization(actor: Account, org_id: str, data: dict) -> Organization
     _validate_org_parent(data["orgType"], parent, current_id=org_id)
 
     enabled = bool(data.get("enabled", True))
-    if organization.enabled and not enabled:
-        if Organization.objects.filter(parent_id=org_id).exists():
-            raise ApiError(
-                STATE_CONFLICT,
-                "存在启用中的下级组织，不能停用",
-                [{"field": "enabled", "reason": "请先迁移或停用下级组织"}],
-            )
+    state_changed = organization.enabled != enabled
+    with transaction.atomic():
+        organization = _apply_org_fields(
+            organization,
+            parent=parent,
+            name=data["name"],
+            org_type=data["orgType"],
+            code=organization.code,
+            enabled=enabled,
+        )
+        # 父级启停级联整棵子树：例如停用学校时，同步停用它下面的球队组织
+        # 节点；重新启用时一并恢复。避免出现“父级已停用、子级仍启用”的
+        # 矛盾状态，也省去逐个手动停用下级。
+        if state_changed:
+            _sync_descendants_enabled(organization, enabled)
+    return organization
 
-    return _apply_org_fields(
-        organization,
-        parent=parent,
-        name=data["name"],
-        org_type=data["orgType"],
-        code=organization.code,
-        enabled=enabled,
-    )
+
+def _sync_descendants_enabled(root: Organization, enabled: bool) -> None:
+    """把 root 的整棵下级子树同步到 enabled 状态（逐条递增版本）。"""
+    frontier = [root.pk]
+    while frontier:
+        children = list(Organization.objects.filter(parent_id__in=frontier))
+        frontier = []
+        for child in children:
+            if child.enabled != enabled:
+                child.enabled = enabled
+                bump(child)
+                child.save(update_fields=["enabled", "version", "updated_at"])
+            frontier.append(child.pk)
 
 
 def delete_organization(actor: Account, org_id: str, version: Optional[int]) -> Organization:

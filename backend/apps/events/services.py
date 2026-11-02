@@ -321,6 +321,34 @@ def get_match(match_id: str) -> "Match":
     return match
 
 
+def match_rosters(match_id: str):
+    """比赛双方现役球员名单，供记录台选择进球者/领牌球员。
+
+    只返回选中比赛两队的 CURRENT 关系，不含身份证等敏感字段；记录台
+    账号无需拥有球队模块的成员列表权限即可拿到姓名与档案 ID。
+    """
+    from apps.teams.models import Team, TeamMember
+
+    match = get_match(match_id)
+    team_ids = []
+    for raw in (match.home_team_id, match.away_team_id):
+        raw = str(raw or "")
+        if not raw:
+            continue
+        team = (
+            Team.objects.filter(pk=int(raw)).first()
+            if raw.isdigit()
+            else Team.objects.filter(team_no=raw).first()
+        )
+        if team is not None:
+            team_ids.append(team.pk)
+    return (
+        TeamMember.objects.filter(team_id__in=team_ids, status="CURRENT")
+        .select_related("person")
+        .order_by("team_id", "jersey_number", "person_id")
+    )
+
+
 def update_match(match_id: str, data: dict) -> "Match":
     match = get_match(match_id)
     check_version(match, data.get("version"))
@@ -1224,18 +1252,81 @@ def _result_news_title(match) -> str:
     return f"赛果：{home} {hs}:{as_} {away}"
 
 
+def _result_news_body(match, event_name: str, title: str) -> tuple[str, str]:
+    """生成自动赛果快讯正文：比分 + 进球名单 + 红黄牌，返回 (html, 纯文本)。"""
+    from .models import MatchEvent
+
+    events = list(MatchEvent.objects.filter(match_id=match.pk))
+    goals = sorted(
+        (event for event in events if event.event_type == "GOAL"),
+        key=lambda event: (event.minute or 0, event.stoppage_minute or 0),
+    )
+    cards = sorted(
+        (
+            event
+            for event in events
+            if event.event_type == "PENALTY"
+            and event.penalty_type in ("YELLOW_CARD", "RED_CARD")
+        ),
+        key=lambda event: (event.minute or 0, event.stoppage_minute or 0),
+    )
+
+    def minute_text(event) -> str:
+        base = f"{event.minute} 分钟"
+        return f"{event.minute}+{event.stoppage_minute} 分钟" if event.stoppage_minute else base
+
+    goal_items: list[str] = []
+    scorer_names: list[str] = []
+    for event in goals:
+        who = display.athlete_name(event.scorer_athlete_id, event.scorer_athlete_id or "未知球员")
+        team = display.team_name(event.team_id, event.team_id)
+        own = "（乌龙球）" if event.own_goal else ""
+        goal_items.append(
+            f"<li>{escape(minute_text(event))} {escape(who)}（{escape(team)}）{own}</li>"
+        )
+        if not event.own_goal:
+            scorer_names.append(who)
+    card_items = [
+        (
+            f"<li>{escape(minute_text(event))} "
+            f"{'红牌' if event.penalty_type == 'RED_CARD' else '黄牌'} "
+            f"{escape(display.athlete_name(event.athlete_id, event.athlete_id or '未知球员'))}"
+            f"（{escape(display.team_name(event.team_id, event.team_id))}）"
+            f"{f'：{escape(event.reason)}' if event.reason else ''}</li>"
+        )
+        for event in cards
+    ]
+
+    parts = [
+        f"<p>{escape(event_name)}</p>",
+        f"<p><strong>{escape(title)}</strong></p>",
+        "<h3>进球时间线</h3>",
+        f"<ul>{''.join(goal_items)}</ul>" if goal_items else "<p>本场暂无进球记录。</p>",
+    ]
+    if card_items:
+        parts += ["<h3>红黄牌</h3>", f"<ul>{''.join(card_items)}</ul>"]
+    parts.append(
+        "<p><small>本快讯由赛事记录台赛果自动生成，最终结果以组委会公告为准。</small></p>"
+    )
+    body_text = title
+    if scorer_names:
+        body_text += f"。进球球员：{'、'.join(scorer_names)}"
+    return "".join(parts), body_text
+
+
 def _sync_result_news(match) -> None:
     """赛果发布后自动生成/更新一条已发布赛果快讯（HIGHLIGHT）。
 
     按 source_match_id 幂等 upsert：同一比赛重复发布只更新不堆积；
-    撤下赛果时由 _offline_result_news 下线对应快讯。
+    撤下赛果时由 _offline_result_news 下线对应快讯。正文自动带进球名单
+    与红黄牌，满足“比赛结束后自动推送比分、进球球员名单”的要求。
     """
     from .models import Content
 
     event_name = display.event_name(match.event_id, match.event_id)
     title = _result_news_title(match)
     summary = f"{title}（{event_name}）"
-    body_html = f"<p>{event_name}</p><p>{title}</p>"
+    body_html, body_text = _result_news_body(match, event_name, title)
     content = Content.objects.filter(source_match_id=match.pk).first()
     if content is None:
         Content.objects.create(
@@ -1244,7 +1335,7 @@ def _sync_result_news(match) -> None:
             title=title,
             summary=summary,
             body_html=body_html,
-            body_text=summary,
+            body_text=body_text,
             event_id=match.event_id,
             group_id=match.group_id,
             status="PUBLISHED",
@@ -1257,7 +1348,7 @@ def _sync_result_news(match) -> None:
         content.title = title
         content.summary = summary
         content.body_html = body_html
-        content.body_text = summary
+        content.body_text = body_text
         content.event_id = match.event_id
         content.group_id = match.group_id
         content.status = "PUBLISHED"

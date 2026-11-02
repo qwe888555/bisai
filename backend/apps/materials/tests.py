@@ -91,8 +91,9 @@ class MaterialApiTests(TestCase):
         Organization.objects.create(
             id="ORG-MSA", code="SCH-900100-101", name="丙一小组织", org_type="SCHOOL"
         )
-        # D1（2026-10-28）：普通材料审核权限仅学校端——审核类测试统一改用
-        # 本校审核账号；ADMIN 仅保留创建/更新/删除/列表等系统管理能力
+        # 审核类测试统一改用本校审核账号（多数用例验证学校端口径）；
+        # 2026-11-02 管理端联调后 materialReview 含 ADMIN，ADMIN 审核见
+        # test_admin_review_allowed_without_audit_evidence / _denied_for_own_material
         cls.uni_reviewer = Account.objects.create(
             id=new_account_id(),
             username="materials-reviewer",
@@ -588,11 +589,12 @@ class MaterialApiTests(TestCase):
         )
         self.assertEqual(resp.status_code, 404)
 
-    def test_admin_review_permission_denied(self):
-        """D1（2026-10-28 批准）：ADMIN 不拥有普通材料审核权限 → 403 FORBIDDEN。
+    def test_admin_review_denied_for_own_material(self):
+        """2026-11-02 管理端联调：ADMIN 已登记 materialReview（接口契约角色含
+        ADMIN，管理端人员管理/参赛队伍页面提供通过/驳回按钮），但防自审规则
+        不变——夹具中 pm_pending 的创建审计记录操作人即 admin，故仍 403。
 
-        权限点拒绝先于数据范围判定；全局 ADMIN 的数据范围能力（全库）
-        不推导审核权。状态不变、无审核日志。
+        状态不变、无审核日志。
         """
         resp = self._post(
             f"{BASE}/{self.pm_pending.pk}/review",
@@ -605,6 +607,27 @@ class MaterialApiTests(TestCase):
         self.assertEqual(self.pm_pending.status, enums.MaterialStatus.PENDING)
         self.assertFalse(
             MaterialAuditLog.objects.filter(material_id=self.pm_pending.pk).exists()
+        )
+
+    def test_admin_review_allowed_without_audit_evidence(self):
+        """2026-11-02 管理端联调：seed 脚本直写数据库的材料无创建/修改审计
+        记录，全局 ADMIN 的缺证据例外放行（学校端仍阻断，见
+        test_review_blocked_without_audit_log）。"""
+        AuditLog.objects.filter(
+            object_type="Material", object_id=f"PERSON:{self.pm_pending.pk}"
+        ).delete()
+        resp = self._post(
+            f"{BASE}/{self.pm_pending.pk}/review",
+            {"decision": "APPROVE", "version": self._mver(self.pm_pending)},
+            token=self.admin_token,
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.pm_pending.refresh_from_db()
+        self.assertEqual(self.pm_pending.status, enums.MaterialStatus.APPROVED)
+        self.assertTrue(
+            MaterialAuditLog.objects.filter(
+                material_id=self.pm_pending.pk, material_kind="PERSON"
+            ).exists()
         )
 
     # ------------------------------------------------------------ 软删
@@ -672,7 +695,7 @@ class MaterialApiTests(TestCase):
         self._delete(
             f"{BASE}/{self.pm_pending.pk}", token=self.admin_token, version=self._mver(self.pm_pending)
         )
-        # 审核（material.review）由学校端审核账号触发（D1：ADMIN 无普通审核权限）
+        # 审核（material.review）由学校端审核账号触发（学校端口径；ADMIN 审核见专项用例）
         actions = set(
             AuditLog.objects.filter(
                 operator_account_id__in=[self.admin.pk, self.uni_reviewer.pk]
@@ -1562,9 +1585,11 @@ class MaterialUniversityScopeTests(TestCase):
     def test_review_permission_includes_university(self):
         from apps.common.permissions import operation_roles
 
-        # D1（2026-10-28 批准）：普通材料审核权限仅学校端；
-        # ADMIN/CITY/PROVINCE_REVIEWER 均不在审核点。
-        self.assertEqual(operation_roles("materialReview"), ("UNIVERSITY",))
+        # 2026-11-02 管理端联调：接口契约 docs §materialReview 角色含 ADMIN，
+        # 管理端人员管理/参赛队伍页面提供通过/驳回按钮，权限点恢复
+        # ADMIN+UNIVERSITY；CITY/PROVINCE_REVIEWER 仍只审报名，不在审核点
+        # （见 test_city_review_permission_denied）。
+        self.assertEqual(operation_roles("materialReview"), ("ADMIN", "UNIVERSITY"))
 
     def test_city_review_permission_denied(self):
         """CITY 无材料审核权限（统一规则：只审报名）→ 权限点 403 FORBIDDEN，

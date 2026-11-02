@@ -274,6 +274,18 @@ def match_event_out(event) -> dict:
         )
     return data
 
+
+def match_roster_out(member) -> dict:
+    """记录台球员选择项：只暴露姓名、球衣号与档案 ID，不含证件信息。"""
+    return {
+        "teamId": str(member.team_id),
+        "athleteId": str(member.person_id),
+        "athleteName": member.person.full_name,
+        "jerseyNumber": member.jersey_number,
+        "position": member.position_code or "",
+        "status": member.status,
+    }
+
 # ---------------------------------------------------------------- 赛事文件 / 图文直播 / 直播链接（5.3 / 5.4）
 
 DocumentType = Literal["SIGN_IN", "SIGNED_RECORD", "REFEREE_REPORT"]

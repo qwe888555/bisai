@@ -618,11 +618,18 @@ def material_review(material_id: str, payload: dict, account) -> tuple:
             )
         # 防自审：纳入 material.create / material.update；
         # material.remove 不纳入（软删后材料不可审核）。
+        # 2026-11-02 管理端联调：全局 ADMIN 允许「无创建/修改审计记录」的
+        # 演示/种子材料通过（seed 脚本直写数据库，不经 materialCreate，
+        # 按缺证据阻断会使管理端「通过/驳回」按钮对种子材料恒 403）；
+        # 若审计记录中存在当前账号的创建/修改，仍按自审阻断。学校端维持
+        # 缺证据阻断口径不变。
+        roles = getattr(account, "roles", ()) or ()
         assert_not_self_review(
             account,
             "Material",
             f"{kind}:{material.pk}",
             ("material.create", "material.update"),
+            allow_missing_evidence=ADMIN in roles,
         )
         decision = payload["decision"]
         reason = (payload.get("reason") or "").strip()

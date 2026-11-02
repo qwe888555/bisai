@@ -227,11 +227,12 @@ class TeamApiTests(TestCase):
         resp = self._put(f"{BASE}/{self.team_main.pk}", {"version": 1})
         self.assertEqual(resp.status_code, 401)
 
-    def test_list_forbidden_for_athlete(self):
-        """ATHLETE 未登记 teamList 权限点 → 403 FORBIDDEN（角色拒绝先于范围）。"""
+    def test_list_denied_for_athlete_without_scope(self):
+        """ATHLETE 自 2026-11-01 起可读球队（个人页契约），但无组织范围 →
+        403 DATA_SCOPE_DENIED（不再以 FORBIDDEN 拒绝角色）。"""
         resp = self._get(BASE, token=self.athlete_token)
         self.assertEqual(resp.status_code, 403)
-        self.assertEqual(resp.json()["code"], "FORBIDDEN")
+        self.assertEqual(resp.json()["code"], "DATA_SCOPE_DENIED")
 
     def test_get_university_sees_own_school_team(self):
         """UNIVERSITY 按账号组织子树内的学校 code 判定：本校球队可读。"""

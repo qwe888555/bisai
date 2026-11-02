@@ -1,8 +1,8 @@
 """球队档案管理接口（django-ninja）：/teams*（T4-03 批次 A + 批次 B 成员）。
 
-前端契约：zuqiu teamApi（src/api/index.ts L135-157）——list/get/create/update
-+ members 域 5 接口（批次 B）+ memberGet 详情（批次 D-2，文档契约明确）；
-remove（DELETE）暂不开放（关联检查依赖报名/比赛域，契约清单在案）；
+前端契约：zuqiu teamApi（src/api/index.ts L135-157）——list/get/create/update/
+remove + members 域 5 接口（批次 B）+ memberGet 详情（批次 D-2，文档契约明确）；
+remove（DELETE）于 2026-11-02 补齐交付（软删 + 报名/比赛关联 409 保护）；
 coaches 域 3 接口已交付（批次 C，2026-10-29）；teamMatches 聚合入口已交付
 （2026-10-29，查询委托 events 读服务）。
 
@@ -64,6 +64,9 @@ register_operation("teamList", _TEAM_READ_ROLES)
 register_operation("teamGet", _TEAM_READ_ROLES)
 register_operation("teamCreate", _TEAM_ROLES)
 register_operation("teamUpdate", _TEAM_ROLES)
+# 2026-11-02 管理端全量联调：前端 TeamsView 删除按钮调用 DELETE /teams/{id}，
+# 契约 §teamDelete 已定义（角色同写操作）；此前未交付导致按钮必然 404。
+register_operation("teamDelete", _TEAM_ROLES)
 # 成员域：读=管理端花名册 + 球队端名单页；写=名单页 + 省市管理端，
 # 数据范围统一由 services.visible_teams 判定。
 register_operation("memberList", _TEAM_ROLES)
@@ -88,10 +91,17 @@ def team_list(
     keyword: Optional[str] = None,
     category: Optional[str] = None,
     status: Optional[str] = None,
+    cityOrgId: Optional[str] = None,
 ):
     account = require("teamList")
     queryset = services.list_teams(
-        {"keyword": keyword, "category": category, "status": status}, account
+        {
+            "keyword": keyword,
+            "category": category,
+            "status": status,
+            "cityOrgId": cityOrgId,
+        },
+        account,
     )
     return paginate(request, queryset, mapper=s.team_out)
 
@@ -131,6 +141,28 @@ def team_update(request, team_id: str, body: s.TeamUpdateBody):
         summary=f"更新球队 {team.name}",
     )
     return ok(s.team_out(team))
+
+
+@router.delete("/teams/{team_id}", auth=_auth, response=EnvelopeOut, summary="删除球队档案")
+def team_delete(
+    request, team_id: str, version: Optional[int] = Query(None, ge=0)
+):
+    account = require("teamDelete")
+    if version is None:
+        raise ApiError(
+            INVALID_ARGUMENT,
+            "缺少 version",
+            field_errors([("version", "该操作必须提交乐观锁版本")]),
+        )
+    team = services.delete_team(team_id, version, account)
+    audit_state(
+        request,
+        "team.delete",
+        object_type="Team",
+        object_id=str(team.pk),
+        summary=f"删除球队 {team.name}({team.team_no})",
+    )
+    return action_result(True, str(team.pk))
 
 
 # ---------------------------------------------------------------- 球队成员（批次 B）
