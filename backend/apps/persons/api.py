@@ -11,8 +11,11 @@
 from __future__ import annotations
 
 from typing import Optional
+from urllib.parse import quote
 
-from ninja import Query, Router
+from django.http import HttpResponse
+from ninja import File, Form, Query, Router
+from ninja.files import UploadedFile
 
 from apps.common.authentication import JWTAuth
 from apps.common.conf import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE
@@ -40,6 +43,7 @@ from apps.common.permissions import (
 )
 from apps.common.schemas import EnvelopeOut
 
+from . import imports as person_imports
 from . import schemas as s
 from . import services
 
@@ -461,6 +465,75 @@ def people_search(request, body: s.PersonSearchBody):
     return ok([s.person_out(item) for item in items])
 
 
+# ---------------------------------------------------------------- 批量导入（§3）
+# 字面量路由必须注册在 /people/{person_id} 之前，否则 POST /people/imports
+# 会先命中详情路由而得到 405（与 teams member/search 同类问题）。
+# 学校建档下沉后，逐个录入/前端逐行调用 POST /people 不可持续：
+# 提供固定模板、批量校验/写入、错误清单下载三条接口；权限与单条建档一致。
+
+register_operation("personImportTemplate", (ADMIN, UNIVERSITY))
+register_operation("personImport", (ADMIN, UNIVERSITY))
+register_operation("personImportErrors", (ADMIN, UNIVERSITY))
+
+
+def _binary(data: bytes, filename: str, content_type: str) -> HttpResponse:
+    response = HttpResponse(data, content_type=content_type)
+    response["Content-Disposition"] = f"attachment; filename*=UTF-8''{quote(filename)}"
+    response["Cache-Control"] = "private, no-store"
+    return response
+
+
+@router.get(
+    "/people/imports/templates/person.xlsx",
+    auth=_auth,
+    response=None,
+    summary="下载人员档案导入模板",
+)
+def person_import_template(request):
+    require("personImportTemplate")
+    return _binary(
+        person_imports.render_template(),
+        "人员档案导入模板.xlsx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+
+@router.post(
+    "/people/imports",
+    auth=_auth,
+    response=EnvelopeOut,
+    summary="人员档案 Excel 校验/导入",
+)
+def person_import(
+    request,
+    mode: str = Form(...),
+    file: UploadedFile = File(...),
+    schoolOrgId: str = Form(""),
+):
+    actor = require("personImport")
+    result = person_imports.import_people(actor, mode, schoolOrgId, file)
+    audit_state(
+        request,
+        "person.import",
+        object_type="PersonImportBatch",
+        object_id=result["batchId"],
+        summary=f"人员导入 {mode}",
+    )
+    return ok(result)
+
+
+@router.get(
+    "/people/imports/{batch_id}/errors.csv",
+    auth=_auth,
+    response=None,
+    summary="下载人员导入错误清单",
+)
+def person_import_errors(request, batch_id: str):
+    actor = require("personImportErrors")
+    data, filename = person_imports.import_errors_csv(actor, batch_id)
+    return _binary(data, filename, "text/csv; charset=utf-8")
+
+
 @router.get(
     "/people/{person_id}", auth=_auth, response=EnvelopeOut, summary="人员档案详情"
 )
@@ -500,9 +573,33 @@ def people_review(request, person_id: str, body: s.PersonReviewBody):
     return ok(s.person_out(person))
 
 
-# 写操作仅 ADMIN（PeopleManageView 为管理端页面；学校端可否创建人员待确认④）
-register_operation("personCreate", (ADMIN,))
-register_operation("personUpdate", (ADMIN,))
+# 建档权限下沉学校（人员档案与账号流程后端改造 §2.1/§6）：学校账号可为本校
+# 建档、修改草稿并提交复核；删除仍仅 ADMIN（重复档案/异常由管理员处理）。
+# 数据范围由 apply_person_scope / _ensure_school_in_operator_scope 双重收口。
+register_operation("personSubmit", (ADMIN, UNIVERSITY))
+
+
+@router.post(
+    "/people/{person_id}/submit",
+    auth=_auth,
+    response=EnvelopeOut,
+    summary="提交人员档案复核",
+)
+def people_submit(request, person_id: str, body: s.PersonSubmitBody):
+    account = require("personSubmit")
+    person = services.submit_person(person_id, body.version, account)
+    audit_state(
+        request,
+        "person.submit",
+        object_type="Person",
+        object_id=str(person.pk),
+        summary=f"提交人员 {person.full_name} 复核",
+    )
+    return ok(s.person_out(person))
+
+
+register_operation("personCreate", (ADMIN, UNIVERSITY))
+register_operation("personUpdate", (ADMIN, UNIVERSITY))
 register_operation("personDelete", (ADMIN,))
 
 

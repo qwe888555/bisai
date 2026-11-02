@@ -51,7 +51,8 @@ class ChangePassword(StrictSchema):
 
 class InviteRequest(StrictSchema):
     kind: InviteKind
-    personId: str = Field(default="", min_length=1, max_length=64)
+    # 改造说明 §4.1：邀请必须绑定人员档案，禁止再签发无档案账号。
+    personId: str = Field(min_length=1, max_length=64)
     orgId: str = Field(min_length=1, max_length=64)
     expiresInMinutes: int = Field(default=1440, ge=5, le=10080)
 

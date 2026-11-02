@@ -221,6 +221,7 @@ def account_list(
     role: Optional[str] = None,
     orgId: Optional[str] = None,
     enabled: Optional[str] = None,
+    unbound: Optional[str] = None,
 ):
     actor = require("accountList")
     queryset = services.list_accounts(
@@ -230,6 +231,8 @@ def account_list(
             "role": role,
             "orgId": orgId,
             "enabled": _bool_param(enabled),
+            # 改造说明 §4.3：无人员档案的运动员/教练账号治理入口。
+            "unbound": _bool_param(unbound),
         },
     )
     return paginate(request, queryset, mapper=s.account_out)

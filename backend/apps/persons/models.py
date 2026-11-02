@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from django.db import models
 
+from apps.accounts.models import VersionedModel
 from apps.common import enums
 from apps.common.fields import TextField, TinyIntegerField
 
@@ -434,3 +435,27 @@ class SensitiveAccessLog(models.Model):
 
     def __str__(self) -> str:  # pragma: no cover - 调试用
         return f"{self.accessed_by}->{self.target_person_id}:{self.scene}"
+
+
+class PersonImportBatch(VersionedModel):
+    """人员批量导入批次（改造说明 §3）：错误明细以 JSON 留存供错误清单下载。
+
+    不建逐行错误子表：人员导入行数上限 500，错误清单一次读取即可，
+    JSON 字段足以支撑下载且避免新增两张表。
+    """
+
+    id = models.CharField(primary_key=True, max_length=64)
+    mode = models.CharField(max_length=30, db_comment="VALIDATE_ONLY/APPLY_VALID_ROWS")
+    total = models.PositiveIntegerField(default=0)
+    success_count = models.PositiveIntegerField(default=0)
+    failure_count = models.PositiveIntegerField(default=0)
+    errors = models.JSONField(default=list, db_comment="逐行错误 [{rowNumber,field,code,message}]")
+    created_by = models.CharField(max_length=64, blank=True, default="")
+
+    class Meta:
+        db_table = "person_import_batch"
+        db_table_comment = "人员批量导入批次"
+        ordering = ["-created_at", "id"]
+
+    def __str__(self) -> str:  # pragma: no cover - 调试用
+        return f"{self.id}({self.mode})"

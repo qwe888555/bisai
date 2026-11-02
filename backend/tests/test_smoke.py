@@ -615,8 +615,15 @@ class ApiSmokeTests(TestCase):
             content_type="application/json",
             HTTP_AUTHORIZATION=f"Bearer {token}",
         )
-        self.assertEqual(disable.status_code, 409, disable.content)
-        self.assertEqual(body(disable)["code"], "STATE_CONFLICT")
+        # 业务口径（2026-10 调整）：停用父级不再 409，而是级联停用整棵子树；
+        # 启用父级同样级联恢复（见 accounts.OrganizationBehaviorTests）。
+        self.assertEqual(disable.status_code, 200, disable.content)
+        school_after = self.client.get(
+            f"{BASE}/organizations/{school['id']}",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+        self.assertEqual(school_after.status_code, 200, school_after.content)
+        self.assertFalse(body(school_after)["data"]["enabled"])
 
     def test_code_is_immutable_on_update(self):
         token = self.login()

@@ -708,12 +708,12 @@ class TeamMemberApiTests(TestCase):
         cls.uni.save(update_fields=["organization"])
 
         # ---- 人员 ----
-        cls.ath_a = _athlete(101, "张小明")  # 现役成员
-        cls.ath_b = _athlete(102, "李小虎")  # 自由球员
-        cls.ath_c = _athlete(103, "王小磊")  # 已离队（历史）
-        cls.ath_d = _athlete(104, "赵小鹏")  # 现役 + PENDING 转出单
-        cls.ath_e = _athlete(105, "孙小冬")  # 中文 position 透传用
-        cls.ath_del = _athlete(106, "钱小失", is_deleted=True)  # 软删人员
+        cls.ath_a = _athlete(101, "张小明", school=cls.school)  # 现役成员
+        cls.ath_b = _athlete(102, "李小虎", school=cls.school)  # 自由球员
+        cls.ath_c = _athlete(103, "王小磊", school=cls.school)  # 已离队（历史）
+        cls.ath_d = _athlete(104, "赵小鹏", school=cls.school)  # 现役 + PENDING 转出单
+        cls.ath_e = _athlete(105, "孙小冬", school=cls.school)  # 中文 position 透传用
+        cls.ath_del = _athlete(106, "钱小失", is_deleted=True, school=cls.school)  # 软删人员
         cls.coach_only = Person.objects.create(
             person_no="P202600000107",
             full_name="周教练",
@@ -1037,7 +1037,7 @@ class TeamMemberApiTests(TestCase):
 
     def test_member_search_limit_20(self):
         for i in range(25):
-            _athlete(300 + i, f"候选球员{i:02d}")
+            _athlete(300 + i, f"候选球员{i:02d}", school=self.school)
         resp = self.client.post(
             f"{self._mpath(self.team_main.pk)}/search",
             data=json.dumps({"keyword": "候选球员"}),

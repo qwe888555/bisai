@@ -103,10 +103,10 @@ def change_password(account: Account, old_password: str, new_password: str) -> N
 
 
 def register(data: dict) -> Account:
-    """消费一次性邀请凭证后建账号。
+    """消费一次性邀请凭证后建账号，并强制绑定到邀请指定的人员档案。
 
-    注意：人员主档的建立/绑定归成员4 的 /people 接口，本接口只建账号并
-    记录 personId 绑定意图，避免只凭身份证认领已有档案。
+    改造说明 §4.2：邀请未绑定人员 → 400；注册填写的姓名/身份证必须与
+    人员档案一致；匹配通过后才写入 person_id，禁止仅凭姓名“认领”档案。
     """
     invitation = RegistrationInvitation.objects.filter(
         token_hash=crypto.hash_token(data["registrationToken"])
@@ -117,10 +117,16 @@ def register(data: dict) -> Account:
         raise ApiError(STATE_CONFLICT, "注册凭证已被使用")
     if invitation.expires_at <= timezone.now():
         raise ApiError(STATE_CONFLICT, "注册凭证已过期")
+    if not invitation.person_id:
+        raise ApiError(
+            INVALID_ARGUMENT,
+            "注册邀请未绑定人员档案，请联系管理员重新签发",
+            [{"field": "registrationToken", "reason": "邀请未绑定人员"}],
+        )
 
     if Account.objects.filter(username=data["username"]).exists():
         raise ApiError(DUPLICATE_RESOURCE, "登录账号已存在", [{"field": "username", "reason": "已被占用"}])
-    if invitation.person_id and Account.objects.filter(person_id=invitation.person_id).exists():
+    if Account.objects.filter(person_id=invitation.person_id).exists():
         raise ApiError(
             DUPLICATE_RESOURCE,
             "该人员已绑定其他账号",
@@ -128,19 +134,32 @@ def register(data: dict) -> Account:
         )
     # 邀请激活建立绑定前重新校验：签发后人员可能被软删（解绑/重绑同理，走服务端重验）
     _ensure_person_bindable(invitation.person_id)
+    person = _get_bound_person(invitation.person_id)
+    if person.full_name.strip() != data["realName"].strip():
+        raise ApiError(
+            INVALID_ARGUMENT,
+            "姓名与人员档案不一致",
+            [{"field": "realName", "reason": "与邀请绑定档案不符"}],
+        )
+    if person.id_card_hash != crypto.lookup_hash(data["idNumber"]):
+        raise ApiError(
+            INVALID_ARGUMENT,
+            "身份证号与人员档案不一致",
+            [{"field": "idNumber", "reason": "与邀请绑定档案不符"}],
+        )
+    _ensure_person_kind(person, invitation.kind)
 
     with transaction.atomic():
         account = Account.objects.create(
             id=new_account_id(),
             username=data["username"],
-            display_name=data["realName"],
+            display_name=person.full_name,
             roles=[invitation.kind],
             organization=invitation.organization,
-            person_id=invitation.person_id or "",
+            person_id=str(person.pk),
             enabled=True,
             password=make_password(data["password"]),
         )
-        # 身份证/手机号加密留存，等成员4 的人员接口完成绑定时再落到主档
         RegistrationInvitation.objects.filter(pk=invitation.pk).update(used_at=timezone.now())
     return account
 
@@ -200,21 +219,26 @@ def create_invitation(actor: Account, data: dict) -> dict[str, Any]:
             [{"field": "orgId", "reason": "不存在或已删除"}],
         )
     ensure_org_in_scope(actor, org.pk)
-    person = None
-    person_id = data.get("personId") or ""
-    if person_id:
-        from apps.persons.models import Person
+    person_id = (data.get("personId") or "").strip()
+    if not person_id:
+        raise ApiError(
+            INVALID_ARGUMENT,
+            "邀请必须绑定人员档案",
+            [{"field": "personId", "reason": "请先在人员管理中建档"}],
+        )
+    from apps.persons.models import Person
 
-        try:
-            person = Person.objects.filter(pk=person_id, is_deleted=False).first()
-        except (TypeError, ValueError):
-            person = None
-        if person is None:
-            raise ApiError(
-                INVALID_ARGUMENT,
-                "人员档案不存在",
-                [{"field": "personId", "reason": "请先在人员管理中建档"}],
-            )
+    try:
+        person = Person.objects.filter(pk=person_id, is_deleted=False).first()
+    except (TypeError, ValueError):
+        person = None
+    if person is None:
+        raise ApiError(
+            INVALID_ARGUMENT,
+            "人员档案不存在",
+            [{"field": "personId", "reason": "请先在人员管理中建档"}],
+        )
+    _ensure_person_kind(person, kind)
     _ensure_invitation_org(org, person)
     if person is not None:
         # 一个人员只能绑定一个账号，也不能同时持有两张可用邀请
@@ -421,6 +445,7 @@ def _issue_one_invitation(
         person = _match_person_by_id_number(
             _row_text(row.get("idNumber")), _row_text(row.get("realName"))
         )
+    _ensure_person_kind(person, kind)
 
     # 不得跨数据范围发放：非全局管理员只能给子树内学校的人员发账号
     school_codes = visible_school_codes(actor)
@@ -598,7 +623,16 @@ def list_accounts(actor: Account, filters: dict):
     enabled = filters.get("enabled")
     if enabled is not None:
         queryset = queryset.filter(enabled=enabled)
-    return queryset.order_by("-created_at", "id")
+    queryset = queryset.order_by("-created_at", "id")
+    if filters.get("unbound"):
+        # 改造说明 §4.3：只统计运动员/教练账号，person_id 为空即未绑定。
+        # JSONField contains 在 SQLite 测试库不支持，转内存过滤保证双库一致。
+        return [
+            account
+            for account in queryset.filter(person_id="")
+            if {"ATHLETE", "COACH"} & set(account.roles or ())
+        ]
+    return queryset
 
 
 ROLE_ORG_TYPES: dict[str, set[str]] = {
@@ -608,6 +642,54 @@ ROLE_ORG_TYPES: dict[str, set[str]] = {
     "CITY": {"CITY"},
     "PROVINCE_REVIEWER": {"PROVINCE"},
 }
+
+
+def _get_bound_person(person_id: str):
+    """按邀请绑定的 person_id 取人员档案；不存在/已软删统一 400。"""
+    try:
+        pk = int(str(person_id))
+    except (TypeError, ValueError):
+        pk = 0
+    person = Person.objects.filter(pk=pk, is_deleted=False).first() if pk > 0 else None
+    if person is None:
+        raise ApiError(
+            INVALID_ARGUMENT,
+            "邀请绑定的人员档案不存在或已删除",
+            [{"field": "personId", "reason": "请重新签发邀请"}],
+        )
+    return person
+
+
+def _ensure_person_kind(person, kind: str, field: str = "personId") -> None:
+    """邀请/账号身份必须与人员档案一致（改造说明 §4.1）。
+
+    身份事实源优先取扩展档案行（方案C），同时兼容只有 person_category
+    的历史/导入数据，避免存量档案因缺少扩展行而无法发邀请。
+    """
+    from apps.persons.models import AthleteProfile, CoachProfile
+
+    if kind == "ATHLETE":
+        matched = (
+            person.person_category == "ATHLETE"
+            or AthleteProfile.objects.filter(person=person).exists()
+        )
+        if not matched:
+            raise ApiError(
+                INVALID_ARGUMENT,
+                "该人员不具备运动员身份",
+                [{"field": field, "reason": "档案类别与邀请身份不一致"}],
+            )
+    if kind == "COACH":
+        matched = (
+            person.person_category == "COACH"
+            or CoachProfile.objects.filter(person=person).exists()
+        )
+        if not matched:
+            raise ApiError(
+                INVALID_ARGUMENT,
+                "该人员不具备教练员身份",
+                [{"field": field, "reason": "档案类别与邀请身份不一致"}],
+            )
 
 
 def _ensure_person_bindable(person_id: str) -> None:

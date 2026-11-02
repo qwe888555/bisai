@@ -1205,11 +1205,17 @@ class PersonVersionMechanismTests(TestCase):
         return person_version(person or Person.objects.get(pk=self.person.pk))
 
     def test_consecutive_saves_produce_distinct_versions(self):
+        import time
+
         v0 = self._derived()
         self.person.save()
+        # Windows 系统时钟粒度约 15.6ms，间隔过小 auto_now 会取到同一时刻；
+        # 20ms 足以区分，又保持「两次写间隔 <1s」的断言口径。
+        time.sleep(0.02)
         v1 = self._derived()
         self.person.full_name = "版本员二"
         self.person.save()
+        time.sleep(0.02)
         v2 = self._derived()
         self.assertGreater(v1, v0)
         self.assertGreater(v2, v1)
@@ -1475,13 +1481,15 @@ class PeopleWriteApiTests(TestCase):
         self.assertEqual(resp.status_code, 400)
         self.assertEqual(resp.json()["code"], "INVALID_ARGUMENT")
 
-    def test_create_forbidden_for_university(self):
+    def test_create_university_without_school_scope_denied(self):
+        """建档权限已下沉学校（改造说明 §2.1），但无组织绑定/未指定学校
+        仍必须在数据范围层拒绝，不能借权限点放开退化为全库写入。"""
         resp = self._post(
             {"kinds": ["ATHLETE"], "realName": "越权", "idNumber": self.ID_CARD},
             token=self.uni_token,
         )
         self.assertEqual(resp.status_code, 403)
-        self.assertEqual(resp.json()["code"], "FORBIDDEN")
+        self.assertEqual(resp.json()["code"], "DATA_SCOPE_DENIED")
 
     # -------------------------------------------- 批次 A：schoolName 明确拒绝
     #（coachCategory 已恢复原口径：声明不持久化，提交静默忽略，见上方 E1 用例）
@@ -1734,9 +1742,11 @@ class PeopleWriteApiTests(TestCase):
         self.assertEqual(person.education, "原值")  # 未被写入
 
     def test_update_person_non_admin_scope_denied(self):
-        """写链现状钉住：学校端账号（无组织绑定）更新人员 → 403 FORBIDDEN
-        （persons 写链权限点未授予学校端角色，A′ persons 域范围校验未落地；
-        权限点层即拒，不进入数据范围判断——不在本轮扩大范围）。"""
+        """学校端账号（无组织绑定）更新人员 → 403 DATA_SCOPE_DENIED。
+
+        改造说明 §2.1 已把更新权限点授予 UNIVERSITY，但无组织绑定无法确定
+        本校范围，范围校验必须拒绝，不能因权限放开而越权写入。
+        """
         _, person = self._create()
         from apps.persons.schemas import person_version
 
@@ -1750,7 +1760,7 @@ class PeopleWriteApiTests(TestCase):
             token=self.uni_token,
         )
         self.assertEqual(resp.status_code, 403)
-        self.assertEqual(resp.json()["code"], "FORBIDDEN")
+        self.assertEqual(resp.json()["code"], "DATA_SCOPE_DENIED")
         person.refresh_from_db()
         self.assertEqual(person.full_name, "王测试")  # 未被写入
 
@@ -2419,19 +2429,19 @@ class PersonAdminScopeTests(TestCase):
     # ------------------------------------------------------------ 非 ADMIN 不变
 
     def test_non_admin_roles_still_denied(self):
-        """A′ 第三批拆分后本类保留的拒绝面：TEAM/CITY 读仍拒绝。
+        """A′ 第三批拆分后本类保留的拒绝面：TEAM/CITY 读写仍拒绝。
 
-        UNIVERSITY 本校读已开放（正向矩阵见 PersonThirdBatchScopeTests）；
-        本测试保留：TEAM/CITY 的列表 403 + 三角色写链 FORBIDDEN。
+        UNIVERSITY 本校读已开放（正向矩阵见 PersonThirdBatchScopeTests），
+        本校建档也已开放（改造说明 §2.1）；本测试保留 TEAM/CITY 的
+        列表 403 DATA_SCOPE_DENIED + 写链 403 FORBIDDEN。
         """
         for token in (self.team_token, self.city_token):
             # 查询类权限点含 TEAM/CITY → 落到数据范围层拒绝
             resp = self._get(PEOPLE, token=token)
             self.assertEqual(resp.status_code, 403)
             self.assertEqual(resp.json()["code"], "DATA_SCOPE_DENIED")
-        for token in (self.uni_token, self.team_token, self.city_token):
-            # 写链权限点仅登记 ADMIN → 角色层即 FORBIDDEN（与既有
-            # test_create_forbidden_for_university 口径一致）
+        for token in (self.team_token, self.city_token):
+            # 写链权限点仅登记 ADMIN/UNIVERSITY → 角色层即 FORBIDDEN
             resp = self._post(
                 PEOPLE,
                 self._create_payload("非管理员新人", "110101201302081234", self.ORG_SA_ID),
@@ -2453,7 +2463,8 @@ class PersonThirdBatchScopeTests(TestCase):
       球员/教练（TeamMember/TeamCoach 各自独立按 CURRENT 过滤），EXITED
       不可见，不因子树扩展到子球队，不经学校归属反推；
     - CITY/PROVINCE_REVIEWER：403 DATA_SCOPE_DENIED（市级范围未开放）；
-    - 范围外对象 404 不泄露存在性；写链不开放（403 FORBIDDEN，零落库）；
+    - 范围外对象 404 不泄露存在性；TEAM/CITY 写链 403 FORBIDDEN，
+      UNIVERSITY 仅本校建档（跨校 403 DATA_SCOPE_DENIED，零落库）；
     - ADMIN 行为不变（PersonAdminScopeTests 继续覆盖第一批口径）。
 
     组织树夹具：
@@ -2762,7 +2773,12 @@ class PersonThirdBatchScopeTests(TestCase):
 
     # ------------------------------------------------------------ 写链与 ADMIN 回归
 
-    def test_write_chain_closed_for_non_admin(self):
+    def test_write_chain_closed_except_university_own_school(self):
+        """TEAM/CITY 写链仍 403 FORBIDDEN；UNIVERSITY 仅能本校建档。
+
+        改造说明 §2.1：学校端可为本校建档，服务端强制 schoolOrgId
+        等于账号所属学校；跨校提交 403 DATA_SCOPE_DENIED 且零落库。
+        """
         before = Person.objects.count()
         payload = {
             "kinds": ["ATHLETE"],
@@ -2770,12 +2786,24 @@ class PersonThirdBatchScopeTests(TestCase):
             "idNumber": "110101201901011234",
             "schoolOrgId": "ORG-3SA",
         }
-        for token in (self.uni_sa_token, self.team_ta_token, self.city_token):
+        for token in (self.team_ta_token, self.city_token):
             resp = self._post(PEOPLE, payload, token=token)
             self.assertEqual(resp.status_code, 403)
             self.assertEqual(resp.json()["code"], "FORBIDDEN")
-        self.assertEqual(Person.objects.count(), before)
         self.assertFalse(Person.objects.filter(full_name="三批越权新人").exists())
+
+        # 本校建档放行
+        resp = self._post(PEOPLE, payload, token=self.uni_sa_token)
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertEqual(Person.objects.count(), before + 1)
+
+        # 跨校建档拒绝（不落库）
+        cross = dict(payload, realName="三批跨校新人", idNumber="110101201901015678",
+                     schoolOrgId="ORG-3SB")
+        resp = self._post(PEOPLE, cross, token=self.uni_sa_token)
+        self.assertEqual(resp.status_code, 403, resp.content)
+        self.assertEqual(resp.json()["code"], "DATA_SCOPE_DENIED")
+        self.assertFalse(Person.objects.filter(full_name="三批跨校新人").exists())
 
     def test_global_admin_unchanged(self):
         # ADMIN 行为不变：全局管理员可见全部（含无校归属人员）
@@ -2926,6 +2954,101 @@ class PersonReviewTests(TestCase):
 
         # D1 口径：普通审核权限仅学校端（对齐 materialReview）。
         self.assertEqual(operation_roles("personReview"), ("UNIVERSITY",))
+
+    # ------------------------------------------------------------ 学校提交复核（§6）
+
+    def _submit(self, person, token=None, version=None):
+        from apps.persons.schemas import person_version
+
+        return self._post(
+            f"{PEOPLE}/{person.pk}/submit",
+            {"version": person_version(person) if version is None else version},
+            token=token or self.uni_a_token,
+        )
+
+    def test_submit_permission_roles_admin_university(self):
+        from apps.common.permissions import operation_roles
+
+        self.assertEqual(operation_roles("personSubmit"), ("ADMIN", "UNIVERSITY"))
+
+    def test_submit_draft_moves_to_pending_and_writes_log(self):
+        """DRAFT → PENDING，变更留痕 reason=学校提交审核。"""
+        resp = self._submit(self.p_draft_a)
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertEqual(resp.json()["data"]["reviewStatus"], "PENDING")
+        self.p_draft_a.refresh_from_db()
+        self.assertEqual(self.p_draft_a.audit_status, enums.AuditStatus.PENDING)
+        log = PersonChangeLog.objects.filter(
+            person=self.p_draft_a, reason="学校提交审核"
+        ).first()
+        self.assertIsNotNone(log)
+        self.assertEqual(
+            log.field_changes[0],
+            {
+                "field": "audit_status",
+                "old": "DRAFT",
+                "new": "PENDING",
+            },
+        )
+
+    def test_submit_rejected_resubmits_to_pending(self):
+        """REJECTED → PENDING（驳回后重新提交）。"""
+        person = Person.objects.create(
+            person_no="P202609990001",
+            full_name="驳回重提",
+            id_card_cipher=encrypt_text("110101201401019999"),
+            id_card_hash=lookup_hash("110101201401019999"),
+            id_card_masked=mask_id_number("110101201401019999"),
+            person_category=enums.PersonCategory.ATHLETE,
+            audit_status=enums.AuditStatus.REJECTED,
+            school=self.school_a,
+        )
+        resp = self._submit(person)
+        self.assertEqual(resp.status_code, 200, resp.content)
+        person.refresh_from_db()
+        self.assertEqual(person.audit_status, enums.AuditStatus.PENDING)
+        self.assertTrue(
+            PersonChangeLog.objects.filter(
+                person=person, reason="驳回后重新提交"
+            ).exists()
+        )
+
+    def test_submit_approved_returns_state_conflict(self):
+        resp = self._submit(self.p_approved_a)
+        self.assertEqual(resp.status_code, 409, resp.content)
+        self.assertEqual(resp.json()["code"], "STATE_CONFLICT")
+
+    def test_submit_pending_is_idempotent(self):
+        resp = self._submit(self.p_pending_a)
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertEqual(resp.json()["data"]["reviewStatus"], "PENDING")
+        self.assertFalse(
+            PersonChangeLog.objects.filter(
+                person=self.p_pending_a, reason__startswith="学校提交"
+            ).exists()
+        )
+
+    def test_submit_out_of_scope_returns_404(self):
+        resp = self._submit(self.p_pending_b)
+        self.assertEqual(resp.status_code, 404, resp.content)
+        self.assertEqual(resp.json()["code"], "NOT_FOUND")
+
+    def test_submit_stale_version_returns_409(self):
+        from apps.persons.schemas import person_version
+
+        old = person_version(self.p_draft_a) - 1
+        resp = self._submit(self.p_draft_a, version=old)
+        self.assertEqual(resp.status_code, 409, resp.content)
+        self.p_draft_a.refresh_from_db()
+        self.assertEqual(self.p_draft_a.audit_status, enums.AuditStatus.DRAFT)
+
+    def test_submit_non_university_roles_forbidden(self):
+        for token in (self.city_token, self.prov_token, self.team_token):
+            resp = self._submit(self.p_draft_a, token=token)
+            self.assertEqual(resp.status_code, 403, resp.content)
+            self.assertEqual(resp.json()["code"], "FORBIDDEN")
+        self.p_draft_a.refresh_from_db()
+        self.assertEqual(self.p_draft_a.audit_status, enums.AuditStatus.DRAFT)
 
     def test_review_denied_for_non_university_roles(self):
         """ADMIN/CITY/PROVINCE_REVIEWER/TEAM 调审核 → 权限点 403 FORBIDDEN，
@@ -5104,3 +5227,218 @@ class AuditTransactionConsistencyTests(TestCase):
             ).count(),
             0,
         )
+
+
+class PersonImportApiTests(TestCase):
+    """人员档案批量导入（改造说明 §3）。
+
+    覆盖：模板下载、VALIDATE_ONLY 不落库、APPLY_VALID_ROWS 落库为 DRAFT、
+    逐行错误隔离（校验位/重复/跨校）、错误清单 CSV 下载。
+    """
+
+    TEMPLATE_URL = "/api/v1/people/imports/templates/person.xlsx"
+    IMPORT_URL = "/api/v1/people/imports"
+
+    @classmethod
+    def setUpTestData(cls):
+        from apps.persons.imports import TEMPLATE_HEADERS
+
+        cls.headers = list(TEMPLATE_HEADERS)
+        cls.admin = Account.objects.create(
+            id=new_account_id(),
+            username="imp-admin",
+            roles=["ADMIN"],
+            password=make_password("pass-123456"),
+            enabled=True,
+        )
+        cls.uni = Account.objects.create(
+            id=new_account_id(),
+            username="imp-uni",
+            roles=["UNIVERSITY"],
+            password=make_password("pass-123456"),
+            enabled=True,
+            organization_id="ORG-I-SA",
+        )
+        cls.out_uni = Account.objects.create(
+            id=new_account_id(),
+            username="imp-out-uni",
+            roles=["UNIVERSITY"],
+            password=make_password("pass-123456"),
+            enabled=True,
+            organization_id="ORG-I-SB",
+        )
+        cls.admin_token = issue_access_token(cls.admin)[0]
+        cls.uni_token = issue_access_token(cls.uni)[0]
+        cls.out_token = issue_access_token(cls.out_uni)[0]
+
+        prov = Region.objects.create(name="导入省", code="960000", level=1)
+        city = Region.objects.create(name="导入市", code="960100", level=2, parent=prov)
+        cls.school_a = School.objects.create(
+            name="导入一小", code="SCH-960100-401", school_type="PRIMARY", region=city
+        )
+        cls.school_b = School.objects.create(
+            name="导入二小", code="SCH-960200-402", school_type="PRIMARY", region=prov
+        )
+        Organization.objects.create(
+            id="ORG-I-P", code="P-960", name="导入省组织", org_type="PROVINCE"
+        )
+        Organization.objects.create(
+            id="ORG-I-SA", code="SCH-960100-401", name="导入一小组织",
+            org_type="SCHOOL", parent_id="ORG-I-P",
+        )
+        Organization.objects.create(
+            id="ORG-I-SB", code="SCH-960200-402", name="导入二小组织",
+            org_type="SCHOOL", parent_id="ORG-I-P",
+        )
+
+    @staticmethod
+    def _auth(token):
+        return {"HTTP_AUTHORIZATION": f"Bearer {token}"}
+
+    @staticmethod
+    def _workbook(rows, headers):
+        import io
+
+        from openpyxl import Workbook
+
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.append(list(headers))
+        for row in rows:
+            sheet.append(list(row))
+        buffer = io.BytesIO()
+        workbook.save(buffer)
+        return buffer.getvalue()
+
+    def _upload(self, rows, mode="VALIDATE_ONLY", token=None, school_org_id=""):
+        from django.core.files.uploadedfile import SimpleUploadedFile
+
+        data = {
+            "mode": mode,
+            "file": SimpleUploadedFile(
+                "people.xlsx",
+                self._workbook(rows, self.headers),
+                content_type=(
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                ),
+            ),
+        }
+        if school_org_id:
+            data["schoolOrgId"] = school_org_id
+        return self.client.post(
+            self.IMPORT_URL, data=data, **self._auth(token or self.uni_token)
+        )
+
+    def _row(self, name, id_number, phone="13800001111", kind="运动员",
+             school="SCH-960100-401", education="小学", gender="男",
+             birth="2013-05-01"):
+        return [name, id_number, phone, kind, school, education, gender, birth]
+
+    # ------------------------------------------------------------ 模板
+
+    def test_template_download(self):
+        resp = self.client.get(self.TEMPLATE_URL, **self._auth(self.uni_token))
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertTrue(resp.content.startswith(b"PK"))  # xlsx = zip
+        self.assertIn("spreadsheetml", resp["Content-Type"])
+        self.assertIn("attachment", resp["Content-Disposition"])
+
+    def test_template_requires_permission(self):
+        from apps.common.authentication import issue_access_token as _issue
+
+        team = Account.objects.create(
+            id=new_account_id(),
+            username="imp-team",
+            roles=["TEAM"],
+            password=make_password("pass-123456"),
+            enabled=True,
+        )
+        resp = self.client.get(self.TEMPLATE_URL, **self._auth(_issue(team)[0]))
+        self.assertEqual(resp.status_code, 403)
+
+    # ------------------------------------------------------------ 校验 / 写入
+
+    def test_validate_only_does_not_persist(self):
+        before = Person.objects.count()
+        resp = self._upload(
+            [self._row("导入甲", "110101201305010014")], mode="VALIDATE_ONLY"
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        data = resp.json()["data"]
+        self.assertEqual(data["total"], 1)
+        self.assertEqual(data["successCount"], 1)
+        self.assertEqual(data["failureCount"], 0)
+        self.assertEqual(Person.objects.count(), before)
+
+    def test_apply_creates_draft_person(self):
+        resp = self._upload(
+            [self._row("导入乙", "110101201305010022")], mode="APPLY_VALID_ROWS"
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertEqual(resp.json()["data"]["successCount"], 1)
+        person = Person.objects.get(full_name="导入乙")
+        self.assertEqual(person.audit_status, enums.AuditStatus.DRAFT)
+        self.assertEqual(person.school, self.school_a)
+        self.assertEqual(person.person_category, "ATHLETE")
+
+    def test_row_errors_isolated_and_csv_download(self):
+        rows = [
+            self._row("导入丙", "110101201305010030"),
+            self._row("坏证件", "110101201305010039"),  # 校验位错误
+            self._row("导入丙重复", "110101201305010030"),  # 文件内重复
+        ]
+        resp = self._upload(rows, mode="APPLY_VALID_ROWS")
+        self.assertEqual(resp.status_code, 200, resp.content)
+        data = resp.json()["data"]
+        self.assertEqual(data["total"], 3)
+        self.assertEqual(data["successCount"], 1)
+        self.assertEqual(data["failureCount"], 2)
+        row_numbers = sorted(error["rowNumber"] for error in data["errors"])
+        self.assertEqual(row_numbers, [3, 4])
+        self.assertEqual(Person.objects.filter(full_name="坏证件").count(), 0)
+
+        csv_resp = self.client.get(
+            f"/api/v1/people/imports/{data['batchId']}/errors.csv",
+            **self._auth(self.uni_token),
+        )
+        self.assertEqual(csv_resp.status_code, 200, csv_resp.content)
+        self.assertTrue(csv_resp.content.startswith(b"\xef\xbb\xbf"))  # BOM
+        body = csv_resp.content.decode("utf-8-sig")
+        self.assertIn("身份证号格式", body)
+        self.assertIn("文件内身份证号重复", body)
+        self.assertIn("行号", body)
+
+    def test_university_cannot_import_other_school_rows(self):
+        resp = self._upload(
+            [self._row("跨校导入", "110101201305010049", school="SCH-960200-402")],
+            mode="APPLY_VALID_ROWS",
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        data = resp.json()["data"]
+        self.assertEqual(data["successCount"], 0)
+        self.assertEqual(data["failureCount"], 1)
+        self.assertEqual(data["errors"][0]["code"], "DATA_SCOPE_DENIED")
+        self.assertFalse(Person.objects.filter(full_name="跨校导入").exists())
+
+    def test_wrong_header_rejected(self):
+        from django.core.files.uploadedfile import SimpleUploadedFile
+
+        headers = list(self.headers)
+        headers[0] = "名字"
+        resp = self.client.post(
+            self.IMPORT_URL,
+            data={
+                "mode": "VALIDATE_ONLY",
+                "file": SimpleUploadedFile(
+                    "people.xlsx",
+                    self._workbook([], headers),
+                    content_type=(
+                        "application/vnd.openxmlformats-officedocument"
+                        ".spreadsheetml.sheet"
+                    ),
+                ),
+            },
+            **self._auth(self.uni_token),
+        )
+        self.assertEqual(resp.status_code, 400, resp.content)
+        self.assertEqual(resp.json()["code"], "INVALID_ARGUMENT")

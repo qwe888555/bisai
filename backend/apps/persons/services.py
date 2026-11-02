@@ -1335,6 +1335,51 @@ def update_own_person(person_id: str, payload: dict):
     return people_queryset().filter(pk=person.pk).first()
 
 
+def submit_person(person_id: str, version: int, account):
+    """POST /people/{id}/submit：学校把本校 DRAFT/REJECTED 档案提交复核。
+
+    建档权限下沉后（改造说明 §2.1/§6），学校录入的档案必须有一个服务端
+    入口转为 PENDING，否则审核接口永远只能处理 PENDING，学校档案无法闭环。
+    - 数据范围复用 apply_person_scope（学校只看本校，管理员按授权子树）；
+    - 状态机：DRAFT/REJECTED → PENDING；PENDING 幂等成功；APPROVED → 409；
+    - 行锁 + 乐观锁：与 review_person 串行，避免并发重复提交。
+    """
+    with transaction.atomic():
+        person = (
+            apply_person_scope(people_queryset(), account)
+            .select_for_update()
+            .filter(pk=parse_path_id(person_id))
+            .first()
+        )
+        if person is None:
+            raise ApiError(NOT_FOUND)
+        ensure_version(person, version)
+        current = person.audit_status
+        if current == enums.AuditStatus.APPROVED:
+            raise ApiError(STATE_CONFLICT, "档案已审核通过，无需提交")
+        if current == enums.AuditStatus.PENDING:
+            return people_queryset().filter(pk=person.pk).first()
+        person.audit_status = enums.AuditStatus.PENDING
+        person.save()
+        _log_change(
+            person,
+            enums.ChangeType.UPDATE,
+            [
+                {
+                    "field": "audit_status",
+                    "old": str(current),
+                    "new": enums.AuditStatus.PENDING.value,
+                }
+            ],
+            reason=(
+                "驳回后重新提交"
+                if current == enums.AuditStatus.REJECTED
+                else "学校提交审核"
+            ),
+        )
+    return people_queryset().filter(pk=person.pk).first()
+
+
 def confirm_own_person(person_id: str, version: int, account):
     """POST /me/profile-confirmation：本人确认档案，提交进入复核。
 

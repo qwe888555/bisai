@@ -854,15 +854,22 @@ class PersonBindingTests(AccountScopeTestBase):
             payload["personId"] = person_id
         return self._post(f"{BASE}/accounts/registration-invitations", payload, token=token)
 
-    def _register(self, token: str, username: str):
+    def _register(
+        self,
+        token: str,
+        username: str,
+        real_name: str = "绑定甲",
+        id_number: str = "110101200001010011",
+    ):
+        # 改造说明 §4.2：注册姓名/身份证必须与邀请绑定档案一致。
         return self._post(
             f"{BASE}/auth/registrations",
             {
                 "registrationToken": token,
                 "username": username,
                 "password": PASSWORD,
-                "realName": "激活人",
-                "idNumber": "110101201305011234",
+                "realName": real_name,
+                "idNumber": id_number,
             },
         )
 
@@ -999,6 +1006,25 @@ class PersonBindingTests(AccountScopeTestBase):
         invitation = RegistrationInvitation.objects.get()
         self.assertEqual(invitation.person_id, str(self.person_a.pk))
 
+    def test_invitation_without_person_rejected(self):
+        """改造说明 §4.1：personId 必填，缺失即 400，不落邀请。"""
+        resp = self._invite("")
+        self.assertEqual(resp.status_code, 400, resp.content)
+        self.assertEqual(resp.json()["code"], "INVALID_ARGUMENT")
+        self.assertFalse(RegistrationInvitation.objects.exists())
+
+    def test_invitation_kind_mismatch_rejected(self):
+        """改造说明 §4.1：邀请类型与人员档案类型必须一致。"""
+        token = self._login("scope-admin")
+        resp = self._post(
+            f"{BASE}/accounts/registration-invitations",
+            {"kind": "COACH", "orgId": self.S.pk, "personId": str(self.person_a.pk)},
+            token=token,
+        )
+        self.assertEqual(resp.status_code, 400, resp.content)
+        self.assertEqual(resp.json()["code"], "INVALID_ARGUMENT")
+        self.assertFalse(RegistrationInvitation.objects.exists())
+
     # ------------------------------------------------------------ 邀请激活
 
     def test_register_with_valid_person_binds_account(self):
@@ -1012,6 +1038,81 @@ class PersonBindingTests(AccountScopeTestBase):
         self.assertEqual(account.person_id, str(self.person_a.pk))
         invitation = RegistrationInvitation.objects.get()
         self.assertIsNotNone(invitation.used_at)
+
+    def test_register_name_mismatch_rejected(self):
+        """改造说明 §4.2：注册姓名必须与绑定档案一致，凭证不消费。"""
+        resp = self._invite(str(self.person_a.pk))
+        plain_token = resp.json()["data"]["registrationToken"]
+
+        resp = self._register(plain_token, "reg-bad-name", real_name="冒名")
+        self.assertEqual(resp.status_code, 400, resp.content)
+        self.assertEqual(resp.json()["code"], "INVALID_ARGUMENT")
+        self.assertEqual(resp.json()["data"][0]["field"], "realName")
+        self.assertFalse(Account.objects.filter(username="reg-bad-name").exists())
+        self.assertIsNone(RegistrationInvitation.objects.get().used_at)
+
+    def test_register_id_number_mismatch_rejected(self):
+        """改造说明 §4.2：身份证号必须与绑定档案一致，禁止凭姓名认领。"""
+        resp = self._invite(str(self.person_a.pk))
+        plain_token = resp.json()["data"]["registrationToken"]
+
+        resp = self._register(
+            plain_token, "reg-bad-id", id_number="110101200001019999"
+        )
+        self.assertEqual(resp.status_code, 400, resp.content)
+        self.assertEqual(resp.json()["code"], "INVALID_ARGUMENT")
+        self.assertEqual(resp.json()["data"][0]["field"], "idNumber")
+        self.assertFalse(Account.objects.filter(username="reg-bad-id").exists())
+        self.assertIsNone(RegistrationInvitation.objects.get().used_at)
+
+    def test_unbound_account_filter(self):
+        """改造说明 §4.3：GET /accounts?unbound=true 只返回未绑定档案的
+        运动员/教练账号。"""
+        Account.objects.create(
+            id=new_account_id(),
+            username="unbound-athlete",
+            display_name="未绑定运动员",
+            roles=["ATHLETE"],
+            organization=self.S,
+            password=make_password(PASSWORD),
+            enabled=True,
+        )
+        Account.objects.create(
+            id=new_account_id(),
+            username="unbound-coach",
+            display_name="未绑定教练",
+            roles=["COACH"],
+            organization=self.S,
+            password=make_password(PASSWORD),
+            enabled=True,
+        )
+        Account.objects.create(
+            id=new_account_id(),
+            username="bound-athlete",
+            display_name="已绑定运动员",
+            roles=["ATHLETE"],
+            organization=self.S,
+            person_id=str(self.person_a.pk),
+            password=make_password(PASSWORD),
+            enabled=True,
+        )
+        Account.objects.create(
+            id=new_account_id(),
+            username="unbound-university",
+            display_name="未绑定学校账号",
+            roles=["UNIVERSITY"],
+            organization=self.S,
+            password=make_password(PASSWORD),
+            enabled=True,
+        )
+
+        resp = self._get(
+            f"{BASE}/accounts", token=self._login("scope-admin"),
+            query={"unbound": "true", "pageSize": 50},
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        usernames = {item["username"] for item in resp.json()["data"]["items"]}
+        self.assertEqual(usernames, {"unbound-athlete", "unbound-coach"})
 
     def test_register_revalidates_person_deleted_after_invitation(self):
         """签发后人员被软删 → 激活时 400 拒绝建号（服务端重验），无部分写入。"""

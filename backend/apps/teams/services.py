@@ -587,21 +587,29 @@ def member_get(team_id: str, member_id: str, account) -> TeamMember:
 def member_search(team_id: str, keyword: str, account) -> list:
     """POST /teams/{id}/members/search：候选球员（复用 persons 读链事实源）。
 
-    - ATHLETE 身份=AthleteProfile 行存在性（方案C 完整类别事实源，与
-      persons kind 过滤同源），非 person_category 单值列；
+    改造说明 §5.1 落地：
+    - 仅本校人员（Person.school 必须等于球队所属学校），杜绝跨校选人；
+    - 仅 audit_status=APPROVED 的运动员进入候选池；
     - 排除本队现役成员（R2 前置；EXITED 历史行可重新加入）；
-    - 上限 20 沿用 persons search_people 保护上限；maskedIdNumber 检索
-      为 mock 演示逻辑，persons 域已裁定不照搬，此处同样不实现。
+    - 关键词同时匹配姓名与身份证后四位（掩码末四位即原证件末四位）；
+    - 上限 20 沿用 persons search_people 保护上限。响应仍为 Person[]，
+      不新增 hasMore 字段以免破坏既有前端契约（超限时前端提示缩小关键词）。
     """
     from apps.persons.schemas import person_out
     from apps.persons.services import people_queryset
 
     team = _team_or_404(team_id)
     ensure_team_visible(account, team)
-    queryset = people_queryset().filter(athlete_profile_exists=True)
+    queryset = people_queryset().filter(
+        athlete_profile_exists=True,
+        school_id=team.school_id,
+        audit_status=enums.AuditStatus.APPROVED,
+    )
     term = (keyword or "").strip()
     if term:
-        queryset = queryset.filter(full_name__icontains=term)
+        queryset = queryset.filter(
+            Q(full_name__icontains=term) | Q(id_card_masked__endswith=term)
+        )
     current_ids = TeamMember.objects.filter(
         team=team, status=enums.RelationStatus.CURRENT
     ).values_list("person_id", flat=True)
@@ -630,6 +638,18 @@ def member_add(team_id: str, payload: dict, account) -> TeamMember:
         raise ApiError(NOT_FOUND, "运动员不存在或已删除")
     if not AthleteProfile.objects.filter(person=person).exists():
         raise ApiError(STATE_CONFLICT, "该人员不具备运动员身份，不能加入球队名单")
+    if person.audit_status != enums.AuditStatus.APPROVED:
+        raise ApiError(
+            STATE_CONFLICT,
+            "该运动员档案尚未审核通过，不能加入球队名单",
+            field_errors([("athleteId", "档案状态非 APPROVED")]),
+        )
+    if person.school_id != team.school_id:
+        raise ApiError(
+            STATE_CONFLICT,
+            "该运动员不属于球队所属学校，请先走转校流程",
+            field_errors([("athleteId", "跨校人员禁止直接加入")]),
+        )
     with transaction.atomic():
         if TeamMember.objects.filter(
             team=team,

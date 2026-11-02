@@ -170,6 +170,16 @@ class PersonReviewBody(StrictSchema):
     version: int = Field(ge=0)
 
 
+class PersonSubmitBody(StrictSchema):
+    """学校提交档案复核（POST /people/{id}/submit）。
+
+    建档权限下沉学校后，学校录入的 DRAFT 必须由学校提交进入 PENDING，
+    否则学校侧没有把 DRAFT 转交审核的入口；version 必填乐观锁。
+    """
+
+    version: int = Field(ge=0)
+
+
 class DossierSearchBody(StrictSchema):
     """POST /selection-dossiers/search 请求体（接口文档 §6.8 dossierSearch + §7 DossierSearch）。
 
