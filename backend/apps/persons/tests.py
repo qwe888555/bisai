@@ -4254,8 +4254,9 @@ class DossierApiTests(TestCase):
     - 检索资格：文档 L4708 仅运动员档案（AthleteProfile 行存在）；
     - athlete 复用 person_out（脱敏同源）、teams 复用 list_own_teams 现役
       正式关系（EXITED 不并入）、materials 复用 material_list/material_out
-      （未软删）；enrollments/matchRecords 契约可选 + 读模型未落地 → 空数组；
-    - eventId/groupId 行为契约未规定（D-A 待决策）→ 非空 400 明确未开放。
+      （未软删）；
+    - 详情聚合报名记录、球队近期比赛、初选/复选评分；检索列表不逐行聚合；
+    - eventId/groupId 按已通过报名名单收窄，与遴选候选人口径一致。
     """
 
     SEARCH = "/api/v1/selection-dossiers/search"
@@ -4408,6 +4409,75 @@ class DossierApiTests(TestCase):
             remark="已删材料",
         )
 
+        # 档案聚合新数据源：报名、组别、比赛、遴选评分
+        from apps.enrollments.models import (
+            STATUS_APPROVED,
+            Enrollment,
+            RosterItem,
+        )
+        from apps.events.models import Event, EventGroup, Match
+        from selection.models import Score, ScoreTemplate
+
+        now = timezone.now()
+        cls.event = Event.objects.create(
+            id="evt_dossier",
+            name="2026 遴选测试赛",
+            season="2026",
+            registration_opens_at=now - timedelta(days=10),
+            registration_closes_at=now + timedelta(days=10),
+        )
+        cls.group = EventGroup.objects.create(
+            id="grp_dossier",
+            event=cls.event,
+            name="小学男子组",
+            category="PRIMARY",
+            gender="MALE",
+            max_players=18,
+        )
+        cls.enrollment = Enrollment.objects.create(
+            id="enr_dossier",
+            event_id=cls.event.pk,
+            group_id=cls.group.pk,
+            team_id=str(cls.team_a.pk),
+            subject_type="SCHOOL_TEAM",
+            status=STATUS_APPROVED,
+            contact_name="王老师",
+        )
+        RosterItem.objects.create(
+            id="rst_dossier",
+            enrollment=cls.enrollment,
+            athlete_id=str(cls.athlete.pk),
+            athlete_name="王候选",
+            position="前锋",
+        )
+        cls.match = Match.objects.create(
+            id="match_dossier",
+            event_id=cls.event.pk,
+            group_id=cls.group.pk,
+            home_team_id=str(cls.team_a.pk),
+            away_team_id=str(cls.team_b.pk),
+            kickoff_at=now - timedelta(days=1),
+            status="FINISHED",
+            home_score=2,
+            away_score=1,
+        )
+        cls.template = ScoreTemplate.objects.create(
+            name="小学组初选模板",
+            group_type="PRIMARY",
+            score_round="INITIAL",
+        )
+        cls.score = Score.objects.create(
+            event_id=cls.event.pk,
+            group_type="PRIMARY",
+            score_round="INITIAL",
+            template=cls.template,
+            candidate_id=str(cls.athlete.pk),
+            candidate_name="王候选",
+            team_name="乙二A队",
+            player_position="前锋",
+            total_score="88.50",
+        )
+
     # ------------------------------------------------------------ 请求工具
 
     @staticmethod
@@ -4479,13 +4549,16 @@ class DossierApiTests(TestCase):
                 "materials",
                 "enrollments",
                 "matchRecords",
+                "scores",
                 "version",
                 "createdAt",
                 "updatedAt",
             ):
                 self.assertIn(key, item)
-            self.assertEqual(item["enrollments"], [])  # 报名读模型未落地
-            self.assertEqual(item["matchRecords"], [])  # 比赛读模型未落地
+            # 检索列表不逐行聚合，避免 N+1；详情接口返回完整数据
+            self.assertEqual(item["enrollments"], [])
+            self.assertEqual(item["matchRecords"], [])
+            self.assertEqual(item["scores"], [])
             self.assertNotIn("idNumber", item["athlete"])  # 证件号永不回显
 
     def test_search_filter_by_name(self):
@@ -4531,13 +4604,24 @@ class DossierApiTests(TestCase):
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.json()["data"]["total"], 0)  # 仅 EXITED 历史 → 不命中
 
-    def test_search_rejects_event_and_group_filters(self):
-        """eventId/groupId 契约未规定过滤行为（D-A 待决策）→ 非空 400 明确
-        未开放，不默认空集、不虚构过滤语义。"""
-        for payload in ({"eventId": "EV1"}, {"groupId": "G1"}):
+    def test_search_filter_by_event_and_group(self):
+        """eventId/groupId 按已通过报名名单收窄，与遴选候选人口径一致。"""
+        for payload in (
+            {"eventId": self.event.pk},
+            {"groupId": self.group.pk},
+            {"eventId": self.event.pk, "groupId": self.group.pk},
+        ):
             resp = self._post(self.SEARCH, payload, token=self.admin_token)
-            self.assertEqual(resp.status_code, 400)
-            self.assertEqual(resp.json()["code"], "INVALID_ARGUMENT")
+            self.assertEqual(resp.status_code, 200)
+            body = resp.json()["data"]
+            self.assertEqual(body["total"], 1)
+            self.assertEqual(body["items"][0]["id"], str(self.athlete.pk))
+
+        resp = self._post(
+            self.SEARCH, {"eventId": "evt_unknown"}, token=self.admin_token
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["data"]["total"], 0)
 
     def test_search_pagination_and_order(self):
         resp = self._post(
@@ -4562,7 +4646,7 @@ class DossierApiTests(TestCase):
 
     def test_get_aggregates_from_existing_relations(self):
         """聚合与库内实际关系一致：athlete 脱敏、teams 仅现役、materials
-        未软删、enrollments/matchRecords 空数组（读模型未落地）。"""
+        未软删；报名、比赛、遴选评分均来自现有业务表。"""
         resp = self._get(
             f"{self.GET_BASE}/{self.athlete.pk}", token=self.admin_token
         )
@@ -4589,9 +4673,31 @@ class DossierApiTests(TestCase):
         self.assertEqual(material["fileName"], "证书.pdf")
         self.assertEqual(material["ownerType"], "PERSON")
 
-        # 报名/比赛读模型未落地：契约可选字段空数组（非伪造记录）
-        self.assertEqual(dossier["enrollments"], [])
-        self.assertEqual(dossier["matchRecords"], [])
+        # 报名记录：复用报名域摘要，并补充组别类型供前端跳转评分
+        self.assertEqual(len(dossier["enrollments"]), 1)
+        enrollment = dossier["enrollments"][0]
+        self.assertEqual(enrollment["id"], self.enrollment.pk)
+        self.assertEqual(enrollment["eventName"], self.event.name)
+        self.assertEqual(enrollment["groupName"], self.group.name)
+        self.assertEqual(enrollment["teamName"], self.team_a.name)
+        self.assertEqual(enrollment["status"], "APPROVED")
+        self.assertEqual(enrollment["groupType"], "PRIMARY")
+        self.assertEqual(enrollment["groupTypeLabel"], "小学组")
+
+        # 比赛记录：报名球队参加的比赛
+        self.assertEqual(len(dossier["matchRecords"]), 1)
+        self.assertEqual(dossier["matchRecords"][0]["id"], self.match.pk)
+        self.assertEqual(dossier["matchRecords"][0]["homeScore"], 2)
+
+        # 遴选评分：初选在前，带模板名与总分
+        self.assertEqual(len(dossier["scores"]), 1)
+        score = dossier["scores"][0]
+        self.assertEqual(score["round"], "INITIAL")
+        self.assertEqual(score["roundLabel"], "初选")
+        self.assertEqual(score["groupType"], "PRIMARY")
+        self.assertEqual(score["templateName"], "小学组初选模板")
+        self.assertEqual(score["totalScore"], 88.5)
+        self.assertEqual(score["eventId"], self.event.pk)
 
         # version：B4 微秒派生（person_version 同源）
         expected_version = int(
@@ -4620,14 +4726,31 @@ class DossierApiTests(TestCase):
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.json()["data"]["total"], 0)
 
-    def test_get_rejects_event_id_filter(self):
+    def test_get_event_id_narrows_aggregates_only(self):
+        """eventId 不用来定位档案，只收窄报名/比赛/评分。"""
         resp = self._get(
             f"{self.GET_BASE}/{self.athlete.pk}",
             token=self.admin_token,
-            query={"eventId": "EV1"},
+            query={"eventId": self.event.pk},
         )
-        self.assertEqual(resp.status_code, 400)
-        self.assertEqual(resp.json()["code"], "INVALID_ARGUMENT")
+        self.assertEqual(resp.status_code, 200)
+        dossier = resp.json()["data"]
+        self.assertEqual(dossier["id"], str(self.athlete.pk))
+        self.assertEqual(len(dossier["enrollments"]), 1)
+        self.assertEqual(len(dossier["matchRecords"]), 1)
+        self.assertEqual(len(dossier["scores"]), 1)
+
+        resp = self._get(
+            f"{self.GET_BASE}/{self.athlete.pk}",
+            token=self.admin_token,
+            query={"eventId": "evt_unknown"},
+        )
+        self.assertEqual(resp.status_code, 200)
+        dossier = resp.json()["data"]
+        self.assertEqual(dossier["id"], str(self.athlete.pk))
+        self.assertEqual(dossier["enrollments"], [])
+        self.assertEqual(dossier["matchRecords"], [])
+        self.assertEqual(dossier["scores"], [])
 
 
 class P0UnifiedFlowTests(TestCase):

@@ -186,9 +186,8 @@ class DossierSearchBody(StrictSchema):
     - idNumber：受控检索（文档 L4713"服务端加密并生成查重索引；不回显到响应
       与日志"）→ 服务层 lookup_hash 精确匹配（与 create_person 写链同款），
       响应仅 maskedIdNumber；
-    - eventId/groupId：契约仅定义"内部ID"参数、未规定筛选行为，报名/比赛读
-      模型未落地（冻结 22 表无此域）→ 服务层遇非空值返回 400 明确未开放
-      （待决策项 D-A：不默认空集、不虚构过滤语义）；
+    - eventId/groupId：按已通过报名名单收窄（与遴选候选人口径一致），
+      不再拒绝非空值；
     - 检索资格：文档 L4708"仅运动员遴选档案受控检索，不允许借用教练员或
       其他人员过滤字段扩大数据范围"→ 服务层强制 AthleteProfile 行存在。
     """

@@ -817,7 +817,7 @@ def dossier_search(request, body: s.DossierSearchBody):
     page_size = min(max(payload.get("pageSize") or DEFAULT_PAGE_SIZE, 1), MAX_PAGE_SIZE)
     start = (page_number - 1) * page_size
     items = [
-        services.dossier_out(row, account)
+        services.dossier_out(row, account, include_aggregates=False)
         for row in queryset[start : start + page_size]
     ]
     # page() 已含完整信封（ok 包装），不再二次包装

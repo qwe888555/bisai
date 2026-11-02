@@ -1880,17 +1880,116 @@ def delete_person(person_id: str, request_version, account) -> None:
 
 # ---------------------------------------------------------------- 遴选档案聚合（§6.8，批次 D-1）
 
-def _reject_undeployed_event_filters(payload: dict) -> None:
-    """eventId/groupId 筛选行为待决策（D-A）：契约仅定义参数、未规定过滤规则，
-    报名/比赛读模型未落地（冻结 22 表无此域）。非空一律 400 明确拒绝，
-    不默认空集、不虚构过滤语义。"""
-    for name in ("eventId", "groupId"):
-        if (payload.get(name) or "").strip():
-            raise ApiError(
-                INVALID_ARGUMENT,
-                f"{name} 筛选依赖报名/比赛读模型，尚未开放（待决策项 D-A）",
-                field_errors([(name, "暂不支持")]),
-            )
+def _dossier_entry_queryset(person_id, event_id: Optional[str] = None):
+    """运动员的报名单：默认全部状态（档案展示履历），eventId 可收窄。"""
+    from apps.enrollments.models import Enrollment
+
+    queryset = Enrollment.objects.filter(
+        players__athlete_id=str(person_id)
+    ).distinct()
+    if event_id:
+        queryset = queryset.filter(event_id=str(event_id))
+    return queryset.order_by("-created_at", "-id")
+
+
+def _dossier_enrollments(person_id, event_id: Optional[str] = None) -> list[dict]:
+    """报名记录：复用 enrollments.to_summary，补充 groupType 供前端跳转评分。"""
+    from apps.enrollments.services import to_summary
+    from apps.events.models import EventGroup
+
+    rows = list(_dossier_entry_queryset(person_id, event_id))
+    groups = {
+        str(group.id): group
+        for group in EventGroup.objects.filter(
+            id__in={row.group_id for row in rows}
+        )
+    }
+    result = []
+    for row in rows:
+        data = to_summary(row)
+        group = groups.get(str(row.group_id))
+        data["groupType"] = group.category if group else None
+        data["groupTypeLabel"] = group.get_category_display() if group else ""
+        result.append(data)
+    return result
+
+
+def _dossier_team_ids(person_id, event_id: Optional[str] = None) -> list[str]:
+    """档案涉及球队：报名名单球队优先，没有报名时退回现役球队关系。"""
+    team_ids = set(
+        _dossier_entry_queryset(person_id, event_id).values_list(
+            "team_id", flat=True
+        )
+    )
+    if not team_ids:
+        team_ids = set(
+            TeamMember.objects.filter(
+                person_id=person_id,
+                status=enums.RelationStatus.CURRENT,
+            ).values_list("team_id", flat=True)
+        )
+    return [str(team_id) for team_id in team_ids]
+
+
+def _dossier_matches(person_id, event_id: Optional[str] = None) -> list[dict]:
+    """球队近期比赛：报名球队（或现役球队）参加的比赛，按开球时间倒序取 10 场。"""
+    from apps.events.models import Match
+    from apps.events.schemas import match_out
+
+    team_ids = _dossier_team_ids(person_id, event_id)
+    if not team_ids:
+        return []
+    queryset = Match.objects.filter(
+        Q(home_team_id__in=team_ids) | Q(away_team_id__in=team_ids)
+    )
+    if event_id:
+        queryset = queryset.filter(event_id=str(event_id))
+    return [
+        match_out(match)
+        for match in queryset.order_by("-kickoff_at", "-id")[:10]
+    ]
+
+
+def _dossier_scores(person_id, event_id: Optional[str] = None) -> list[dict]:
+    """遴选评分记录：candidate_id 与人员主键同源（主程序适配器已归一化）。
+
+    selection 应用未安装时静默返回空数组，保证人员域可独立测试。
+    """
+    try:
+        from selection.enums import GroupType, RoundType
+        from selection.models import Score
+    except ImportError:  # pragma: no cover - 主程序恒安装 selection
+        return []
+
+    queryset = Score.objects.select_related("template").filter(
+        candidate_id=str(person_id)
+    )
+    if event_id:
+        queryset = queryset.filter(event_id=str(event_id))
+    round_order = {RoundType.INITIAL: 0, RoundType.FINAL: 1}
+    scores = sorted(
+        queryset,
+        key=lambda score: (
+            round_order.get(score.score_round, 9),
+            -score.updated_at.timestamp(),
+        ),
+    )
+    return [
+        {
+            "id": score.pk,
+            "eventId": score.event_id,
+            "groupType": score.group_type,
+            "groupTypeLabel": GroupType.label(score.group_type),
+            "round": score.score_round,
+            "roundLabel": RoundType.label(score.score_round),
+            "templateId": str(score.template_id),
+            "templateName": score.template.name if score.template_id else "",
+            "totalScore": float(score.total_score),
+            "version": int(score.version or 0),
+            "updatedAt": score.updated_at,
+        }
+        for score in scores
+    ]
 
 
 def dossier_search_queryset(payload: dict, account) -> QuerySet:
@@ -1899,10 +1998,10 @@ def dossier_search_queryset(payload: dict, account) -> QuerySet:
     复用：people_queryset（软删排除+档案行注解）、apply_person_scope（一期仅
     ADMIN，D5 口径）、list_people 的 -id 排序先例、create_person 的
     lookup_hash 受控检索链路；teamId=现役 TeamMember 关系（CURRENT 口径同
-    /me/teams）。检索资格：文档 L4708"仅运动员遴选档案受控检索，不允许借用
+    /me/teams）；eventId/groupId=已通过报名名单（与遴选候选人口径一致）。
+    检索资格：文档 L4708"仅运动员遴选档案受控检索，不允许借用
     教练员或其他人员过滤字段扩大数据范围"→ 强制 athlete_profile_exists=True。
     """
-    _reject_undeployed_event_filters(payload)
     queryset = apply_person_scope(people_queryset(), account).filter(
         athlete_profile_exists=True
     )
@@ -1920,10 +2019,29 @@ def dossier_search_queryset(payload: dict, account) -> QuerySet:
                 status=enums.RelationStatus.CURRENT,
             ).values("person_id")
         )
+    event_id = (payload.get("eventId") or "").strip()
+    group_id = (payload.get("groupId") or "").strip()
+    if event_id or group_id:
+        from apps.enrollments.models import STATUS_APPROVED, RosterItem
+
+        roster = RosterItem.objects.filter(
+            enrollment__status=STATUS_APPROVED,
+            enrollment__deleted_at__isnull=True,
+        )
+        if event_id:
+            roster = roster.filter(enrollment__event_id=event_id)
+        if group_id:
+            roster = roster.filter(enrollment__group_id=group_id)
+        queryset = queryset.filter(pk__in=roster.values("athlete_id"))
     return queryset.order_by("-id")
 
 
-def dossier_out(person, account) -> dict:
+def dossier_out(
+    person,
+    account,
+    event_id: Optional[str] = None,
+    include_aggregates: bool = True,
+) -> dict:
     """Person(+注解列) → CandidateDossier（§7 L4692-4704）。
 
     - athlete：person_out（脱敏同源，idNumber 永不回显）；
@@ -1932,8 +2050,11 @@ def dossier_out(person, account) -> dict:
     - materials：materials.services.material_list(PERSON, ownerId)（批次 C
       未软删查询）+ materials.schemas.material_out（零第二套序列化）；逐行
       调用与 /me/teams 同款（pageSize≤100 已限，批量优化待数据量增长）；
-    - enrollments/matchRecords：报名/比赛读模型未落地，契约字段可选
-      （§7 L4700-4701 必填=否）→ 空数组=无读模型数据，非伪造记录；
+    - enrollments：报名记录（全部状态，含事件/组别/球队/审核状态/组别类型）；
+    - matchRecords：报名球队或现役球队的近期比赛（最多 10 场）；
+    - scores：该运动员的初选/复选评分记录（selection 应用同库时）；
+    - eventId：只收窄报名/比赛/评分，不影响档案本身；
+    - include_aggregates=False 供检索列表复用，避免逐行聚合造成 N+1；
     - id：person 主键字符串（无独立档案表，待决策项 D-B）；
     - version：person_version 微秒派生（B4 同款，待决策项 D-C）。
     """
@@ -1952,8 +2073,21 @@ def dossier_out(person, account) -> dict:
         "athlete": person_out(person),
         "teams": list_own_teams(person.pk),
         "materials": materials,
-        "enrollments": [],
-        "matchRecords": [],
+        "enrollments": (
+            _dossier_enrollments(person.pk, event_id)
+            if include_aggregates
+            else []
+        ),
+        "matchRecords": (
+            _dossier_matches(person.pk, event_id)
+            if include_aggregates
+            else []
+        ),
+        "scores": (
+            _dossier_scores(person.pk, event_id)
+            if include_aggregates
+            else []
+        ),
         "version": person_version(person),
         "createdAt": person.created_at,
         "updatedAt": person.updated_at,
@@ -1964,14 +2098,9 @@ def dossier_get(athlete_id: str, event_id: Optional[str], account) -> dict:
     """GET /selection-dossiers/{athleteId}（§6.8 L1758-1773）。
 
     非运动员（无 AthleteProfile 行）/软删/不存在 → 404（"仅运动员遴选档案"
-    资格口径同 dossier_search）；eventId 非空 → 400（D-A 待决策）。
+    资格口径同 dossier_search）；eventId 只收窄报名/比赛/评分，不用来
+    限制定位档案本人。
     """
-    if (event_id or "").strip():
-        raise ApiError(
-            INVALID_ARGUMENT,
-            "eventId 筛选依赖报名读模型，尚未开放（待决策项 D-A）",
-            field_errors([("eventId", "暂不支持")]),
-        )
     person = (
         apply_person_scope(people_queryset(), account)
         .filter(pk=parse_path_id(athlete_id), athlete_profile_exists=True)
@@ -1979,4 +2108,4 @@ def dossier_get(athlete_id: str, event_id: Optional[str], account) -> dict:
     )
     if person is None:
         raise ApiError(NOT_FOUND, "遴选档案不存在")
-    return dossier_out(person, account)
+    return dossier_out(person, account, event_id)
