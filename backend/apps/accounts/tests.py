@@ -202,6 +202,7 @@ class AuthFlowTests(AccountScopeTestBase):
         data = resp.json()["data"]
         self.assertEqual(data["username"], "scope-admin")
         self.assertEqual(data["orgId"], self.P.pk)
+        self.assertEqual(data["orgName"], "测试省")
         self.assertIn("api:accountList", data["permissions"])
         self.assertIn("api:organizationList", data["permissions"])
         menu_keys = {m["key"] for m in data["menus"]}
@@ -329,6 +330,14 @@ class DataScopeTests(AccountScopeTestBase):
         self.assertIn("scope-school", usernames)
         self.assertIn("scope-city-far", usernames)
         self.assertNotIn("scope-outsider", usernames)
+
+    def test_account_list_includes_org_name(self):
+        """2026-11-03 复测问题 3：账号列表输出组织名称，前端不再显示裸 orgId。"""
+        resp = self._get(f"{BASE}/accounts", token=self._login("scope-prov"))
+        self.assertEqual(resp.status_code, 200)
+        rows = {a["username"]: a for a in resp.json()["data"]["items"]}
+        self.assertEqual(rows["scope-school"]["orgName"], "测试学校")
+        self.assertEqual(rows["scope-school"]["orgId"], self.S.pk)
 
     def test_city_role_has_account_list_permission(self):
         """main 方案3 后反转断言：accountList 权限点含 CITY，市级 200（服务层仍按子树过滤）。"""
@@ -1007,10 +1016,12 @@ class PersonBindingTests(AccountScopeTestBase):
         self.assertEqual(invitation.person_id, str(self.person_a.pk))
 
     def test_invitation_without_person_rejected(self):
-        """改造说明 §4.1：personId 必填，缺失即 400，不落邀请。"""
+        """改造说明 §4.1：personId 必填，缺失即 400 且返回字段级错误。"""
         resp = self._invite("")
         self.assertEqual(resp.status_code, 400, resp.content)
         self.assertEqual(resp.json()["code"], "INVALID_ARGUMENT")
+        self.assertEqual(resp.json()["data"][0]["field"], "personId")
+        self.assertIn("人员档案", resp.json()["message"])
         self.assertFalse(RegistrationInvitation.objects.exists())
 
     def test_invitation_kind_mismatch_rejected(self):

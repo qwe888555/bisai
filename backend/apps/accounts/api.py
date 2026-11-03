@@ -126,6 +126,7 @@ def current_user(request):
         "displayName": actor.display_name,
         "roles": list(actor.roles or []),
         "orgId": actor.organization_id or "",
+        "orgName": actor.organization.name if actor.organization_id else None,
         "teamIds": list(actor.team_ids or []),
         "permissions": permissions_for(actor.roles),
         "menus": menus_for(actor.roles),

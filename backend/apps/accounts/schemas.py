@@ -52,7 +52,9 @@ class ChangePassword(StrictSchema):
 class InviteRequest(StrictSchema):
     kind: InviteKind
     # 改造说明 §4.1：邀请必须绑定人员档案，禁止再签发无档案账号。
-    personId: str = Field(min_length=1, max_length=64)
+    # 缺省空串交由服务层返回字段级错误（personId），避免只得到通用的
+    # “请求参数不合法”而无法定位表单字段（2026-11-03 复测问题 5）。
+    personId: str = Field(default="", max_length=64)
     orgId: str = Field(min_length=1, max_length=64)
     expiresInMinutes: int = Field(default=1440, ge=5, le=10080)
 
@@ -118,6 +120,7 @@ def account_out(account) -> dict:
         "displayName": account.display_name,
         "roles": list(account.roles or []),
         "orgId": account.organization_id or "",
+        "orgName": account.organization.name if account.organization_id else None,
         "teamIds": list(account.team_ids or []),
     }
     if account.person_id:

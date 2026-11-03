@@ -26,6 +26,7 @@ from django.utils import timezone
 from apps.common import crypto, enums
 from apps.common.enums import RegionLevel
 from apps.common.errors import (
+    BUSINESS_VALIDATION_FAILED,
     DATA_SCOPE_DENIED,
     DUPLICATE_RESOURCE,
     FORBIDDEN,
@@ -673,16 +674,22 @@ def coach_duties_map(person_ids: list) -> dict:
     }
 
 
-def search_people(keyword: str, account) -> list:
+def search_people(keyword: str, account, review_status: str = "APPROVED") -> list:
     """POST /people/search：{keyword} 按姓名包含匹配，返回数组（非分页）。
+
+    默认仅返回 APPROVED（2026-11-03 复测问题 1）：该接口服务于报名添加
+    运动员、球队教练添加、公示/刊物人员选择等下游选择器，草稿与驳回档案
+    不应被选入业务；需要其他状态时由调用方显式指定 reviewStatus。
 
     mock 的 slice(0, 20) 截断沿用作无分页检索的保护上限（C 类沿用项，
     如需调整待确认）。mock 按 maskedIdNumber 匹配为演示逻辑，不照搬。
     """
+    _check_enum(review_status, tuple(enums.AuditStatus.values), "reviewStatus")
     queryset = apply_person_scope(people_queryset(), account)
     term = (keyword or "").strip()
     if term:
         queryset = queryset.filter(full_name__icontains=term)
+    queryset = queryset.filter(audit_status=review_status)
     return list(queryset.order_by("-id")[:20])
 
 
@@ -1571,6 +1578,67 @@ def _assert_not_self_review(person, account) -> None:
         raise ApiError(FORBIDDEN, "不得审核自己创建或提交的人员档案")
 
 
+def _review_evidence(person_ids) -> dict:
+    """批量取创建/最近提交操作者（2026-11-03 复测问题 4 的 canReview 依据）。
+
+    与 _assert_not_self_review 同一证据口径（person.create + person.self_confirm，
+    仅 SUCCESS），但按人员 ID 批量查询，避免列表逐行 N+1；返回
+    {person_id: {"creator": (时间, 账号ID), "submitter": (时间, 账号ID)}}。
+    """
+    ids = [str(pk) for pk in person_ids]
+    if not ids:
+        return {}
+    entries = AuditLog.objects.filter(
+        object_type="Person",
+        object_id__in=ids,
+        outcome="SUCCESS",
+    ).filter(Q(action="person.create") | Q(action="person.self_confirm"))
+    evidence: dict[str, dict] = {}
+    for object_id, action, operator_id, created_at in entries.values_list(
+        "object_id", "action", "operator_account_id", "created_at"
+    ):
+        slot = "creator" if action == "person.create" else "submitter"
+        item = evidence.setdefault(object_id, {})
+        previous = item.get(slot)
+        if previous is None or created_at > previous[0]:
+            item[slot] = (created_at, operator_id or "")
+    return evidence
+
+
+def can_review_map(rows, account) -> dict:
+    """按行计算 canReview：有审核权限 + PENDING + 非本人创建/提交。
+
+    权限口径与 review_person 的 require("personReview") 一致（仅以角色判断，
+    不复制数据范围裁决）；数据范围由调用方查询链保证。缺审计日志时与
+    审核接口同口径放行（无证据可判），不因缺日志误隐藏按钮。
+    """
+    from apps.common.permissions import operation_roles
+
+    rows = list(rows)
+    result = {row.pk: False for row in rows}
+    account_id = getattr(account, "pk", "") or ""
+    if not account_id:
+        return result
+    if not set(getattr(account, "roles", ()) or ()) & set(
+        operation_roles("personReview")
+    ):
+        return result
+    evidence = _review_evidence([row.pk for row in rows])
+    for row in rows:
+        if row.audit_status != enums.AuditStatus.PENDING:
+            continue
+        item = evidence.get(str(row.pk), {})
+        creator_id = item.get("creator", (None, ""))[1]
+        submitter_id = item.get("submitter", (None, ""))[1]
+        if account_id not in (creator_id, submitter_id):
+            result[row.pk] = True
+    return result
+
+
+def can_review_person(person, account) -> bool:
+    return can_review_map([person], account).get(person.pk, False)
+
+
 def review_person(person_id: str, payload: dict, account):
     """POST /people/{id}/review（P0-2，2026-10-28）：学校端档案审核。
 
@@ -1633,7 +1701,7 @@ def review_person(person_id: str, payload: dict, account):
         reason = (payload.get("reason") or "").strip()
         if decision == "REJECT" and not reason:
             raise ApiError(
-                INVALID_ARGUMENT,
+                BUSINESS_VALIDATION_FAILED,
                 "驳回档案必须填写审核意见",
                 [{"field": "reason", "reason": "REJECT 时必填"}],
             )
