@@ -37,11 +37,11 @@ from . import services
 router = Router(tags=["events"])
 _auth = JWTAuth()
 
-# 管理端写操作：ADMIN / PROVINCE_REVIEWER
-register_operation("eventCreate", (ADMIN, PROVINCE_REVIEWER))
+# 管理端写操作：ADMIN / PROVINCE_REVIEWER / CITY（市州可发布本级赛事）
+register_operation("eventCreate", (ADMIN, PROVINCE_REVIEWER, CITY))
 register_operation("eventGet", ALL_ROLES)
-register_operation("eventUpdate", (ADMIN, PROVINCE_REVIEWER))
-register_operation("eventDelete", (ADMIN, PROVINCE_REVIEWER))
+register_operation("eventUpdate", (ADMIN, PROVINCE_REVIEWER, CITY))
+register_operation("eventDelete", (ADMIN, PROVINCE_REVIEWER, CITY))
 # 只读查询：比赛页/报名页筛选依赖，学校端、市州、球队都需读取
 _REFERENCE_READ_ROLES = (
     ADMIN,
@@ -57,10 +57,10 @@ register_operation("availableEvents", ALL_ROLES)
 # 组别只读：同赛事读取范围
 register_operation("eventGroupList", _REFERENCE_READ_ROLES)
 register_operation("eventGroupGet", _REFERENCE_READ_ROLES)
-# 组别管理端写操作
-register_operation("eventGroupCreate", (ADMIN, PROVINCE_REVIEWER))
-register_operation("eventGroupUpdate", (ADMIN, PROVINCE_REVIEWER))
-register_operation("eventGroupDelete", (ADMIN, PROVINCE_REVIEWER))
+# 组别管理端写操作（市州随赛事发布开放）
+register_operation("eventGroupCreate", (ADMIN, PROVINCE_REVIEWER, CITY))
+register_operation("eventGroupUpdate", (ADMIN, PROVINCE_REVIEWER, CITY))
+register_operation("eventGroupDelete", (ADMIN, PROVINCE_REVIEWER, CITY))
 # 报名可选组别：全角色
 register_operation("availableGroups", ALL_ROLES)
 
