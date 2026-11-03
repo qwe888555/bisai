@@ -441,6 +441,94 @@ class LivePost(SoftDeleteVersionedModel):
         return f"LivePost@{self.match_id}"
 
 
+# ---------------------------------------------------------------- 官方名次与奖项（P1-3，2026-11-02）
+
+# 与小组赛积分榜（standings，按已发布赛果实时推算）分工：本表承载赛事
+# 结束后由组委会录定的官方最终名次与奖项，人工确认，不从比赛自动推导。
+RANK_MEDALS = (
+    ("GOLD", "金牌"),
+    ("SILVER", "银牌"),
+    ("BRONZE", "铜牌"),
+)
+
+RANK_SOURCES = (
+    ("AUTO", "按积分榜推导"),
+    ("MANUAL", "人工录定"),
+)
+
+AWARD_TYPES = (
+    ("TOP_SCORER", "最佳射手"),
+    ("MVP", "最有价值球员"),
+    ("BEST_GOALKEEPER", "最佳门将"),
+    ("BEST_DEFENDER", "最佳后卫"),
+    ("FAIR_PLAY", "公平竞赛奖"),
+    ("OTHER", "其他奖项"),
+)
+
+
+class EventRanking(SoftDeleteVersionedModel):
+    """赛事官方最终名次：一支球队在赛事（可细分组别）中的官方名次。
+
+    唯一性（同赛事同组别同球队仅一行）由服务层校验，不用条件唯一索引
+    —— MySQL 不支持部分索引，软删行也不能占用唯一键。
+    """
+
+    id = models.CharField(primary_key=True, max_length=64)
+    event_id = models.CharField(max_length=64, db_index=True)
+    # 空串表示赛事整体名次（不按组别拆分）
+    group_id = models.CharField(max_length=64, blank=True, default="")
+    team_id = models.CharField(max_length=64, db_index=True)
+    # 官方名次从 1 开始；允许并列（同名次多行），故不做唯一约束
+    final_rank = models.PositiveIntegerField()
+    medal = models.CharField(max_length=10, choices=RANK_MEDALS, blank=True, default="")
+    source = models.CharField(
+        max_length=10, choices=RANK_SOURCES, default="MANUAL"
+    )
+    published = models.BooleanField(default=False)
+    published_at = models.DateTimeField(null=True, blank=True)
+    remark = models.CharField(max_length=500, blank=True, default="")
+
+    class Meta:
+        db_table = "events_event_ranking"
+        indexes = [
+            models.Index(fields=["event_id", "group_id"]),
+            models.Index(fields=["published"]),
+        ]
+        ordering = ["final_rank", "id"]
+
+    def __str__(self) -> str:  # pragma: no cover
+        return f"#{self.final_rank}@{self.event_id}"
+
+
+class EventAward(SoftDeleteVersionedModel):
+    """赛事官方奖项：个人或球队获奖记录，published 控制门户可见。"""
+
+    id = models.CharField(primary_key=True, max_length=64)
+    event_id = models.CharField(max_length=64, db_index=True)
+    group_id = models.CharField(max_length=64, blank=True, default="")
+    award_type = models.CharField(max_length=24, choices=AWARD_TYPES)
+    # 个人奖填运动员、球队奖（如公平竞赛）填球队；OTHER 奖项两者可同时为空
+    athlete_id = models.CharField(max_length=64, blank=True, default="")
+    team_id = models.CharField(max_length=64, blank=True, default="")
+    # 量化值展示：如最佳射手进球数「12球」，纯文本不参与计算
+    value = models.CharField(max_length=100, blank=True, default="")
+    published = models.BooleanField(default=False)
+    published_at = models.DateTimeField(null=True, blank=True)
+    remark = models.CharField(max_length=500, blank=True, default="")
+
+    class Meta:
+        db_table = "events_event_award"
+        indexes = [
+            models.Index(fields=["event_id", "group_id"]),
+            models.Index(fields=["award_type"]),
+            models.Index(fields=["published"]),
+        ]
+        ordering = ["award_type", "id"]
+
+    def __str__(self) -> str:  # pragma: no cover
+        return f"{self.award_type}@{self.event_id}"
+
+
 class LiveLink(SoftDeleteVersionedModel):
     """外部直播链接（视频流/直播平台），enabled 控制是否展示。"""
 

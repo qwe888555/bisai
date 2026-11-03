@@ -188,7 +188,15 @@ def _ask_model(question: str, documents: list[PolicyDocument]) -> Optional[str]:
         with httpx.Client(timeout=conf.AI_TIMEOUT_SECONDS) as client:
             response = client.post(
                 f"{conf.AI_BASE_URL.rstrip('/')}/chat/completions",
-                json={"model": conf.AI_MODEL, "messages": messages, "temperature": 0},
+                json={
+                    "model": conf.AI_MODEL,
+                    "messages": messages,
+                    "temperature": 0,
+                    # MiMo 是推理模型：不关 thinking 时推理会吃掉大半
+                    # completion 预算并拖长耗时，在 AI_TIMEOUT_SECONDS 内
+                    # 容易拿到空 content 而降级 UNAVAILABLE
+                    "thinking": {"type": "disabled"},
+                },
                 headers={"Authorization": f"Bearer {conf.AI_API_KEY}"},
             )
         if response.status_code >= 400:
@@ -245,7 +253,12 @@ def _ask_general(question: str) -> Optional[str]:
         with httpx.Client(timeout=conf.AI_TIMEOUT_SECONDS) as client:
             response = client.post(
                 f"{conf.AI_BASE_URL.rstrip('/')}/chat/completions",
-                json={"model": conf.AI_MODEL, "messages": messages, "temperature": 0.3},
+                json={
+                    "model": conf.AI_MODEL,
+                    "messages": messages,
+                    "temperature": 0.3,
+                    "thinking": {"type": "disabled"},
+                },
                 headers={"Authorization": f"Bearer {conf.AI_API_KEY}"},
             )
         if response.status_code >= 400:

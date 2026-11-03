@@ -1,4 +1,4 @@
-﻿"""events 业务逻辑：赛事与赛事组别的查询、创建、更新、软删除。
+"""events 业务逻辑：赛事与赛事组别的查询、创建、更新、软删除。
 
 规则集中在本层，视图只做权限校验与信封包装；写操作带乐观锁 version，
 删除为软删除，存在受保护历史关联时返回 409 STATE_CONFLICT，不级联破坏。
@@ -14,6 +14,7 @@ from django.utils.html import escape
 from apps.common.errors import (
     BUSINESS_VALIDATION_FAILED,
     FORBIDDEN,
+    INVALID_ARGUMENT,
     NOT_FOUND,
     STATE_CONFLICT,
     ApiError,
@@ -1620,3 +1621,255 @@ def public_list_live_links(match_id: str):
 
     public_get_match(match_id)
     return LiveLink.objects.filter(match_id=match_id, enabled=True).order_by("-created_at", "-id")
+
+
+# ---------------------------------------------------------------- 官方名次与奖项（P1-3，2026-11-02）
+#
+# 与 standings（小组赛按已发布赛果实时推算）分工：本节承载组委会录定的
+# 官方最终名次与奖项。唯一性（同赛事同组别同球队/同获奖人一行）在服务层
+# 校验——MySQL 不支持部分唯一索引，且软删行不得占用唯一键。
+
+def _ranking_queryset(event_id: str, group_id: Optional[str] = None, published_only: bool = False):
+    from .models import EventRanking
+
+    get_event(event_id)  # 赛事不存在/已删 → 404
+    qs = EventRanking.objects.filter(event_id=event_id)
+    if group_id:
+        qs = qs.filter(group_id=group_id)
+    if published_only:
+        qs = qs.filter(published=True)
+    return qs
+
+
+def list_rankings(event_id: str, group_id: Optional[str] = None, published_only: bool = False):
+    return _ranking_queryset(event_id, group_id, published_only)
+
+
+def get_ranking(ranking_id: str):
+    from .models import EventRanking
+
+    ranking = EventRanking.objects.filter(pk=ranking_id).first()
+    if ranking is None:
+        raise ApiError(NOT_FOUND)
+    return ranking
+
+
+def _ensure_ranking_unique(event_id: str, group_id: str, team_id: str, exclude_id: str = "") -> None:
+    from .models import EventRanking
+
+    qs = EventRanking.objects.filter(
+        event_id=event_id, group_id=group_id, team_id=team_id
+    )
+    if exclude_id:
+        qs = qs.exclude(pk=exclude_id)
+    if qs.exists():
+        raise ApiError(
+            STATE_CONFLICT,
+            "该球队在此赛事组别下已有官方名次",
+            [{"field": "teamId", "reason": "同赛事同组别同球队仅允许一行"}],
+        )
+
+
+def create_ranking(event_id: str, data: dict):
+    from .models import EventRanking, RANK_MEDALS
+
+    get_event(event_id)
+    medal = data.get("medal", "") or ""
+    if medal and medal not in {code for code, _ in RANK_MEDALS}:
+        raise ApiError(
+            INVALID_ARGUMENT,
+            "奖项牌面取值不合法",
+            [{"field": "medal", "reason": "须为 GOLD/SILVER/BRONZE 或留空"}],
+        )
+    group_id = data.get("groupId", "") or ""
+    team_id = data["teamId"]
+    _ensure_ranking_unique(event_id, group_id, team_id)
+    return EventRanking.objects.create(
+        id=new_id("rnk"),
+        event_id=event_id,
+        group_id=group_id,
+        team_id=team_id,
+        final_rank=int(data["finalRank"]),
+        medal=medal,
+        source="MANUAL",
+        published=False,
+        remark=data.get("remark", "") or "",
+    )
+
+
+def update_ranking(ranking_id: str, data: dict):
+    from .models import RANK_MEDALS
+
+    ranking = get_ranking(ranking_id)
+    check_version(ranking, data.get("version"))
+    medal = data.get("medal", "") or ""
+    if medal and medal not in {code for code, _ in RANK_MEDALS}:
+        raise ApiError(
+            INVALID_ARGUMENT,
+            "奖项牌面取值不合法",
+            [{"field": "medal", "reason": "须为 GOLD/SILVER/BRONZE 或留空"}],
+        )
+    group_id = data.get("groupId", "") or ""
+    _ensure_ranking_unique(
+        ranking.event_id, group_id, data["teamId"], exclude_id=ranking.pk
+    )
+    ranking.group_id = group_id
+    ranking.team_id = data["teamId"]
+    ranking.final_rank = int(data["finalRank"])
+    ranking.medal = medal
+    ranking.remark = data.get("remark", "") or ""
+    bump(ranking)
+    ranking.save()
+    return ranking
+
+
+def delete_ranking(ranking_id: str, version: int):
+    ranking = get_ranking(ranking_id)
+    check_version(ranking, version)
+    ranking.deleted_at = timezone.now()
+    bump(ranking)
+    ranking.save()
+    return ranking
+
+
+def set_ranking_published(ranking_id: str, version: int, published: bool):
+    ranking = get_ranking(ranking_id)
+    check_version(ranking, version)
+    ranking.published = published
+    if published:
+        ranking.published_at = timezone.now()
+    bump(ranking)
+    ranking.save()
+    return ranking
+
+
+def _award_queryset(event_id: str, group_id: Optional[str] = None, published_only: bool = False):
+    from .models import EventAward
+
+    get_event(event_id)
+    qs = EventAward.objects.filter(event_id=event_id)
+    if group_id:
+        qs = qs.filter(group_id=group_id)
+    if published_only:
+        qs = qs.filter(published=True)
+    return qs
+
+
+def list_awards(event_id: str, group_id: Optional[str] = None, published_only: bool = False):
+    return _award_queryset(event_id, group_id, published_only)
+
+
+def get_award(award_id: str):
+    from .models import EventAward
+
+    award = EventAward.objects.filter(pk=award_id).first()
+    if award is None:
+        raise ApiError(NOT_FOUND)
+    return award
+
+
+def _validate_award(data: dict) -> None:
+    from .models import AWARD_TYPES
+
+    award_type = data["awardType"]
+    if award_type not in {code for code, _ in AWARD_TYPES}:
+        raise ApiError(
+            INVALID_ARGUMENT,
+            "奖项类型取值不合法",
+            [{"field": "awardType", "reason": "须为已登记的奖项类型"}],
+        )
+    if award_type != "OTHER" and not (
+        (data.get("athleteId") or "").strip() or (data.get("teamId") or "").strip()
+    ):
+        raise ApiError(
+            INVALID_ARGUMENT,
+            "该奖项需指明获奖运动员或球队",
+            [{"field": "athleteId", "reason": "个人奖填 athleteId，球队奖填 teamId"}],
+        )
+
+
+def _ensure_award_unique(event_id: str, group_id: str, data: dict, exclude_id: str = "") -> None:
+    from .models import EventAward
+
+    qs = EventAward.objects.filter(
+        event_id=event_id,
+        group_id=group_id,
+        award_type=data["awardType"],
+        athlete_id=data.get("athleteId", "") or "",
+        team_id=data.get("teamId", "") or "",
+    )
+    if exclude_id:
+        qs = qs.exclude(pk=exclude_id)
+    if qs.exists():
+        raise ApiError(
+            STATE_CONFLICT,
+            "该获奖对象在此赛事组别下已有同类型奖项",
+            [{"field": "awardType", "reason": "同赛事同组别同对象同类型仅允许一行"}],
+        )
+
+
+def create_award(event_id: str, data: dict):
+    from .models import EventAward
+
+    get_event(event_id)
+    _validate_award(data)
+    group_id = data.get("groupId", "") or ""
+    _ensure_award_unique(event_id, group_id, data)
+    return EventAward.objects.create(
+        id=new_id("awd"),
+        event_id=event_id,
+        group_id=group_id,
+        award_type=data["awardType"],
+        athlete_id=data.get("athleteId", "") or "",
+        team_id=data.get("teamId", "") or "",
+        value=data.get("value", "") or "",
+        published=False,
+        remark=data.get("remark", "") or "",
+    )
+
+
+def update_award(award_id: str, data: dict):
+    award = get_award(award_id)
+    check_version(award, data.get("version"))
+    _validate_award(data)
+    group_id = data.get("groupId", "") or ""
+    _ensure_award_unique(award.event_id, group_id, data, exclude_id=award.pk)
+    award.group_id = group_id
+    award.award_type = data["awardType"]
+    award.athlete_id = data.get("athleteId", "") or ""
+    award.team_id = data.get("teamId", "") or ""
+    award.value = data.get("value", "") or ""
+    award.remark = data.get("remark", "") or ""
+    bump(award)
+    award.save()
+    return award
+
+
+def delete_award(award_id: str, version: int):
+    award = get_award(award_id)
+    check_version(award, version)
+    award.deleted_at = timezone.now()
+    bump(award)
+    award.save()
+    return award
+
+
+def set_award_published(award_id: str, version: int, published: bool):
+    award = get_award(award_id)
+    check_version(award, version)
+    award.published = published
+    if published:
+        award.published_at = timezone.now()
+    bump(award)
+    award.save()
+    return award
+
+
+def public_official_results(event_id: str, group_id: Optional[str] = None) -> dict:
+    """门户成绩页一次性取回已发布的官方名次与奖项（免登录）。"""
+    return {
+        "rankings": list(
+            _ranking_queryset(event_id, group_id, published_only=True)
+        ),
+        "awards": list(_award_queryset(event_id, group_id, published_only=True)),
+    }

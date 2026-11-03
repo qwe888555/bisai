@@ -4307,6 +4307,156 @@ class MyProfileApiTests(TestCase):
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.json()["data"], [])
 
+    # ---- GET /me/competitions（2026-11-02 P0-4）----
+
+    ME_COMPETITIONS = "/api/v1/me/competitions"
+
+    def _seed_competition(self):
+        """构造：本人名册 1 条 + 已结束/未开赛各 1 场 + 进球/黄/红事件。
+
+        统计口径见 services.list_own_competitions：只计本人所属球队在
+        status=FINISHED 的比赛；事件按 athlete_id 精确归属，不按球队姓名匹配。
+        """
+        from apps.enrollments.models import Enrollment, RosterItem
+        from apps.events.models import Event, Match, MatchEvent
+
+        event = Event.objects.create(
+            id="evt_me_comp",
+            name="甲省青少年足球联赛",
+            season="2026",
+            event_category="PROVINCIAL_LEAGUE",
+            registration_opens_at=timezone.now(),
+            registration_closes_at=timezone.now() + timedelta(days=7),
+            status="RUNNING",
+        )
+        enrollment = Enrollment.objects.create(
+            id="enr_me_comp",
+            event_id=event.pk,
+            group_id="grp_me_u15",
+            team_id=str(self.team_main.pk),
+            subject_type="SCHOOL_TEAM",
+            status="APPROVED",
+            contact_name="张老师",
+            created_by="acc_test",
+        )
+        RosterItem.objects.create(
+            id="rst_me_comp",
+            enrollment=enrollment,
+            athlete_id=str(self.athlete.pk),
+            athlete_name="张小明",
+            jersey_number=9,
+        )
+        finished = Match.objects.create(
+            id="mch_me_comp_finished",
+            event_id=event.pk,
+            group_id="grp_me_u15",
+            home_team_id=str(self.team_main.pk),
+            away_team_id="88",
+            kickoff_at=timezone.now() - timedelta(days=1),
+            status="FINISHED",
+            home_score=2,
+            away_score=1,
+            result_published=True,
+        )
+        scheduled = Match.objects.create(
+            id="mch_me_comp_scheduled",
+            event_id=event.pk,
+            group_id="grp_me_u15",
+            home_team_id="88",
+            away_team_id=str(self.team_main.pk),
+            kickoff_at=timezone.now() + timedelta(days=1),
+            status="SCHEDULED",
+        )
+        MatchEvent.objects.create(
+            id="mev_me_goal",
+            match_id=finished.pk,
+            event_type="GOAL",
+            minute=10,
+            team_id=str(self.team_main.pk),
+            scorer_athlete_id=str(self.athlete.pk),
+        )
+        MatchEvent.objects.create(
+            id="mev_me_yellow",
+            match_id=finished.pk,
+            event_type="PENALTY",
+            minute=30,
+            team_id=str(self.team_main.pk),
+            athlete_id=str(self.athlete.pk),
+            penalty_type="YELLOW_CARD",
+        )
+        MatchEvent.objects.create(
+            id="mev_me_red",
+            match_id=finished.pk,
+            event_type="PENALTY",
+            minute=70,
+            team_id=str(self.team_main.pk),
+            athlete_id=str(self.athlete.pk),
+            penalty_type="RED_CARD",
+        )
+        # 他人红牌、未开赛比赛进球：均不得计入本人
+        MatchEvent.objects.create(
+            id="mev_me_red_other",
+            match_id=finished.pk,
+            event_type="PENALTY",
+            minute=80,
+            team_id=str(self.team_main.pk),
+            athlete_id="10086",
+            penalty_type="RED_CARD",
+        )
+        MatchEvent.objects.create(
+            id="mev_me_goal_scheduled",
+            match_id=scheduled.pk,
+            event_type="GOAL",
+            minute=5,
+            team_id=str(self.team_main.pk),
+            scorer_athlete_id=str(self.athlete.pk),
+        )
+        return event
+
+    def test_my_competitions_missing_token_returns_401(self):
+        resp = self.client.get(self.ME_COMPETITIONS)
+        self.assertEqual(resp.status_code, 401)
+        self.assertEqual(resp.json()["code"], "UNAUTHENTICATED")
+
+    def test_my_competitions_unbound_account_returns_404(self):
+        resp = self.client.get(
+            self.ME_COMPETITIONS, **self._auth(self.unbound_token)
+        )
+        self.assertEqual(resp.status_code, 404)
+        self.assertEqual(resp.json()["code"], "NOT_FOUND")
+
+    def test_my_competitions_university_role_forbidden(self):
+        resp = self.client.get(self.ME_COMPETITIONS, **self._auth(self.uni_token))
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json()["code"], "FORBIDDEN")
+
+    def test_my_competitions_athlete_aggregates_finished_matches(self):
+        event = self._seed_competition()
+        resp = self.client.get(
+            self.ME_COMPETITIONS, **self._auth(self.athlete_token)
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["code"], "OK")
+        rows = resp.json()["data"]
+        self.assertEqual(len(rows), 1, rows)
+        row = rows[0]
+        self.assertEqual(row["eventId"], event.pk)
+        self.assertEqual(row["eventName"], "甲省青少年足球联赛")
+        self.assertEqual(row["teamId"], str(self.team_main.pk))
+        self.assertEqual(row["teamName"], "甲一小男足一队")
+        self.assertEqual(row["groupIds"], ["grp_me_u15"])
+        # 未开赛比赛不计场次与进球；他人红牌不计
+        self.assertEqual(row["appearances"], 1)
+        self.assertEqual(row["goals"], 1)
+        self.assertEqual(row["yellowCards"], 1)
+        self.assertEqual(row["redCards"], 1)
+
+    def test_my_competitions_empty_when_no_roster(self):
+        """教练无报名名册 → 空数组（200），不因无数据 404。"""
+        resp = self.client.get(self.ME_COMPETITIONS, **self._auth(self.coach_token))
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["data"], [])
+
 
 class DossierApiTests(TestCase):
     """§6.8 档案聚合（批次 D-1）：POST /selection-dossiers/search、

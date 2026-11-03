@@ -1,14 +1,22 @@
 """政策问答 AI_ENABLED=false 显式单测（2026-10-29 成员4专项修复⑧）。
 
 只覆盖 DISABLED 降级路径，不改配置默认值、不动业务代码：
-- 默认关闭时 answer() 返回 DISABLED + 政策原文兜底（不调模型、无网络依赖）；
+- 关闭时 answer() 返回 DISABLED + 政策原文兜底（不调模型、无网络依赖）；
 - 无已发布政策时兜底列表为空；
 - 个人信息拦截先于 DISABLED 生效（身份证/手机号拒绝外发）。
+
+配置开关（2026-11-02）：AI_* 由 conf 在模块导入时读定为常量，
+override_settings 改不到它——部署机 .env 一旦开 AI_ENABLED=true，
+旧写法会让本类测试打到真实模型接口（实测 74s 且断言失效）。
+故直接 patch conf.AI_ENABLED，测试与本机 .env 解耦。
 """
 
-from django.test import TestCase, override_settings
+from unittest.mock import patch
+
+from django.test import TestCase
 from django.utils import timezone
 
+from apps.common import conf
 from apps.common.errors import ApiError
 from apps.policyqa.models import PolicyDocument
 from apps.policyqa.services import answer
@@ -27,8 +35,13 @@ def _enabled_document(title="省级足球赛事报名办法"):
     )
 
 
-@override_settings(AI_ENABLED=False)
 class DisabledAnswerTests(TestCase):
+    # 覆盖 conf 常量而非 settings：见模块 docstring
+    def setUp(self):
+        patcher = patch.object(conf, "AI_ENABLED", False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_disabled_returns_status_and_fallback(self):
         document = _enabled_document()
         result = answer("报名需要什么条件")
