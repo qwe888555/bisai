@@ -1016,10 +1016,10 @@ class PersonBindingTests(AccountScopeTestBase):
         self.assertEqual(invitation.person_id, str(self.person_a.pk))
 
     def test_invitation_without_person_rejected(self):
-        """改造说明 §4.1：personId 必填，缺失即 400 且返回字段级错误。"""
+        """改造说明 §4.1：personId 必填，缺失按 422 业务校验失败返回字段级错误。"""
         resp = self._invite("")
-        self.assertEqual(resp.status_code, 400, resp.content)
-        self.assertEqual(resp.json()["code"], "INVALID_ARGUMENT")
+        self.assertEqual(resp.status_code, 422, resp.content)
+        self.assertEqual(resp.json()["code"], "BUSINESS_VALIDATION_FAILED")
         self.assertEqual(resp.json()["data"][0]["field"], "personId")
         self.assertIn("人员档案", resp.json()["message"])
         self.assertFalse(RegistrationInvitation.objects.exists())
@@ -1330,7 +1330,11 @@ class InvitationBatchTests(AccountScopeTestBase):
         token = self._login("scope-admin")
         resp = self._post(
             f"{BASE}/accounts/registration-invitations",
-            {"kind": "ATHLETE", "orgId": self.P.pk},
+            {
+                "kind": "ATHLETE",
+                "orgId": self.P.pk,
+                "personId": str(self.person.pk),
+            },
             token=token,
         )
         self.assertEqual(resp.status_code, 400, resp.content)

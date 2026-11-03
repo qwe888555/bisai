@@ -221,8 +221,10 @@ def create_invitation(actor: Account, data: dict) -> dict[str, Any]:
     ensure_org_in_scope(actor, org.pk)
     person_id = (data.get("personId") or "").strip()
     if not person_id:
+        # 请求语法合法、缺的是业务必填项：按 422 业务校验失败返回，
+        # 与驳回缺 reason 等场景保持同一套错误码契约。
         raise ApiError(
-            INVALID_ARGUMENT,
+            BUSINESS_VALIDATION_FAILED,
             "邀请必须绑定人员档案",
             [{"field": "personId", "reason": "请先在人员管理中建档"}],
         )
