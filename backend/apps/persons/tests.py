@@ -1163,6 +1163,42 @@ class PeopleApiTests(TestCase):
         self.assertEqual(resp.status_code, 400)
         self.assertEqual(resp.json()["code"], "INVALID_ARGUMENT")
 
+    def test_search_defaults_to_approved_only(self):
+        """2026-11-03 复测问题 1：选择器默认不得返回待审/草稿档案。"""
+        resp = self._post(PEOPLE + "/search", {"keyword": "李"}, token=self.admin_token)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["data"], [])
+
+        resp = self._post(
+            PEOPLE + "/search",
+            {"keyword": "李", "reviewStatus": "PENDING"},
+            token=self.admin_token,
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(
+            [item["id"] for item in resp.json()["data"]], [str(self.coach.pk)]
+        )
+
+    def test_person_payloads_expose_can_review(self):
+        """2026-11-03 复测问题 4：ADMIN 无审核权限，列表/详情均不可审。"""
+        resp = self._get(PEOPLE, token=self.admin_token)
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(
+            all(item["canReview"] is False for item in resp.json()["data"]["items"])
+        )
+
+        resp = self._get(f"{PEOPLE}/{self.coach.pk}", token=self.admin_token)
+        self.assertEqual(resp.status_code, 200)
+        self.assertIs(resp.json()["data"]["canReview"], False)
+
+        resp = self._post(
+            PEOPLE + "/search",
+            {"keyword": "李", "reviewStatus": "PENDING"},
+            token=self.admin_token,
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertIs(resp.json()["data"][0]["canReview"], False)
+
     # ------------------------------------------------------------ 详情
 
     def test_get_person_detail_and_soft_deleted_404(self):
@@ -2955,6 +2991,33 @@ class PersonReviewTests(TestCase):
         # D1 口径：普通审核权限仅学校端（对齐 materialReview）。
         self.assertEqual(operation_roles("personReview"), ("UNIVERSITY",))
 
+    def test_can_review_map_pending_self_and_status(self):
+        """2026-11-03 复测问题 4：canReview 与审核接口同口径。"""
+        from apps.persons import services
+
+        result = services.can_review_map(
+            [self.p_pending_a, self.p_draft_a, self.p_approved_a], self.uni_a
+        )
+        self.assertIs(result[self.p_pending_a.pk], True)
+        self.assertIs(result[self.p_draft_a.pk], False)
+        self.assertIs(result[self.p_approved_a.pk], False)
+        # ADMIN 无 personReview 权限点，即使 PENDING 也不可审
+        admin_result = services.can_review_map([self.p_pending_a], self.admin)
+        self.assertIs(admin_result[self.p_pending_a.pk], False)
+        # 本人创建（最近一条 person.create 操作者为 uni_a）→ 不可审
+        AuditLog.objects.create(
+            id=f"log-self-review-{self.p_pending_a.pk}",
+            log_type="OPERATION",
+            operator_account_id=str(self.uni_a.pk),
+            action="person.create",
+            object_type="Person",
+            object_id=str(self.p_pending_a.pk),
+            outcome="SUCCESS",
+        )
+        self.assertIs(
+            services.can_review_person(self.p_pending_a, self.uni_a), False
+        )
+
     # ------------------------------------------------------------ 学校提交复核（§6）
 
     def _submit(self, person, token=None, version=None):
@@ -3097,13 +3160,14 @@ class PersonReviewTests(TestCase):
         self.assertIsNone(entry.changed_by)
 
     def test_review_reject_requires_reason(self):
-        """REJECT 未填 reason → 400，状态与留痕零变更。"""
+        """REJECT 未填 reason → 422 业务校验失败，状态与留痕零变更。"""
         resp = self._post(
             f"{PEOPLE}/{self.p_pending_a.pk}/review",
             self._body(self.p_pending_a, decision="REJECT"),
             token=self.uni_a_token,
         )
-        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.status_code, 422)
+        self.assertEqual(resp.json()["code"], "BUSINESS_VALIDATION_FAILED")
         self.p_pending_a.refresh_from_db()
         self.assertEqual(self.p_pending_a.audit_status, enums.AuditStatus.PENDING)
         self.assertFalse(self._audit_log(self.p_pending_a).exists())

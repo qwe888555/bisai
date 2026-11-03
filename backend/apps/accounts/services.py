@@ -600,12 +600,16 @@ def invitation_batch_csv(result: dict) -> tuple[bytes, str]:
 # ---------------------------------------------------------------- 账号
 
 def scoped_accounts(actor: Account):
+    # select_related：账号列表输出 orgName（2026-11-03 复测问题 3），
+    # 避免当前页逐行回查组织造成 N+1。
     if is_global_admin(actor):
-        return Account.objects.all()
+        return Account.objects.select_related("organization")
     scope = org_scope_ids(actor)
     if not scope:
-        return Account.objects.none()
-    return Account.objects.filter(organization_id__in=scope)
+        return Account.objects.none().select_related("organization")
+    return Account.objects.filter(organization_id__in=scope).select_related(
+        "organization"
+    )
 
 
 def list_accounts(actor: Account, filters: dict):

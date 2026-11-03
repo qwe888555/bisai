@@ -441,8 +441,13 @@ def people_list(
     total = queryset.count()
     rows = list(queryset[(page_number - 1) * page_size : page_number * page_size])
     duties = services.coach_duties_map([row.pk for row in rows])
+    can_review = services.can_review_map(rows, account)
     items = [
-        {**s.person_out(row), "coachDuties": duties.get(row.pk, [])}
+        {
+            **s.person_out(row),
+            "coachDuties": duties.get(row.pk, []),
+            "canReview": can_review.get(row.pk, False),
+        }
         for row in rows
     ]
     return page(items, page_number, page_size, total)
@@ -453,7 +458,7 @@ def people_list(
 )
 def people_search(request, body: s.PersonSearchBody):
     account = require("personSearch")
-    items = services.search_people(body.keyword, account)
+    items = services.search_people(body.keyword, account, body.reviewStatus)
     # 检索正文不入审计（文档：精确检索服务端不记正文），仅记操作发生
     audit_state(
         request,
@@ -462,7 +467,13 @@ def people_search(request, body: s.PersonSearchBody):
         summary="人员档案检索",
     )
     # 前端 personApi.search 类型为 Person[]（数组非分页），直接返回列表
-    return ok([s.person_out(item) for item in items])
+    can_review = services.can_review_map(items, account)
+    return ok(
+        [
+            {**s.person_out(item), "canReview": can_review.get(item.pk, False)}
+            for item in items
+        ]
+    )
 
 
 # ---------------------------------------------------------------- 批量导入（§3）
@@ -546,6 +557,7 @@ def people_get(request, person_id: str):
     person = services.get_person(person_id, account)
     data = s.person_out(person)
     data["coachQualification"] = services.coach_qualification(person)
+    data["canReview"] = services.can_review_person(person, account)
     return ok(data)
 
 
@@ -570,7 +582,12 @@ def people_review(request, person_id: str, body: s.PersonReviewBody):
         object_id=str(person.pk),
         summary=f"审核人员 {person.full_name}：{body.decision}",
     )
-    return ok(s.person_out(person))
+    return ok(
+        {
+            **s.person_out(person),
+            "canReview": services.can_review_person(person, account),
+        }
+    )
 
 
 # 建档权限下沉学校（人员档案与账号流程后端改造 §2.1/§6）：学校账号可为本校
@@ -595,7 +612,12 @@ def people_submit(request, person_id: str, body: s.PersonSubmitBody):
         object_id=str(person.pk),
         summary=f"提交人员 {person.full_name} 复核",
     )
-    return ok(s.person_out(person))
+    return ok(
+        {
+            **s.person_out(person),
+            "canReview": services.can_review_person(person, account),
+        }
+    )
 
 
 register_operation("personCreate", (ADMIN, UNIVERSITY))

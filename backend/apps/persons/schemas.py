@@ -152,9 +152,18 @@ def dict_item_out(item) -> dict:
 
 class PersonSearchBody(StrictSchema):
     """POST /people/search 正文：前端三处调用（PublicationsManageView L160、
-    TeamCoachesView L77、EnrollmentDetailView L253）均只传 keyword。"""
+    TeamCoachesView L77、EnrollmentDetailView L253）均只传 keyword。
+
+    reviewStatus 默认 APPROVED（2026-11-03 复测问题 1）：该接口用于下游
+    人员选择器，草稿/待审/驳回档案不应可选；人员管理页查看全状态走
+    GET /people?reviewStatus=…，需要指定其他状态时可显式传本字段。
+    """
 
     keyword: str = Field(min_length=1, max_length=50)
+    reviewStatus: Literal["DRAFT", "PENDING", "APPROVED", "REJECTED"] = Field(
+        default="APPROVED",
+        description="审核状态，默认仅返回已通过档案",
+    )
 
 
 class PersonReviewBody(StrictSchema):
