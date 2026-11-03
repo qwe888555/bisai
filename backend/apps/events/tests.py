@@ -459,3 +459,225 @@ class StandingsTests(TestCase):
         # 只统计已发布赛果的球队：A、B 两队在榜，C 队未发布比赛不入榜
         self.assertEqual(result["total"], 2)
         self.assertNotIn("C", {row["teamId"] for row in result["items"]})
+
+
+# ---------------------------------------------------------------- P1-3 官方名次与奖项（2026-11-02）
+
+import json
+
+from apps.accounts.models import Account
+from apps.common.authentication import issue_access_token, make_password
+from apps.common.errors import ApiError
+from apps.common.ids import new_account_id
+
+from .models import EventAward, EventRanking
+
+
+class OfficialResultServiceTests(TestCase):
+    """服务层：录定唯一性、发布可见性、软删与乐观锁。"""
+
+    def setUp(self):
+        self.event = _make_event()
+        self.group = EventGroup.objects.create(
+            id=new_id("grp"),
+            event=self.event,
+            name="小学男子组",
+            category="PRIMARY",
+            gender="MALE",
+            max_players=12,
+            required_material_types=[],
+        )
+
+    @staticmethod
+    def _rank_payload(team_id, rank, group_id="", medal=""):
+        return {
+            "teamId": team_id,
+            "finalRank": rank,
+            "groupId": group_id,
+            "medal": medal,
+            "remark": "",
+        }
+
+    def test_create_ranking_rejects_duplicate_team(self):
+        services.create_ranking(self.event.pk, self._rank_payload("T1", 1, medal="GOLD"))
+        with self.assertRaises(ApiError) as caught:
+            services.create_ranking(self.event.pk, self._rank_payload("T1", 2))
+        self.assertEqual(caught.exception.code, "STATE_CONFLICT")
+        # 同球队不同组别是另一行，不冲突
+        services.create_ranking(
+            self.event.pk, self._rank_payload("T1", 1, group_id=self.group.pk)
+        )
+        self.assertEqual(EventRanking.objects.filter(event_id=self.event.pk).count(), 2)
+
+    def test_ranking_ordered_by_final_rank(self):
+        for rank, team in ((3, "C"), (1, "A"), (2, "B")):
+            services.create_ranking(self.event.pk, self._rank_payload(team, rank))
+        rows = list(services.list_rankings(self.event.pk))
+        self.assertEqual([row.final_rank for row in rows], [1, 2, 3])
+
+    def test_public_results_only_published(self):
+        published = services.create_ranking(
+            self.event.pk, self._rank_payload("A", 1, medal="GOLD")
+        )
+        services.set_ranking_published(published.pk, published.version, True)
+        draft = services.create_ranking(self.event.pk, self._rank_payload("B", 2))
+        award = services.create_award(
+            self.event.pk,
+            {"awardType": "TOP_SCORER", "athleteId": "p1", "teamId": "",
+             "groupId": "", "value": "12球", "remark": ""},
+        )
+        services.set_award_published(award.pk, award.version, True)
+
+        result = services.public_official_results(self.event.pk)
+        self.assertEqual([row.team_id for row in result["rankings"]], ["A"])
+        self.assertEqual(len(result["awards"]), 1)
+        # 管理端列表含未发布行
+        self.assertEqual(len(services.list_rankings(self.event.pk)), 2)
+
+    def test_award_requires_subject_and_unique(self):
+        payload = {
+            "awardType": "MVP", "athleteId": "", "teamId": "",
+            "groupId": "", "value": "", "remark": "",
+        }
+        with self.assertRaises(ApiError) as caught:
+            services.create_award(self.event.pk, payload)
+        self.assertEqual(caught.exception.code, "INVALID_ARGUMENT")
+
+        payload["athleteId"] = "p1"
+        services.create_award(self.event.pk, payload)
+        with self.assertRaises(ApiError) as caught:
+            services.create_award(self.event.pk, payload)
+        self.assertEqual(caught.exception.code, "STATE_CONFLICT")
+        # OTHER 奖项不强制获奖对象
+        services.create_award(
+            self.event.pk,
+            {"awardType": "OTHER", "athleteId": "", "teamId": "",
+             "groupId": "", "value": "最佳组织奖", "remark": ""},
+        )
+
+    def test_delete_ranking_is_soft_and_stale_version_conflict(self):
+        ranking = services.create_ranking(self.event.pk, self._rank_payload("T1", 1))
+        with self.assertRaises(ApiError) as caught:
+            services.update_ranking(
+                ranking.pk, {**self._rank_payload("T1", 2), "version": 99}
+            )
+        self.assertEqual(caught.exception.code, "VERSION_CONFLICT")
+
+        services.delete_ranking(ranking.pk, ranking.version)
+        self.assertEqual(EventRanking.objects.filter(pk=ranking.pk).count(), 0)
+        self.assertEqual(EventRanking.all_objects.filter(pk=ranking.pk).count(), 1)
+
+
+class OfficialResultApiTests(TestCase):
+    """HTTP 层：角色权限、发布流转、门户只读聚合。"""
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.admin = Account.objects.create(
+            id=new_account_id(),
+            username="rank-admin",
+            display_name="管理员",
+            roles=["ADMIN"],
+            password=make_password("admin-pass-123"),
+            enabled=True,
+        )
+        cls.athlete = Account.objects.create(
+            id=new_account_id(),
+            username="rank-athlete",
+            display_name="运动员",
+            roles=["ATHLETE"],
+            password=make_password("athlete-pass-123"),
+            enabled=True,
+        )
+        cls.admin_token = issue_access_token(cls.admin)[0]
+        cls.athlete_token = issue_access_token(cls.athlete)[0]
+
+    def setUp(self):
+        self.event = _make_event()
+
+    @staticmethod
+    def _auth(token):
+        return {"HTTP_AUTHORIZATION": f"Bearer {token}"}
+
+    def _post(self, path, payload, token):
+        return self.client.post(
+            path, data=json.dumps(payload), content_type="application/json",
+            **self._auth(token),
+        )
+
+    def test_write_forbidden_for_athlete(self):
+        resp = self._post(
+            f"/api/v1/events/{self.event.pk}/rankings",
+            {"teamId": "T1", "finalRank": 1},
+            self.athlete_token,
+        )
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json()["code"], "FORBIDDEN")
+
+    def test_create_publish_and_public_visibility(self):
+        base = f"/api/v1/events/{self.event.pk}/rankings"
+        resp = self._post(
+            base, {"teamId": "T1", "finalRank": 1, "medal": "GOLD"}, self.admin_token
+        )
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()["data"]
+        self.assertFalse(body["published"])
+        self.assertEqual(body["source"], "MANUAL")
+
+        # 重复录入 → 409
+        dup = self._post(base, {"teamId": "T1", "finalRank": 2}, self.admin_token)
+        self.assertEqual(dup.status_code, 409)
+        self.assertEqual(dup.json()["code"], "STATE_CONFLICT")
+
+        # 发布后门户可见
+        pub = self._post(
+            f"/api/v1/rankings/{body['id']}/publish", {"version": body["version"]},
+            self.admin_token,
+        )
+        self.assertEqual(pub.status_code, 200)
+        self.assertTrue(pub.json()["data"]["published"])
+
+        public = self.client.get(f"/api/v1/public/events/{self.event.pk}/rankings")
+        self.assertEqual(public.status_code, 200)
+        data = public.json()["data"]
+        self.assertEqual(len(data["rankings"]), 1)
+        self.assertEqual(data["rankings"][0]["finalRank"], 1)
+        self.assertEqual(data["rankings"][0]["medal"], "GOLD")
+        # 公开投影不含内部字段
+        self.assertNotIn("version", data["rankings"][0])
+
+        # 下线后门户不再可见
+        down = self._post(
+            f"/api/v1/rankings/{body['id']}/unpublish",
+            {"version": pub.json()["data"]["version"]},
+            self.admin_token,
+        )
+        self.assertEqual(down.status_code, 200)
+        public = self.client.get(f"/api/v1/public/events/{self.event.pk}/rankings")
+        self.assertEqual(public.json()["data"]["rankings"], [])
+
+    def test_award_crud_over_http(self):
+        base = f"/api/v1/events/{self.event.pk}/awards"
+        resp = self._post(
+            base,
+            {"awardType": "TOP_SCORER", "athleteId": "p1", "value": "12球"},
+            self.admin_token,
+        )
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()["data"]
+        self.assertEqual(body["awardType"], "TOP_SCORER")
+
+        # 个人奖缺获奖对象 → 400（schema 层拒绝，awardType 合法但主体为空由服务层判）
+        empty = self._post(base, {"awardType": "MVP"}, self.admin_token)
+        self.assertEqual(empty.status_code, 400)
+
+        listed = self.client.get(base, **self._auth(self.admin_token))
+        self.assertEqual(listed.status_code, 200)
+        self.assertEqual(listed.json()["data"]["total"], 1)
+
+        removed = self.client.delete(
+            f"/api/v1/awards/{body['id']}?version={body['version']}",
+            **self._auth(self.admin_token),
+        )
+        self.assertEqual(removed.status_code, 200)
+        self.assertEqual(EventAward.objects.filter(pk=body["id"]).count(), 0)

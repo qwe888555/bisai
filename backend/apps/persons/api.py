@@ -791,6 +791,31 @@ def my_team_affiliations(request):
     return paginate_list(request, services.list_own_team_affiliations(person_id))
 
 
+# GET /me/competitions（2026-11-02 P0-4）：运动员个人参赛数据。个人页此前只有
+# /me/profile 与 /me/teams，「赛事 / 场次 / 进球 / 红黄牌」无接口可读——
+# /enrollments 对 ATHLETE 未注册权限点（403），前端只能按球队名称匹配公开赛果，
+# 重名或改名即漏匹配。本接口按 athlete_id 精确聚合（口径见 services
+# .list_own_competitions），数组直出，同 /me/teams 惯例。
+# 未绑定档案 → 404（对齐 myProfileGet 口径）；读接口不留审计。
+register_operation("myCompetitions", (ATHLETE, COACH))
+
+
+@router.get(
+    "/me/competitions",
+    auth=_auth,
+    response=EnvelopeOut,
+    summary="本人参赛数据（赛事/场次/进球/红黄牌）",
+)
+def my_competitions(request):
+    account = require("myCompetitions")
+    person_id = _own_person_id(account)
+    if not person_id:
+        raise ApiError(NOT_FOUND, "当前账号未绑定人员档案")
+    # dict 数组直出（EnvelopeOut.data=Any），字段口径见 services
+    # .list_own_competitions
+    return ok(services.list_own_competitions(person_id))
+
+
 # §6.8 档案聚合（批次 D-1）：文档角色 ADMIN/PROVINCE_REVIEWER（接口文档
 # L1740/L1762）；数据范围复用 apply_person_scope（非 ADMIN → 403
 # DATA_SCOPE_DENIED，D5 同口径，PROVINCE_REVIEWER 权限点通过但范围拒绝）。

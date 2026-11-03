@@ -565,6 +565,106 @@ def standing_row_out(row: dict) -> dict:
         "points": row["points"],
     }
 
+# ---------------------------------------------------------------- 官方名次与奖项（P1-3，2026-11-02）
+
+MedalCode = Literal["", "GOLD", "SILVER", "BRONZE"]
+AwardType = Literal[
+    "TOP_SCORER", "MVP", "BEST_GOALKEEPER", "BEST_DEFENDER", "FAIR_PLAY", "OTHER"
+]
+
+
+class RankingCreate(StrictSchema):
+    teamId: str = Field(min_length=1, max_length=64)
+    finalRank: int = Field(ge=1)
+    # 空串表示赛事整体名次（不按组别拆分）
+    groupId: str = Field(default="", max_length=64)
+    medal: MedalCode = ""
+    remark: str = Field(default="", max_length=500)
+
+
+class RankingUpdate(RankingCreate):
+    version: int = Field(ge=0)
+
+
+class AwardCreate(StrictSchema):
+    awardType: AwardType
+    athleteId: str = Field(default="", max_length=64)
+    teamId: str = Field(default="", max_length=64)
+    groupId: str = Field(default="", max_length=64)
+    value: str = Field(default="", max_length=100)
+    remark: str = Field(default="", max_length=500)
+
+
+class AwardUpdate(AwardCreate):
+    version: int = Field(ge=0)
+
+
+def ranking_out(row) -> dict:
+    """管理端投影：含 version/published/source 等内部字段。"""
+    return {
+        "id": row.pk,
+        "eventId": row.event_id,
+        "groupId": row.group_id or "",
+        "teamId": row.team_id,
+        "teamName": display.team_name(row.team_id, row.team_id),
+        "finalRank": int(row.final_rank),
+        "medal": row.medal or "",
+        "source": row.source,
+        "published": bool(row.published),
+        "publishedAt": row.published_at,
+        "remark": row.remark or "",
+        "version": int(row.version or 0),
+        "createdAt": row.created_at,
+        "updatedAt": row.updated_at,
+    }
+
+
+def award_out(row) -> dict:
+    return {
+        "id": row.pk,
+        "eventId": row.event_id,
+        "groupId": row.group_id or "",
+        "awardType": row.award_type,
+        "athleteId": row.athlete_id or "",
+        "athleteName": display.athlete_name(row.athlete_id, row.athlete_id)
+        if row.athlete_id
+        else "",
+        "teamId": row.team_id or "",
+        "teamName": display.team_name(row.team_id, row.team_id) if row.team_id else "",
+        "value": row.value or "",
+        "published": bool(row.published),
+        "publishedAt": row.published_at,
+        "remark": row.remark or "",
+        "version": int(row.version or 0),
+        "createdAt": row.created_at,
+        "updatedAt": row.updated_at,
+    }
+
+
+def public_ranking_out(row) -> dict:
+    """门户安全投影：不含 version/source/remark 等内部字段。"""
+    return {
+        "teamId": row.team_id,
+        "teamName": display.team_name(row.team_id, row.team_id),
+        "finalRank": int(row.final_rank),
+        "medal": row.medal or "",
+        "publishedAt": row.published_at,
+    }
+
+
+def public_award_out(row) -> dict:
+    return {
+        "awardType": row.award_type,
+        "athleteId": row.athlete_id or "",
+        "athleteName": display.athlete_name(row.athlete_id, row.athlete_id)
+        if row.athlete_id
+        else "",
+        "teamId": row.team_id or "",
+        "teamName": display.team_name(row.team_id, row.team_id) if row.team_id else "",
+        "value": row.value or "",
+        "publishedAt": row.published_at,
+    }
+
 # ---------------------------------------------------------------- 门户公开只读(T5-07)
 
 def public_event_out(event) -> dict:

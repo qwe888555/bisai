@@ -1765,6 +1765,139 @@ def list_own_team_affiliations(person_id: str) -> list[dict]:
     return rows
 
 
+def list_own_competitions(person_id: str) -> list[dict]:
+    """GET /me/competitions：本人参赛赛事汇总（场次 / 进球 / 红黄牌）。
+
+    契约（2026-11-02 P0-4）：运动员此前只有 /me/profile 与 /me/teams，个人页的
+    「参赛数据」无接口可读（/enrollments 对 ATHLETE 未注册权限点，403）；公开赛果
+    又只按球队名称匹配，重名/改名会漏匹配。本接口按 athlete_id 精确聚合，直接给出
+    本人赛事、场次、累计进球与红黄牌，前端不再逐场回查。
+
+    口径：
+    - 参赛依据 = 本人名册条目（RosterItem.athlete_id == Person 主键字符串，
+      剔除 EXCLUDED），按 (eventId, teamId) 汇总，同一人跨队/跨赛事各占一行；
+    - 场次 = 该队在该赛事下 status=FINISHED 的比赛数（取消/未开赛不计）；
+    - 进球 = event_type=GOAL 且 scorer_athlete_id 为本人（含乌龙，按录入口径计）；
+      红黄牌 = event_type=PENALTY 且 penalty_type=YELLOW_CARD/RED_CARD、
+      athlete_id 为本人；
+    - 事件只在本人所属球队的已完成比赛内统计，不串到其他场次；
+    - 赛事/球队名称取主档，查不到回退 ID，不因主档缺失丢行。
+    """
+    from apps.enrollments.models import QUALIFICATION_EXCLUDED, RosterItem
+
+    athlete_id = str(int(person_id))
+    entries: dict[tuple[str, str], set[str]] = {}
+    roster = (
+        RosterItem.objects.filter(
+            athlete_id=athlete_id, enrollment__deleted_at__isnull=True
+        )
+        .exclude(qualification_status=QUALIFICATION_EXCLUDED)
+        .select_related("enrollment")
+    )
+    for item in roster:
+        enrollment = item.enrollment
+        entries.setdefault((enrollment.event_id, enrollment.team_id), set()).add(
+            enrollment.group_id
+        )
+    if not entries:
+        return []
+
+    from apps.events.models import Event, Match, MatchEvent
+
+    # 逐 (赛事, 球队) 取已完成比赛，避免"我队在 A 赛事 + 我队在 B 赛事"被串算
+    condition = Q()
+    for event_id, team_id in entries:
+        condition |= Q(event_id=event_id, home_team_id=team_id) | Q(
+            event_id=event_id, away_team_id=team_id
+        )
+    match_key: dict[str, tuple[str, str]] = {}
+    for match in Match.objects.filter(condition, status="FINISHED"):
+        for team_id in (match.home_team_id, match.away_team_id):
+            key = (match.event_id, team_id)
+            if key in entries:
+                match_key[str(match.pk)] = key
+                break
+
+    def _per_match(queryset) -> dict[str, int]:
+        return {
+            str(row["match_id"]): int(row["total"])
+            for row in queryset.values("match_id").annotate(total=Count("id"))
+        }
+
+    match_ids = list(match_key)
+    goals = _per_match(
+        MatchEvent.objects.filter(
+            match_id__in=match_ids, event_type="GOAL", scorer_athlete_id=athlete_id
+        )
+    )
+    yellow = _per_match(
+        MatchEvent.objects.filter(
+            match_id__in=match_ids,
+            event_type="PENALTY",
+            penalty_type="YELLOW_CARD",
+            athlete_id=athlete_id,
+        )
+    )
+    red = _per_match(
+        MatchEvent.objects.filter(
+            match_id__in=match_ids,
+            event_type="PENALTY",
+            penalty_type="RED_CARD",
+            athlete_id=athlete_id,
+        )
+    )
+
+    stats: dict[tuple[str, str], dict] = {
+        key: {
+            "eventId": key[0],
+            "teamId": key[1],
+            "groupIds": group_ids,
+            "appearances": 0,
+            "goals": 0,
+            "yellowCards": 0,
+            "redCards": 0,
+        }
+        for key, group_ids in entries.items()
+    }
+    for match_id, key in match_key.items():
+        row = stats[key]
+        row["appearances"] += 1
+        row["goals"] += goals.get(match_id, 0)
+        row["yellowCards"] += yellow.get(match_id, 0)
+        row["redCards"] += red.get(match_id, 0)
+
+    event_names = dict(
+        Event.objects.filter(
+            pk__in={key[0] for key in stats}
+        ).values_list("pk", "name")
+    )
+    # enrollment.team_id 是球队主键的字符串形式，Team 主键为整型，需转数值再查
+    team_ids = {key[1] for key in stats}
+    numeric_ids = {int(team_id) for team_id in team_ids if str(team_id).isdigit()}
+    team_names = dict(
+        Team.objects.filter(pk__in=numeric_ids).values_list("pk", "name")
+    ) if numeric_ids else {}
+
+    result: list[dict] = []
+    for (event_id, team_id), row in stats.items():
+        numeric_team_id = int(team_id) if str(team_id).isdigit() else None
+        result.append(
+            {
+                "eventId": event_id,
+                "eventName": event_names.get(event_id) or event_id,
+                "teamId": team_id,
+                "teamName": team_names.get(numeric_team_id) or team_id,
+                "groupIds": sorted(row["groupIds"]),
+                "appearances": row["appearances"],
+                "goals": row["goals"],
+                "yellowCards": row["yellowCards"],
+                "redCards": row["redCards"],
+            }
+        )
+    result.sort(key=lambda item: (item["eventId"], item["teamId"]))
+    return result
+
+
 _COACH_DUTY_LABELS = {
     "HEAD_COACH": "主教练",
     "ASSISTANT_COACH": "助理教练",
