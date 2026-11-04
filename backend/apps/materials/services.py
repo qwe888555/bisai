@@ -211,24 +211,57 @@ def _resolve_owner(owner_type: str, owner_id: str):
     return owner
 
 
+def _is_enrollment_attachment_type(code: str) -> bool:
+    """报名附件类型（enrollments.MATERIAL_TYPES）不属于通用材料类型。"""
+    from apps.enrollments.models import MATERIAL_TYPES
+
+    return code in {item[0] for item in MATERIAL_TYPES}
+
+
 def _resolve_material_type(code: str, owner_type: str) -> MaterialType:
     """类型必须存在于 material_type 表且启用且归属匹配（空表 → 400 明确报错）。
 
     2026-10-29 问题⑥裁定：类型不存在/停用/归属不匹配属于请求引用了
     无效的类型字典项（配置/参数错误），语义为 400 INVALID_ARGUMENT，
     不再使用 409 STATE_CONFLICT（409 保留给真实资源状态冲突）。
+
+    2026-11-04 复测：STAMPED_FORM/STUDENT_STATUS 是报名附件类型，团队/人员
+    材料页不提供，直接调用 POST /materials 时才暴露；此前统一报“字典尚未
+    初始化”，与真实原因不符。现区分三种情况并带 materialType 字段级明细：
+    报名附件类型误用 / 字典确实为空 / 字典非空但 code 不存在。
     """
     mtype = MaterialType.objects.filter(code=code).first()
     if mtype is None:
+        if _is_enrollment_attachment_type(code):
+            raise ApiError(
+                INVALID_ARGUMENT,
+                f"材料类型 {code} 属于报名附件类型，不能作为人员/球队材料上传",
+                [{"field": "materialType", "reason": "请通过报名附件接口上传"}],
+            )
+        if not MaterialType.objects.exists():
+            raise ApiError(
+                INVALID_ARGUMENT,
+                "材料类型字典尚未初始化，请先初始化 material_type 字典",
+                [{"field": "materialType", "reason": "材料类型字典为空"}],
+            )
         raise ApiError(
             INVALID_ARGUMENT,
-            f"材料类型 {code} 不存在：类型字典尚未初始化，暂无法受理材料创建",
+            f"材料类型 {code} 不存在",
+            [{"field": "materialType", "reason": "类型字典中没有该 code"}],
         )
     if not mtype.is_active:
-        raise ApiError(INVALID_ARGUMENT, f"材料类型 {code} 已停用")
+        raise ApiError(
+            INVALID_ARGUMENT,
+            f"材料类型 {code} 已停用",
+            [{"field": "materialType", "reason": "类型已停用"}],
+        )
     # main 653f04f 保留：applies_to 支持 PERSON,TEAM 逗号分隔双归属
     if owner_type not in [p.strip() for p in mtype.applies_to.split(",") if p.strip()]:
-        raise ApiError(INVALID_ARGUMENT, f"材料类型 {code} 不适用于 {owner_type} 归属")
+        raise ApiError(
+            INVALID_ARGUMENT,
+            f"材料类型 {code} 不适用于 {owner_type} 归属",
+            [{"field": "materialType", "reason": f"仅适用于 {mtype.applies_to}"}],
+        )
     return mtype
 
 

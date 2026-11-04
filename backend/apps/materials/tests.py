@@ -359,12 +359,30 @@ class MaterialApiTests(TestCase):
 
     # ------------------------------------------------------------ 创建：类型
 
-    def test_create_type_missing_when_table_empty(self):
-        """类型表无该 code → 400 INVALID_ARGUMENT（不伪造成功、不硬编码 13 种类型）。"""
+    def test_create_type_unknown_code_rejected(self):
+        """字典已初始化但无该 code → 400，不再误报“字典尚未初始化”。"""
         resp = self._post(BASE, self._create_payload(materialType="NO_SUCH_TYPE"), token=self.admin_token)
         self.assertEqual(resp.status_code, 400)
         self.assertEqual(resp.json()["code"], "INVALID_ARGUMENT")
-        self.assertIn("尚未初始化", resp.json()["message"])
+        self.assertIn("不存在", resp.json()["message"])
+        self.assertNotIn("尚未初始化", resp.json()["message"])
+        self.assertEqual(resp.json()["data"][0]["field"], "materialType")
+
+    def test_create_enrollment_attachment_type_rejected(self):
+        """STAMPED_FORM/STUDENT_STATUS 是报名附件类型，不能当球队/人员材料。"""
+        for code in ("STAMPED_FORM", "STUDENT_STATUS"):
+            with self.subTest(code=code):
+                resp = self._post(
+                    BASE,
+                    self._create_payload(
+                        ownerType="TEAM", ownerId=str(self.team_a.pk), materialType=code
+                    ),
+                    token=self.admin_token,
+                )
+                self.assertEqual(resp.status_code, 400, resp.content)
+                self.assertEqual(resp.json()["code"], "INVALID_ARGUMENT")
+                self.assertIn("报名附件", resp.json()["message"])
+                self.assertEqual(resp.json()["data"][0]["field"], "materialType")
 
     def test_create_type_inactive(self):
         resp = self._post(BASE, self._create_payload(materialType="OFF_TYPE"), token=self.admin_token)
