@@ -79,6 +79,9 @@ register_operation("memberDelete", _TEAM_ROLES)
 # teamCoachDelete，角色行与成员域一致。
 register_operation("teamCoachList", _TEAM_ROLES)
 register_operation("teamCoachCreate", _TEAM_ROLES)
+# 候选教练搜索（2026-11-04 缺陷修复）：前端添加弹窗原用通用 /people/search，
+# TEAM 账号只可见本队现役运动员 → 教练候选恒为空；补球队域候选接口。
+register_operation("teamCoachSearch", _TEAM_ROLES)
 register_operation("teamCoachDelete", _TEAM_ROLES)
 # 球队赛程聚合入口（契约 api:teamMatches，2026-10-29 交付）：路由归球队域，
 # 查询委托 events 比赛读服务（docs/后端接口文档.md teamMatches 契约）。
@@ -304,6 +307,21 @@ def team_coach_create(request, team_id: str, body: s.CoachAddBody):
     return ok(s.coach_out(coach))
 
 
+@router.post(
+    "/teams/{team_id}/coaches/search",
+    auth=_auth,
+    response=EnvelopeOut,
+    summary="候选教练搜索",
+)
+def team_coach_search(request, team_id: str, body: s.CoachSearchBody):
+    account = require("teamCoachSearch")
+    candidates = services.coach_search(team_id, body.keyword, account)
+    return ok(candidates)
+
+
+# 注意：POST /coaches/search 必须注册在 DELETE /coaches/{coach_id} 之前——
+# Django URL 按注册序匹配，字面量 search 若排在转换器之后，该 POST 会先命中
+# 详情路由并按方法不匹配返回 405（与 members/search 同一坑，2026-11-04 复现）。
 @router.delete(
     "/teams/{team_id}/coaches/{coach_id}",
     auth=_auth,

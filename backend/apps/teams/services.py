@@ -794,6 +794,38 @@ def coach_list(team_id: str, filters: dict, account) -> QuerySet[TeamCoach]:
     return queryset.order_by("-created_at", "-id")
 
 
+def coach_search(team_id: str, keyword: str, account) -> list:
+    """POST /teams/{id}/coaches/search：候选教练（与 member_search 同口径）。
+
+    2026-11-04 缺陷修复：前端原用通用 POST /people/search，TEAM 账号的数据
+    范围只含本队现役成员（均为运动员），按 kinds=COACH 过滤后恒为空，添加
+    教练弹窗搜不到候选。教练候选改走球队域接口，范围规则与 member_search
+    一致：仅本校人员、档案 APPROVED、具备 COACH 身份（CoachProfile 行存在
+    性，方案C 事实源）、排除本队现役教练（EXITED 历史行可重新加入）；关键
+    词匹配姓名与身份证后四位；上限 20 沿用 persons 读链保护上限。
+    """
+    from apps.persons.schemas import person_out
+    from apps.persons.services import people_queryset
+
+    team = _team_or_404(team_id)
+    ensure_team_visible(account, team)
+    queryset = people_queryset().filter(
+        coach_profile_exists=True,
+        school_id=team.school_id,
+        audit_status=enums.AuditStatus.APPROVED,
+    )
+    term = (keyword or "").strip()
+    if term:
+        queryset = queryset.filter(
+            Q(full_name__icontains=term) | Q(id_card_masked__endswith=term)
+        )
+    current_ids = TeamCoach.objects.filter(
+        team=team, status=enums.RelationStatus.CURRENT
+    ).values_list("person_id", flat=True)
+    queryset = queryset.exclude(pk__in=current_ids)
+    return [person_out(p) for p in queryset.order_by("-id")[:20]]
+
+
 def coach_add(team_id: str, payload: dict, account) -> TeamCoach:
     """POST /teams/{id}/coaches：校验球队/教练 + 现役唯一 + R4 现役主教练唯一。
 

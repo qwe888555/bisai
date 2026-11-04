@@ -100,6 +100,17 @@ class MemberSearchBody(StrictSchema):
     keyword: str = Field(min_length=1, max_length=50)
 
 
+class CoachSearchBody(StrictSchema):
+    """POST /teams/{id}/coaches/search 正文（与 MemberSearchBody 同值域）。
+
+    TeamCoachesView 添加弹窗原用通用 POST /people/search：TEAM 账号数据范围
+    只含本队现役成员（均运动员），按 kinds=COACH 过滤后恒为空 → 教练候选
+    必须走球队域接口（2026-11-04 缺陷修复）。
+    """
+
+    keyword: str = Field(min_length=1, max_length=50)
+
+
 class MemberCreateBody(StrictSchema):
     """POST /teams/{id}/members 请求体（键名与前端 addMember payload 一致，
     TeamMembersView L110-114：athleteId/jerseyNumber/position，无 version/日期）。"""

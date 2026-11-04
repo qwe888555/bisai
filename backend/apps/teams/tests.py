@@ -20,7 +20,7 @@ from apps.accounts.models import Account, AuditLog, Organization
 from apps.common import crypto, enums
 from apps.common.authentication import issue_access_token, make_password
 from apps.common.ids import new_account_id, new_organization_id
-from apps.persons.models import AthleteProfile, Person, Region, School
+from apps.persons.models import AthleteProfile, CoachProfile, Person, Region, School
 from apps.teams.models import Team, TeamCoach, TeamMember, TeamTransfer
 
 BASE = "/api/v1/teams"
@@ -640,6 +640,23 @@ def _athlete(seq: int, name: str, **kw) -> Person:
     return person
 
 
+def _coach(seq: int, name: str, **kw) -> Person:
+    """测试教练（含 CoachProfile 行——方案C 的 COACH 事实源）。"""
+    idnum = f"1101011985{seq:04d}X" if seq % 2 else f"1101011986{seq:04d}X"
+    person = Person.objects.create(
+        person_no=f"P2026{seq:08d}",
+        full_name=name,
+        id_card_cipher=crypto.encrypt_text(idnum),
+        id_card_hash=crypto.lookup_hash(idnum),
+        id_card_masked=crypto.mask_id_number(idnum),
+        person_category=enums.PersonCategory.COACH,
+        audit_status=kw.pop("audit_status", enums.AuditStatus.APPROVED),
+        **kw,
+    )
+    CoachProfile.objects.create(person=person)
+    return person
+
+
 class TeamMemberApiTests(TestCase):
     """批次 B：GET/POST /teams/{id}/members(+ /search)、PUT/DELETE members/{mid}。
 
@@ -1050,6 +1067,65 @@ class TeamMemberApiTests(TestCase):
         resp = self.client.post(
             f"{BASE}/99999/members/search",
             data=json.dumps({"keyword": "小"}),
+            content_type="application/json",
+            **self._auth(self.admin_token),
+        )
+        self.assertEqual(resp.status_code, 404)
+
+    # ------------------------------------------------------------ 候选教练搜索
+    # 2026-11-04 缺陷：前端添加教练弹窗用通用 /people/search，TEAM 范围只含本队
+    # 现役运动员 → 按 COACH 过滤恒为空；改走球队域候选接口。
+
+    def _coach_search(self, keyword: str, token=None):
+        return self.client.post(
+            f"{BASE}/{self.team_main.pk}/coaches/search",
+            data=json.dumps({"keyword": keyword}),
+            content_type="application/json",
+            **self._auth(token or self.uni_token),
+        )
+
+    def test_coach_search_same_school_approved(self):
+        coach_ok = _coach(401, "韩雅婷", school=self.school)
+        resp = self._coach_search("韩")
+        self.assertEqual(resp.status_code, 200)  # 与 DELETE 参数路由不冲突（非 405）
+        data = resp.json()["data"]
+        self.assertEqual([p["id"] for p in data], [str(coach_ok.pk)])
+        self.assertIn("COACH", data[0]["kinds"])
+        self.assertIn("schoolName", data[0])
+
+    def test_coach_search_excludes_pending_cross_school_and_current(self):
+        pending = _coach(
+            402, "候选待审", school=self.school,
+            audit_status=enums.AuditStatus.PENDING,
+        )
+        other_school = School.objects.create(
+            name="丙校", code="SCH-910200-001", school_type="PRIMARY", region=self.city
+        )
+        cross = _coach(403, "候选外校", school=other_school)
+        current = _coach(404, "候选在队", school=self.school)
+        ath_cand = _athlete(405, "候选队员", school=self.school)
+        TeamCoach.objects.create(
+            team=self.team_main, person=current,
+            duty=enums.CoachDuty.HEAD_COACH, joined_at=date(2026, 5, 1),
+        )
+        resp = self._coach_search("候选")
+        self.assertEqual(resp.status_code, 200)
+        ids = [p["id"] for p in resp.json()["data"]]
+        self.assertNotIn(str(pending.pk), ids)  # 未审核通过
+        self.assertNotIn(str(cross.pk), ids)  # 跨校
+        self.assertNotIn(str(current.pk), ids)  # 本队现役
+        self.assertNotIn(str(ath_cand.pk), ids)  # 运动员不进入教练候选
+
+    def test_coach_search_limit_20(self):
+        for i in range(25):
+            _coach(500 + i, f"候选教练{i:02d}", school=self.school)
+        resp = self._coach_search("候选教练")
+        self.assertEqual(len(resp.json()["data"]), 20)
+
+    def test_coach_search_missing_team_404(self):
+        resp = self.client.post(
+            f"{BASE}/99999/coaches/search",
+            data=json.dumps({"keyword": "韩"}),
             content_type="application/json",
             **self._auth(self.admin_token),
         )
