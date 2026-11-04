@@ -81,7 +81,8 @@ def _latest_review_reason(enrollment: Enrollment) -> str:
 
 
 def to_roster(item: RosterItem) -> dict:
-    """契约 RosterItem；qualification_status 暂不出（TODO 确认项#3）。"""
+    """契约 RosterItem；qualification_* 为学校端资格确认 UI（确认项#3 落地，
+    终审双轨 hard-gate 依赖 confirmedAt/confirmedBy 凭证）。"""
     return {
         "id": item.pk,
         "athleteId": item.athlete_id,
@@ -91,6 +92,10 @@ def to_roster(item: RosterItem) -> dict:
         "studentStatusFileIds": list(item.student_status_file_ids or []),
         "athleteName": item.athlete_name,
         "maskedIdNumber": item.masked_id_number,
+        "qualificationStatus": item.qualification_status,
+        "qualificationReason": item.qualification_reason or "",
+        "confirmedAt": item.confirmed_at,
+        "confirmedBy": item.confirmed_by or "",
         "version": int(item.version or 0),
         "createdAt": item.created_at,
         "updatedAt": item.updated_at,
@@ -216,6 +221,8 @@ def to_summary(
         "submissionNo": int(enrollment.submission_no or 0),
         "contactName": enrollment.contact_name,
         "maskedContactPhone": enrollment.contact_phone_masked,
+        # 学校端编辑/提交按创建者判定（scope.ensure_enrollment_creator 同口径）
+        "createdBy": enrollment.created_by or "",
         "playerCount": _resolve_player_count(enrollment, player_count),
         "editable": enrollment.editable,
         "snapshotId": snapshot.pk if snapshot else None,
@@ -689,16 +696,22 @@ def qualify_roster(actor, enrollment_id: str, roster_id: str, payload) -> dict:
             item.qualification_status = QUALIFICATION_QUALIFIED
             item.confirmed_at = timezone.now()
             item.confirmed_by = actor.pk
+            # 学校端资格 UI 需回显原因：确认即视为核验通过，清空历史原因。
+            item.qualification_reason = None
             log_action = "CONFIRM"
         elif action == "REJECT":
             item.qualification_status = QUALIFICATION_DISQUALIFIED
             item.confirmed_at = None
             item.confirmed_by = ""
+            # 原因回写条目（to_roster 暴露 qualificationReason 供学校端回显；
+            # 日志仍按原契约留痕）
+            item.qualification_reason = reason
             log_action = "REJECT"
         elif action == "EXCLUDE":
             item.qualification_status = QUALIFICATION_EXCLUDED
             item.confirmed_at = None
             item.confirmed_by = ""
+            item.qualification_reason = reason
             log_action = "EXCLUDE"
         elif action == "REVOKE":
             if not _has_valid_credential(item):
@@ -709,6 +722,7 @@ def qualify_roster(actor, enrollment_id: str, roster_id: str, payload) -> dict:
                 )
             item.confirmed_at = None
             item.confirmed_by = ""
+            item.qualification_reason = reason
             log_action = "REVOKE"
         else:  # pragma: no cover - schema 层 Literal 已拦截
             raise ApiError(INVALID_ARGUMENT, "action 取值非法")
