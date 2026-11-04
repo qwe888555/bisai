@@ -123,6 +123,27 @@ class MaterialApiTests(TestCase):
         cls.person_b = _person(2, "材料乙")
         cls.person_c = _person(3, "材料丙")
         cls.person_del = _person(4, "材料删", deleted=True)
+        # 本人自服务账号（2026-11-04 开放材料自范围）：绑定人员档案
+        cls.athlete_self = Account.objects.create(
+            id=new_account_id(),
+            username="materials-athlete-self",
+            display_name="运动员本人",
+            roles=["ATHLETE"],
+            password=make_password("athlete-self-pass"),
+            enabled=True,
+            person_id=str(cls.person_a.pk),
+        )
+        cls.coach_self = Account.objects.create(
+            id=new_account_id(),
+            username="materials-coach-self",
+            display_name="教练本人",
+            roles=["COACH"],
+            password=make_password("coach-self-pass"),
+            enabled=True,
+            person_id=str(cls.person_b.pk),
+        )
+        cls.athlete_self_token = _token(cls.athlete_self)
+        cls.coach_self_token = _token(cls.coach_self)
         cls.team_a = Team.objects.create(
             team_no="T202600000101", name="丙一小男足队", category_code="PRIMARY",
             region=cls.city, school=cls.school_a,
@@ -281,10 +302,44 @@ class MaterialApiTests(TestCase):
         )
 
     def test_list_athlete_scope_denied(self):
-        """ATHLETE 本批未开放材料数据范围（P1-9：仅全局 ADMIN/UNIVERSITY 本校），保持拒绝。"""
+        """未绑定人员档案的 ATHLETE 账号仍拒绝（自范围以 person_id 为依据）。"""
         resp = self._get(BASE, token=self.athlete_token)
         self.assertEqual(resp.status_code, 403)
         self.assertEqual(resp.json()["code"], "DATA_SCOPE_DENIED")
+
+    def test_athlete_self_lists_own_material(self):
+        """ATHLETE 绑定本人档案后仅可见本人材料（2026-11-04 开放）。"""
+        resp = self._get(
+            BASE,
+            token=self.athlete_self_token,
+            query={"ownerType": "PERSON", "ownerId": str(self.person_a.pk)},
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["data"]["total"], 1)
+        self.assertEqual(resp.json()["data"]["items"][0]["ownerId"], str(self.person_a.pk))
+
+    def test_athlete_self_cannot_see_others(self):
+        """ATHLETE 自范围不得外溢到他人材料。"""
+        resp = self._get(
+            BASE,
+            token=self.athlete_self_token,
+            query={"ownerType": "PERSON", "ownerId": str(self.person_b.pk)},
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["data"]["total"], 0)
+        detail = self._get(f"{BASE}/{self.pm_approved.pk}", token=self.athlete_self_token)
+        self.assertEqual(detail.status_code, 403)
+        self.assertEqual(detail.json()["code"], "DATA_SCOPE_DENIED")
+
+    def test_coach_self_lists_own_material(self):
+        """COACH 与运动员同口径：仅本人 PERSON 材料。"""
+        resp = self._get(
+            BASE,
+            token=self.coach_self_token,
+            query={"ownerType": "PERSON", "ownerId": str(self.person_b.pk)},
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["data"]["total"], 1)
 
     def test_list_university_scope_denied(self):
         """UNIVERSITY 无组织绑定（幽灵范围）默认拒绝；本校正向口径见 MaterialUniversityScopeTests。"""
@@ -1636,9 +1691,14 @@ class MaterialUniversityScopeTests(TestCase):
             ).exists()
         )
 
-    def test_city_history_scope_denied(self):
-        """CITY 在 materialHistory 角色集内（同 materialGet），但数据范围拒绝。"""
+    def test_city_history_scope_allowed_within_city(self):
+        """CITY 可读本市材料审核历史（2026-11-04 开放市州范围）。"""
         resp = self._get(f"{BASE}/{self.pm_a.pk}/audit-logs", token=self.city_token)
+        self.assertEqual(resp.status_code, 200)
+
+    def test_city_detail_other_city_denied(self):
+        """CITY 范围外（省直属学校）材料详情仍 403。"""
+        resp = self._get(f"{BASE}/{self.pm_b.pk}", token=self.city_token)
         self.assertEqual(resp.status_code, 403)
         self.assertEqual(resp.json()["code"], "DATA_SCOPE_DENIED")
 
@@ -1795,11 +1855,32 @@ class MaterialUniversityScopeTests(TestCase):
         self.assertEqual(resp.status_code, 403)
         self.assertEqual(resp.json()["code"], "DATA_SCOPE_DENIED")
 
-    def test_city_role_still_denied(self):
-        """CITY 本批未开放材料数据范围（P1-9 批次边界），保持拒绝。"""
-        resp = self._get(BASE, token=self.city_token)
-        self.assertEqual(resp.status_code, 403)
-        self.assertEqual(resp.json()["code"], "DATA_SCOPE_DENIED")
+    def test_city_list_scoped_to_own_city(self):
+        """CITY 列表仅含本市学校材料，省直属学校材料不可见（2026-11-04 开放）。"""
+        own = self._get(
+            BASE,
+            token=self.city_token,
+            query={"ownerType": "PERSON", "ownerId": str(self.p_a.pk)},
+        )
+        self.assertEqual(own.status_code, 200)
+        self.assertEqual(own.json()["data"]["total"], 1)
+        other = self._get(
+            BASE,
+            token=self.city_token,
+            query={"ownerType": "PERSON", "ownerId": str(self.p_b.pk)},
+        )
+        self.assertEqual(other.status_code, 200)
+        self.assertEqual(other.json()["data"]["total"], 0)
+
+    def test_province_list_covers_all_schools(self):
+        """PROVINCE_REVIEWER 可读全省学校材料（2026-11-04 开放）。"""
+        resp = self._get(
+            BASE,
+            token=self.prov_token,
+            query={"ownerType": "PERSON", "ownerId": str(self.p_b.pk)},
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["data"]["total"], 1)
 
     def test_create_own_school_owner_ok(self):
         """UNIVERSITY 本校创建材料正向：先传后绑文件认领成功（多份类型避开 R6）。"""

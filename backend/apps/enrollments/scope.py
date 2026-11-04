@@ -1,7 +1,9 @@
 """报名域数据范围（第三/四层校验）。
 
 - TEAM / UNIVERSITY：只看本队/本校组织子树映射出的球队；
-- CITY / PROVINCE_REVIEWER / ADMIN：按组织子树过滤 city_org_id；
+- CITY / PROVINCE_REVIEWER / 挂组织 ADMIN：按组织子树过滤 city_org_id；
+- 无组织 ADMIN（全局管理员）：全库读写（与文档“未挂组织 ADMIN 覆盖全库”
+  一致）；MATCH_RECORDER 全局只读；
 - 筛选条件只能缩小范围，不能扩大权限。
 
 本模块同时向 attachments 注册 ENROLLMENT 归属校验器。
@@ -20,7 +22,7 @@ from apps.common.permissions import (
     TEAM,
     UNIVERSITY,
 )
-from apps.common.scopes import org_scope_ids
+from apps.common.scopes import is_global_admin, org_scope_ids
 
 from .clients import team_client
 from .models import Enrollment
@@ -51,6 +53,9 @@ def scoped_queryset(account, queryset):
     # 记录员：赛前身份核验需跨队/跨市读取名册，授予全局只读（写权限由 R1/R3 拦截，不在 R5）。
     if MATCH_RECORDER in role_set(account):
         return queryset
+    # 全局管理员（未挂组织）：文档口径为全库；挂组织 ADMIN 仍走组织子树。
+    if is_global_admin(account):
+        return queryset
     if is_org_scoped(account):
         org_ids = org_scope_ids(account)
         if not org_ids:
@@ -64,6 +69,8 @@ def scoped_queryset(account, queryset):
 
 def ensure_enrollment_access(account, enrollment: Enrollment) -> None:
     if MATCH_RECORDER in role_set(account):
+        return
+    if is_global_admin(account):
         return
     if is_org_scoped(account):
         if enrollment.city_org_id not in set(org_scope_ids(account)):

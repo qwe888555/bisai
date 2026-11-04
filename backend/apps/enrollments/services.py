@@ -494,6 +494,7 @@ def _get_roster_item(enrollment: Enrollment, roster_id: str) -> RosterItem:
 
 def create_roster(actor, enrollment_id: str, payload) -> dict:
     enrollment = scope.get_enrollment(actor, enrollment_id)
+    scope.ensure_enrollment_creator(actor, enrollment)
     _ensure_editable(enrollment)
     precheck.ensure_window_open(enrollment.event_id)
     person = person_client.get_person(payload.athleteId)
@@ -529,6 +530,7 @@ def create_roster(actor, enrollment_id: str, payload) -> dict:
 
 def update_roster(actor, enrollment_id: str, roster_id: str, payload) -> dict:
     enrollment = scope.get_enrollment(actor, enrollment_id)
+    scope.ensure_enrollment_creator(actor, enrollment)
     _ensure_editable(enrollment)
     precheck.ensure_window_open(enrollment.event_id)
     item = _get_roster_item(enrollment, roster_id)
@@ -578,6 +580,7 @@ def delete_roster(
     actor, enrollment_id: str, roster_id: str, version: int
 ) -> tuple[str, int]:
     enrollment = scope.get_enrollment(actor, enrollment_id)
+    scope.ensure_enrollment_creator(actor, enrollment)
     _ensure_editable(enrollment)
     item = _get_roster_item(enrollment, roster_id)
     check_version(item, version)
@@ -993,6 +996,7 @@ def list_attachments(actor, enrollment_id: str):
 
 def create_attachment(actor, enrollment_id: str, payload) -> dict:
     enrollment = scope.get_enrollment(actor, enrollment_id)
+    scope.ensure_enrollment_creator(actor, enrollment)
     _ensure_editable(enrollment)
     precheck.ensure_window_open(enrollment.event_id)
     record = file_client.get_record(actor, payload.fileId)
@@ -1035,6 +1039,7 @@ def delete_attachment(
     actor, enrollment_id: str, attachment_id: str, version: int
 ) -> tuple[str, int]:
     enrollment = scope.get_enrollment(actor, enrollment_id)
+    scope.ensure_enrollment_creator(actor, enrollment)
     _ensure_editable(enrollment)
     attachment = EnrollmentAttachment.objects.filter(
         pk=attachment_id, enrollment_id=enrollment.pk

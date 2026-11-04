@@ -356,7 +356,8 @@ class ApiSmokeTests(TestCase):
             self.assertEqual(created.status_code, 403, created.content)
 
     def test_match_and_event_writes_still_denied_for_school_city_team(self):
-        for username in ("city", "team", "university"):
+        # 学校/球队无赛事写权限 → 权限点 403
+        for username in ("team", "university"):
             token = self.login(username)
             deleted = self.client.delete(
                 f"{BASE}/events/evt_demo?version=0",
@@ -364,6 +365,14 @@ class ApiSmokeTests(TestCase):
             )
             self.assertEqual(deleted.status_code, 403, deleted.content)
             self.assertEqual(body(deleted)["code"], "FORBIDDEN")
+        # 市州在 event 写权限点内（eventCreate 登记 ADMIN/PROVINCE/CITY），
+        # 权限通过后落到资源不存在 → 404，而非越权 403
+        city = self.login("city")
+        deleted = self.client.delete(
+            f"{BASE}/events/evt_demo?version=0",
+            HTTP_AUTHORIZATION=f"Bearer {city}",
+        )
+        self.assertEqual(deleted.status_code, 404, deleted.content)
 
     # ---------------------------------------------------------------- 账号绑定约定
     def test_account_role_must_match_org_type(self):

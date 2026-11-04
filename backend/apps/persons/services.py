@@ -486,8 +486,11 @@ def apply_person_scope(queryset: QuerySet, account) -> QuerySet:
       各自独立按 CURRENT 过滤），不经学校归属反推，不因组织子树扩展到
       其他球队（多队授权未立项）。
 
-    - CITY / PROVINCE_REVIEWER：403 DATA_SCOPE_DENIED（市级/省级人员
-      范围留待独立评审，契约文案不区分角色）。
+    - CITY / PROVINCE_REVIEWER（2026-11-04 开放）：绑定节点必须存在且
+      org_type 匹配（CITY→"CITY"、PROVINCE_REVIEWER→"PROVINCE"），否则
+      403；可见其组织子树中全部学校类节点（SCHOOL/UNIVERSITY）code 对应
+      的人员。市州看本市、省级看全省；无 school 归属人员不可见
+      （deny-by-default，与学校端口径一致）。
 
     角色门禁必须在 scope_org_codes 之前：该 helper 不校验角色，若颠倒
     顺序，UNIVERSITY 等有组织绑定的账号会被其非空子树编码误放行。
@@ -508,10 +511,12 @@ def apply_person_scope(queryset: QuerySet, account) -> QuerySet:
             )
         return queryset.filter(school__code__in=codes)
 
-    if "UNIVERSITY" not in roles and "TEAM" not in roles:
+    if not (
+        {"UNIVERSITY", "TEAM", "CITY", "PROVINCE_REVIEWER"} & roles
+    ):
         raise ApiError(
             DATA_SCOPE_DENIED,
-            "市级/省级人员数据范围尚未开放，当前仅管理员及学校/球队端可查询",
+            "当前角色无人员数据范围，仅管理员及学校/球队/市州/省级端可查询",
         )
 
     from apps.accounts.models import Organization
@@ -542,6 +547,26 @@ def apply_person_scope(queryset: QuerySet, account) -> QuerySet:
                 DATA_SCOPE_DENIED,
                 "当前账号无有效组织范围，禁止访问人员数据",
             )
+        return queryset.filter(school__code__in=school_codes)
+
+    # CITY / PROVINCE_REVIEWER 分支：组织子树内学校类节点 code（市州看本市、
+    # 省级看全省）；节点类型必须与角色匹配，防止跨级绑定放大范围。
+    if "CITY" in roles or "PROVINCE_REVIEWER" in roles:
+        expected_types = set()
+        if "CITY" in roles:
+            expected_types.add("CITY")
+        if "PROVINCE_REVIEWER" in roles:
+            expected_types.add("PROVINCE")
+        if org.org_type not in expected_types:
+            raise ApiError(
+                DATA_SCOPE_DENIED,
+                "市州/省级账号绑定组织类型不匹配，禁止访问人员数据",
+            )
+        school_codes = list(
+            Organization.objects.filter(pk__in=org_scope_ids(account))
+            .filter(org_type__in=("SCHOOL", "UNIVERSITY"))
+            .values_list("code", flat=True)
+        )
         return queryset.filter(school__code__in=school_codes)
 
     # TEAM 分支：仅绑定节点自身（org.code == team_no），不取子树
@@ -578,25 +603,35 @@ def verify_person_owner(account, owner_id) -> None:
     - 账号绑定本人档案（account.person_id 服务端签发，与 /me/profile 同源）
       → 放行（本人材料上传/查看，对应 materialList/Create 含 ATHLETE/COACH
       的自服务场景）；
-    - 其余一律 DATA_SCOPE_DENIED——本市/本校/本队范围依赖 A′ 映射，未交付
-      前不得放行，不发明组织层级授权。
+    - CITY / PROVINCE_REVIEWER：人员学校归属在账号组织子树学校编码内
+      → 放行（与 apply_person_scope 同口径；用于市州/省级查看材料文件）；
+    - 其余一律 DATA_SCOPE_DENIED。
     """
     from apps.common.permissions import ADMIN
+    from apps.common.scopes import visible_school_codes
 
     raw = str(owner_id or "").strip()
     if not raw:
         raise ApiError(DATA_SCOPE_DENIED, "文件归属对象未确定，暂无法校验归属")
-    if not Person.objects.filter(
-        pk=parse_path_id(raw, "ownerId"), is_deleted=False
-    ).exists():
+    person = (
+        Person.objects.filter(pk=parse_path_id(raw, "ownerId"), is_deleted=False)
+        .select_related("school")
+        .first()
+    )
+    if person is None:
         raise ApiError(NOT_FOUND, "归属人员不存在或已删除")
-    if ADMIN in (getattr(account, "roles", ()) or ()):
+    roles = set(getattr(account, "roles", ()) or ())
+    if ADMIN in roles:
         return
     if str(getattr(account, "person_id", "") or "") == raw:
         return
+    if "CITY" in roles or "PROVINCE_REVIEWER" in roles:
+        codes = visible_school_codes(account)
+        if codes and person.school is not None and person.school.code in codes:
+            return
     raise ApiError(
         DATA_SCOPE_DENIED,
-        "人员数据范围待组织映射方案确认后开放，当前仅管理员与本人可访问",
+        "人员数据范围与当前账号不匹配，禁止访问该人员文件",
     )
 
 
@@ -2196,8 +2231,9 @@ def _dossier_scores(person_id, event_id: Optional[str] = None) -> list[dict]:
 def dossier_search_queryset(payload: dict, account) -> QuerySet:
     """POST /selection-dossiers/search 查询构建（§6.8 L1736-1756 + §7 DossierSearch）。
 
-    复用：people_queryset（软删排除+档案行注解）、apply_person_scope（一期仅
-    ADMIN，D5 口径）、list_people 的 -id 排序先例、create_person 的
+    复用：people_queryset（软删排除+档案行注解）、apply_person_scope
+    （全局 ADMIN 全库 / 省级账号全省 / 市州账号本市）、list_people 的 -id
+    排序先例、create_person 的
     lookup_hash 受控检索链路；teamId=现役 TeamMember 关系（CURRENT 口径同
     /me/teams）；eventId/groupId=已通过报名名单（与遴选候选人口径一致）。
     检索资格：文档 L4708"仅运动员遴选档案受控检索，不允许借用

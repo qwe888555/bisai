@@ -30,6 +30,9 @@ ACCOUNTS = (
     ("acc_city", "city", ["CITY"], "org_city_01"),
     ("acc_province", "province", ["PROVINCE_REVIEWER"], "org_prov"),
     ("acc_admin", "admin", ["ADMIN"], "org_prov"),
+    # 生产 init_admin 口径：未挂组织的全局管理员
+    ("acc_global_admin", "globaladmin", ["ADMIN"], None),
+    ("acc_recorder", "recorder", ["MATCH_RECORDER"], None),
 )
 
 

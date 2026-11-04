@@ -1246,12 +1246,12 @@ class PersonVersionMechanismTests(TestCase):
         v0 = self._derived()
         self.person.save()
         # Windows 系统时钟粒度约 15.6ms，间隔过小 auto_now 会取到同一时刻；
-        # 20ms 足以区分，又保持「两次写间隔 <1s」的断言口径。
-        time.sleep(0.02)
+        # 50ms 留足 3 个时钟刻度，避免全量测试并发下偶发同值（2026-11-04）。
+        time.sleep(0.05)
         v1 = self._derived()
         self.person.full_name = "版本员二"
         self.person.save()
-        time.sleep(0.02)
+        time.sleep(0.05)
         v2 = self._derived()
         self.assertGreater(v1, v0)
         self.assertGreater(v2, v1)
@@ -2465,17 +2465,23 @@ class PersonAdminScopeTests(TestCase):
     # ------------------------------------------------------------ 非 ADMIN 不变
 
     def test_non_admin_roles_still_denied(self):
-        """A′ 第三批拆分后本类保留的拒绝面：TEAM/CITY 读写仍拒绝。
+        """TEAM 读写仍拒绝；CITY 读已开放本市范围（2026-11-04）。
 
         UNIVERSITY 本校读已开放（正向矩阵见 PersonThirdBatchScopeTests），
-        本校建档也已开放（改造说明 §2.1）；本测试保留 TEAM/CITY 的
-        列表 403 DATA_SCOPE_DENIED + 写链 403 FORBIDDEN。
+        本校建档也已开放（改造说明 §2.1）；CITY 列表按本市组织子树过滤，
+        写链权限点仍仅登记 ADMIN/UNIVERSITY → 角色层 FORBIDDEN。
         """
-        for token in (self.team_token, self.city_token):
-            # 查询类权限点含 TEAM/CITY → 落到数据范围层拒绝
-            resp = self._get(PEOPLE, token=token)
-            self.assertEqual(resp.status_code, 403)
-            self.assertEqual(resp.json()["code"], "DATA_SCOPE_DENIED")
+        resp = self._get(PEOPLE, token=self.team_token)
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json()["code"], "DATA_SCOPE_DENIED")
+
+        resp = self._get(PEOPLE, token=self.city_token)
+        self.assertEqual(resp.status_code, 200)
+        names = {i["realName"] for i in resp.json()["data"]["items"]}
+        self.assertEqual(names, {"树内一", "树内二", "树内三"})
+        self.assertNotIn("树外人", names)
+        self.assertNotIn("无校人", names)
+
         for token in (self.team_token, self.city_token):
             # 写链权限点仅登记 ADMIN/UNIVERSITY → 角色层即 FORBIDDEN
             resp = self._post(
@@ -2683,12 +2689,24 @@ class PersonThirdBatchScopeTests(TestCase):
         resp = self._get(PEOPLE)
         self.assertEqual(resp.status_code, 401)
 
-    def test_city_and_province_reviewer_denied(self):
-        for token in (self.city_token, self.prov_token):
-            resp = self._get(PEOPLE, token=token)
-            self.assertEqual(resp.status_code, 403)
-            self.assertEqual(resp.json()["code"], "DATA_SCOPE_DENIED")
-            self.assertEqual(resp.json()["data"], None)
+    def test_city_and_province_reviewer_scoped(self):
+        """CITY 见本市子树、PROVINCE_REVIEWER 见全省（2026-11-04 开放）。"""
+        city_people = {
+            "现役球员", "离队球员", "无关联员", "子队球员",
+            "现役教练", "离队教练", "高校球员",
+        }
+        resp = self._get(PEOPLE, token=self.city_token)
+        self.assertEqual(resp.status_code, 200)
+        names = {i["realName"] for i in resp.json()["data"]["items"]}
+        self.assertEqual(names, city_people)
+        self.assertNotIn("界外球员", names)
+        self.assertNotIn("无校教练", names)
+
+        resp = self._get(PEOPLE, token=self.prov_token)
+        self.assertEqual(resp.status_code, 200)
+        names = {i["realName"] for i in resp.json()["data"]["items"]}
+        self.assertEqual(names, city_people | {"界外球员"})
+        self.assertNotIn("无校教练", names)
         # 数据未被过滤动作改变
         self.assertEqual(Person.objects.count(), 9)
 
@@ -4463,8 +4481,9 @@ class DossierApiTests(TestCase):
     GET /selection-dossiers/{athleteId}。
 
     契约依据：接口文档 L1736-1773 + §7 CandidateDossier/DossierSearch（L4692-4718）。
-    - 角色 ADMIN/PROVINCE_REVIEWER（文档 L1740/L1762）；数据范围一期仅 ADMIN
-      （D5 同 persons apply_person_scope 口径 → PROVINCE_REVIEWER 403）；
+    - 角色 ADMIN/PROVINCE_REVIEWER（文档 L1740/L1762）；数据范围复用
+      apply_person_scope：全局 ADMIN 全库、绑定省级组织的 PROVINCE_REVIEWER
+      全省；未绑定组织仍 403（2026-11-04 开放）；
     - 检索资格：文档 L4708 仅运动员档案（AthleteProfile 行存在）；
     - athlete 复用 person_out（脱敏同源）、teams 复用 list_own_teams 现役
       正式关系（EXITED 不并入）、materials 复用 material_list/material_out
@@ -4507,8 +4526,25 @@ class DossierApiTests(TestCase):
 
         region = Region.objects.create(name="乙省", code="810000", level=1)
         cls.school = School.objects.create(
-            name="乙二中", school_type="JUNIOR", region=region
+            name="乙二中", code="SCH-810100-101", school_type="JUNIOR", region=region
         )
+        # 省级账号的组织映射（2026-11-04 开放遴选档案省级范围）
+        Organization.objects.create(
+            id="ORG-DP", code="P-810", name="乙省组织", org_type="PROVINCE"
+        )
+        Organization.objects.create(
+            id="ORG-DS", code=cls.school.code, name="乙二中组织",
+            org_type="SCHOOL", parent_id="ORG-DP",
+        )
+        cls.prov_scoped = Account.objects.create(
+            id=new_account_id(),
+            username="dossier-prov-scoped",
+            roles=["PROVINCE_REVIEWER"],
+            password=make_password("prov-scoped-pass-123"),
+            enabled=True,
+            organization_id="ORG-DP",
+        )
+        cls.prov_scoped_token = issue_access_token(cls.prov_scoped)[0]
         cls.team_a = Team.objects.create(
             team_no="T202600000201",
             name="乙二A队",
@@ -4726,8 +4762,7 @@ class DossierApiTests(TestCase):
         self.assertEqual(resp.json()["code"], "FORBIDDEN")
 
     def test_search_data_scope_denied_for_province_reviewer(self):
-        """PROVINCE_REVIEWER 权限点通过、数据范围一期仅 ADMIN（D5）→ 403
-        DATA_SCOPE_DENIED（复用 persons apply_person_scope 同口径）。"""
+        """未绑定组织的 PROVINCE_REVIEWER 无有效范围 → 403（幽灵范围口径）。"""
         resp = self._post(self.SEARCH, {}, token=self.prov_token)
         self.assertEqual(resp.status_code, 403)
         self.assertEqual(resp.json()["code"], "DATA_SCOPE_DENIED")
@@ -4737,6 +4772,18 @@ class DossierApiTests(TestCase):
         )
         self.assertEqual(resp.status_code, 403)
         self.assertEqual(resp.json()["code"], "DATA_SCOPE_DENIED")
+
+    def test_search_scope_open_for_bound_province(self):
+        """绑定省级组织后，遴选档案检索/详情按全省范围开放（2026-11-04）。"""
+        resp = self._post(self.SEARCH, {}, token=self.prov_scoped_token)
+        self.assertEqual(resp.status_code, 200)
+        names = {item["athlete"]["realName"] for item in resp.json()["data"]["items"]}
+        self.assertIn("王候选", names)
+
+        resp = self._get(
+            f"{self.GET_BASE}/{self.athlete.pk}", token=self.prov_scoped_token
+        )
+        self.assertEqual(resp.status_code, 200)
 
     def test_permission_points_registered_with_contract_roles(self):
         from apps.common.permissions import operation_roles

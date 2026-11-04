@@ -228,3 +228,55 @@ def test_form_config_rejects_non_university(client, auth):
         )
         assert response.status_code == 403, username
         assert response.json()["code"] == "FORBIDDEN"
+
+
+def test_global_admin_sees_all_enrollments(client, auth):
+    """未挂组织的全局管理员覆盖全库（与文档口径一致，2026-11-04 修复）。"""
+    school_a = auth("university")
+    school_b = auth("university2")
+    first = create_draft(client, school_a, team_id="org_team_01")
+    second = create_draft(client, school_b, team_id="org_team_02")
+
+    admin = auth("globaladmin")
+    listing = client.get(f"{BASE}/enrollments", **admin)
+    assert listing.status_code == 200
+    ids = {item["id"] for item in listing.json()["data"]["items"]}
+    assert {first["id"], second["id"]} <= ids
+
+    detail = client.get(f"{BASE}/enrollments/{second['id']}", **admin)
+    assert detail.status_code == 200
+
+    stats = client.get(
+        f"{BASE}/enrollment-statistics?eventId=event_01&dimension=CITY", **admin
+    )
+    assert stats.status_code == 200
+
+
+def test_recorder_reads_but_cannot_write_roster(client, auth):
+    """记录台跨队只读；名单/附件写操作需创建者或本队（2026-11-04 修复）。"""
+    school = auth("university")
+    enrollment = create_draft(client, school)
+    recorder = auth("recorder")
+
+    listing = client.get(
+        f"{BASE}/enrollments/{enrollment['id']}/players", **recorder
+    )
+    assert listing.status_code == 200
+
+    created = post_json(
+        client,
+        f"{BASE}/enrollments/{enrollment['id']}/players",
+        recorder,
+        {"athleteId": "per_test_00", "jerseyNumber": 7, "position": "DF"},
+    )
+    assert created.status_code == 403
+    assert created.json()["code"] == "FORBIDDEN"
+
+    attachment = post_json(
+        client,
+        f"{BASE}/enrollments/{enrollment['id']}/attachments",
+        recorder,
+        {"materialType": "STAMPED_FORM", "fileId": "file_not_owned"},
+    )
+    assert attachment.status_code == 403
+    assert attachment.json()["code"] == "FORBIDDEN"
