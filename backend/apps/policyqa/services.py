@@ -192,10 +192,10 @@ def _ask_model(question: str, documents: list[PolicyDocument]) -> Optional[str]:
                     "model": conf.AI_MODEL,
                     "messages": messages,
                     "temperature": 0,
-                    # MiMo 是推理模型：不关 thinking 时推理会吃掉大半
-                    # completion 预算并拖长耗时，在 AI_TIMEOUT_SECONDS 内
-                    # 容易拿到空 content 而降级 UNAVAILABLE
-                    "thinking": {"type": "disabled"},
+                    # GLM-5.3-Flash 始终思考、不接受 thinking 关闭（400/1210）；
+                    # 用 reasoning_effort=low 压低推理开销，避免超出
+                    # AI_TIMEOUT_SECONDS 后拿到空 content 降级 UNAVAILABLE
+                    "reasoning_effort": "low",
                 },
                 headers={"Authorization": f"Bearer {conf.AI_API_KEY}"},
             )
@@ -257,7 +257,7 @@ def _ask_general(question: str) -> Optional[str]:
                     "model": conf.AI_MODEL,
                     "messages": messages,
                     "temperature": 0.3,
-                    "thinking": {"type": "disabled"},
+                    "reasoning_effort": "low",
                 },
                 headers={"Authorization": f"Bearer {conf.AI_API_KEY}"},
             )
