@@ -283,7 +283,14 @@ def match_list(
 @router.post("/matches", auth=_auth, response=EnvelopeOut, summary="创建比赛对阵")
 def match_create(request, body: s.MatchCreate):
     require("matchCreate")
+    # 创建前服务端 ID 未定，按 账号+操作+key 隔离（object_id 留空）；
+    # 与事件接口一致：同键同正文回放首次结果，同键不同正文 409 IDEMPOTENCY_CONFLICT
+    g = idempotency.guard(request, "matchCreate", payload=body.model_dump())
+    if g.replay is not None:
+        return g.replay
     match = services.create_match(body.model_dump())
+    envelope = ok(s.match_out(match))
+    g.commit(envelope)
     audit_state(
         request,
         "match.create",
@@ -291,7 +298,7 @@ def match_create(request, body: s.MatchCreate):
         object_id=match.pk,
         summary=f"创建对阵 {match.home_team_id} vs {match.away_team_id}",
     )
-    return ok(s.match_out(match))
+    return envelope
 
 
 @router.get("/matches/{match_id}", auth=_auth, response=EnvelopeOut, summary="比赛对阵详情")

@@ -1117,6 +1117,7 @@ class DisplayAndSchemaTests(TestCase):
             data=json.dumps(payload),
             content_type="application/json",
             HTTP_AUTHORIZATION=f"Bearer {token}",
+            HTTP_IDEMPOTENCY_KEY=f"aware-kickoff-{payload['kickoffAt']}",
         )
         self.assertEqual(response.status_code, 200, response.content)
 

@@ -27,6 +27,98 @@ def body(response) -> dict:
     return json.loads(response.content.decode("utf-8"))
 
 
+class MatchCreateIdempotencyTests(TestCase):
+    """matchCreate 幂等 guard：同键同正文回放，同键不同正文 409。"""
+
+    @classmethod
+    def setUpTestData(cls):
+        from apps.events.models import Event, EventGroup
+        from apps.teams.models import Team
+
+        call_command("seed_demo", verbosity=0)
+        cls.team_a = Team.objects.create(team_no="T202600000001",
+                                         name="幂等主队", category_code="MIDDLE")
+        cls.team_b = Team.objects.create(team_no="T202600000002",
+                                         name="幂等客队", category_code="MIDDLE")
+        event = Event.objects.create(
+            id="evt_idem", name="幂等赛事", season="2026",
+            registration_opens_at="2026-01-01T00:00:00Z",
+            registration_closes_at="2026-12-31T23:59:59Z", status="PUBLISHED",
+        )
+        EventGroup.objects.create(
+            id="grp_idem", event=event, name="幂等组", category="MIDDLE",
+            gender="MALE", max_players=25, required_material_types=["STAMPED_FORM"],
+            rules_confirmed=True, min_players=5,
+        )
+
+    def _token(self):
+        response = self.client.post(
+            BASE + "/auth/login",
+            data=json.dumps({"username": "admin", "password": PASSWORD}),
+            content_type="application/json",
+        )
+        return body(response)["data"]["accessToken"]
+
+    def _payload(self):
+        return {
+            "eventId": "evt_idem", "groupId": "grp_idem",
+            "homeTeamId": str(self.team_a.pk), "awayTeamId": str(self.team_b.pk),
+            "kickoffAt": "2026-08-01T15:00:00+08:00", "status": "SCHEDULED",
+            "venue": "幂等场地", "stage": "小组赛",
+        }
+
+    def _post(self, token, key):
+        return self.client.post(
+            BASE + "/matches",
+            data=json.dumps(self._payload()),
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+            HTTP_IDEMPOTENCY_KEY=key,
+        )
+
+    def test_same_key_same_body_replays_first_result(self):
+        from apps.events.models import Match
+
+        token = self._token()
+        first = self._post(token, "idem-mk-1")
+        self.assertEqual(first.status_code, 200, first.content)
+        first_id = body(first)["data"]["id"]
+
+        second = self._post(token, "idem-mk-1")
+        self.assertEqual(second.status_code, 200, second.content)
+        self.assertEqual(body(second)["data"]["id"], first_id)
+        # 不产生第二场比赛
+        self.assertEqual(Match.objects.count(), 1)
+
+    def test_same_key_different_body_conflicts(self):
+        from apps.events.models import Match
+
+        token = self._token()
+        first = self._post(token, "idem-mk-2")
+        self.assertEqual(first.status_code, 200, first.content)
+
+        self.client.post(
+            BASE + "/matches",
+            data=json.dumps({**self._payload(), "venue": "另一个场地"}),
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+            HTTP_IDEMPOTENCY_KEY="idem-mk-2",
+        )
+        # 同键不同正文被拒绝，不产生新场次
+        self.assertEqual(Match.objects.count(), 1)
+
+    def test_different_key_same_body_creates_new_match(self):
+        from apps.events.models import Match
+
+        token = self._token()
+        first = self._post(token, "idem-mk-3a")
+        second = self._post(token, "idem-mk-3b")
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        self.assertNotEqual(body(first)["data"]["id"], body(second)["data"]["id"])
+        self.assertEqual(Match.objects.count(), 2)
+
+
 class ApiSmokeTests(TestCase):
     @classmethod
     def setUpTestData(cls):
