@@ -43,6 +43,30 @@ def team_name(team_id: str, fallback: Optional[str] = None) -> str:
     return name or (fallback if fallback is not None else "")
 
 
+def athlete_name_in_match(match, athlete_id: str, fallback: Optional[str] = None) -> str:
+    """运动员姓名：优先取本场（赛事+组别+双方球队）报名名单快照，
+    避免同一运动员跨赛事改名后展示错名；查不到回退全局解析。"""
+    if not athlete_id or match is None:
+        return athlete_name(athlete_id, fallback)
+    from apps.enrollments.models import Enrollment, RosterItem
+
+    name = (
+        RosterItem.objects.filter(
+            athlete_id=athlete_id,
+            enrollment__in=Enrollment.objects.filter(
+                event_id=match.event_id,
+                group_id=match.group_id,
+                team_id__in=[match.home_team_id, match.away_team_id],
+            ),
+        )
+        .values_list("athlete_name", flat=True)
+        .first()
+    )
+    if name:
+        return name
+    return athlete_name(athlete_id, fallback)
+
+
 def athlete_name(athlete_id: str, fallback: Optional[str] = None) -> str:
     """运动员姓名：优先取报名名单中的姓名快照，其次人员主档。"""
     if not athlete_id:

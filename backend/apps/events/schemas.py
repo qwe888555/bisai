@@ -9,7 +9,7 @@ from __future__ import annotations
 from datetime import date, datetime
 from typing import Literal, Optional
 
-from pydantic import Field
+from pydantic import Field, field_validator
 
 from apps.common.schemas import StrictSchema
 from .services import event_phase
@@ -148,6 +148,14 @@ class MatchCreate(StrictSchema):
     status: MatchStatus
     referees: list[RefereeAssignment] = []
 
+    @field_validator("kickoffAt")
+    @classmethod
+    def _kickoff_must_carry_timezone(cls, value: datetime) -> datetime:
+        # 契约要求日期时间必须带时区；naive 值会被 Django 按默认时区静默偏移
+        if value.utcoffset() is None:
+            raise ValueError("kickoffAt 必须带时区（ISO8601 偏移，如 +08:00）")
+        return value
+
 
 class MatchUpdate(MatchCreate):
     version: int = Field(ge=0)
@@ -229,7 +237,14 @@ class MatchEventUpdate(StrictSchema):
     event: MatchEventCreate
 
 
-def match_event_out(event) -> dict:
+def match_event_out(event, match=None) -> dict:
+    """事件投影；传入 match 时姓名按本场名单快照解析，否则回退全局。"""
+
+    def _name(athlete_id: str, fallback: str) -> str:
+        if match is not None:
+            return display.athlete_name_in_match(match, athlete_id, fallback)
+        return display.athlete_name(athlete_id, fallback)
+
     data = {
         "id": event.pk,
         "matchId": event.match_id,
@@ -250,26 +265,20 @@ def match_event_out(event) -> dict:
         data["teamName"] = team_name
     if event.scorer_athlete_id:
         data["scorerAthleteId"] = event.scorer_athlete_id
-        data["scorerName"] = display.athlete_name(
-            event.scorer_athlete_id, event.scorer_athlete_id
-        )
+        data["scorerName"] = _name(event.scorer_athlete_id, event.scorer_athlete_id)
     if event.athlete_id:
         data["athleteId"] = event.athlete_id
-        data["athleteName"] = display.athlete_name(event.athlete_id, event.athlete_id)
+        data["athleteName"] = _name(event.athlete_id, event.athlete_id)
     if event.penalty_type:
         data["penaltyType"] = event.penalty_type
     if event.reason:
         data["reason"] = event.reason
     if event.out_athlete_id:
         data["outAthleteId"] = event.out_athlete_id
-        data["outAthleteName"] = display.athlete_name(
-            event.out_athlete_id, event.out_athlete_id
-        )
+        data["outAthleteName"] = _name(event.out_athlete_id, event.out_athlete_id)
     if event.in_athlete_id:
         data["inAthleteId"] = event.in_athlete_id
-        data["inAthleteName"] = display.athlete_name(
-            event.in_athlete_id, event.in_athlete_id
-        )
+        data["inAthleteName"] = _name(event.in_athlete_id, event.in_athlete_id)
     return data
 
 # ---------------------------------------------------------------- 赛事文件 / 图文直播 / 直播链接（5.3 / 5.4）
@@ -572,7 +581,7 @@ def public_match_out(match) -> dict:
 def public_match_detail_out(match, events) -> dict:
     """门户比赛详情：在对阵投影上补裁判组与已记录事件（含姓名投影）。"""
     data = public_match_out(match)
-    data["events"] = [match_event_out(event) for event in events]
+    data["events"] = [match_event_out(event, match=match) for event in events]
     return data
 
 

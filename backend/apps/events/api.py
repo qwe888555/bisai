@@ -268,7 +268,7 @@ def match_list(
     request,
     eventId: Optional[str] = None,
     groupId: Optional[str] = None,
-    status: Optional[str] = None,
+    status: Optional[s.MatchStatus] = None,
     teamId: Optional[str] = None,
     teamName: Optional[str] = None,
 ):
@@ -296,8 +296,8 @@ def match_create(request, body: s.MatchCreate):
 
 @router.get("/matches/{match_id}", auth=_auth, response=EnvelopeOut, summary="比赛对阵详情")
 def match_get(request, match_id: str):
-    require("matchGet")
-    match = services.get_match(match_id)
+    account = require("matchGet")
+    match = services.get_match(match_id, account=account)
     return ok(s.match_out(match))
 
 
@@ -371,10 +371,13 @@ register_operation("matchEventDelete", _MATCH_ROLES)
     response=EnvelopeOut,
     summary="查看进球/判罚/换人事件",
 )
-def match_event_list(request, match_id: str, eventType: Optional[str] = None):
+def match_event_list(request, match_id: str, eventType: Optional[s.MatchEventType] = None):
     require("matchEventList")
+    match = services.get_match(match_id)
     queryset = services.list_match_events(match_id, eventType)
-    return paginate(request, queryset, mapper=s.match_event_out)
+    return paginate(
+        request, queryset, mapper=lambda e: s.match_event_out(e, match=match)
+    )
 
 
 @router.post(
@@ -391,7 +394,7 @@ def match_event_create(request, match_id: str, body: s.MatchEventCreate):
     if g.replay is not None:
         return g.replay
     event = services.create_match_event(match_id, body.model_dump())
-    envelope = ok(s.match_event_out(event))
+    envelope = ok(s.match_event_out(event, match=services.get_match(match_id)))
     g.commit(envelope)
     audit_state(
         request,
@@ -412,7 +415,7 @@ def match_event_create(request, match_id: str, body: s.MatchEventCreate):
 def match_event_get(request, match_id: str, event_id: str):
     require("matchEventGet")
     event = services.get_match_event(match_id, event_id)
-    return ok(s.match_event_out(event))
+    return ok(s.match_event_out(event, match=services.get_match(match_id)))
 
 
 @router.put(
@@ -433,7 +436,7 @@ def match_event_update(request, match_id: str, event_id: str, body: s.MatchEvent
         object_id=event.pk,
         summary="修改比赛事件，比分同步重算",
     )
-    return ok(s.match_event_out(event))
+    return ok(s.match_event_out(event, match=services.get_match(match_id)))
 
 
 @router.delete(
@@ -498,7 +501,7 @@ def match_document_create(request, match_id: str, body: s.MatchDocumentCreate):
     response=EnvelopeOut,
     summary="比赛文件列表",
 )
-def match_document_list(request, match_id: str, documentType: Optional[str] = None):
+def match_document_list(request, match_id: str, documentType: Optional[s.DocumentType] = None):
     require("matchDocumentList")
     queryset = services.list_match_documents(match_id, documentType)
     return paginate(request, queryset, mapper=s.match_document_out)

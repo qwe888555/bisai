@@ -100,8 +100,23 @@ def update_event(event_id: str, data: dict) -> Event:
 def delete_event(event_id: str, version: Optional[int]) -> Event:
     event = get_event(event_id)
     check_version(event, version)
+    from apps.enrollments.models import Enrollment
+    from selection.models import PublicityRecord, ResultBatch, Score
+
+    from .models import Match
+
     if EventGroup.objects.filter(event=event).exists():
         raise ApiError(STATE_CONFLICT, "该赛事下仍有组别，不能删除")
+    if Match.objects.filter(event_id=event.pk).exists():
+        raise ApiError(STATE_CONFLICT, "该赛事下仍有比赛对阵，不能删除")
+    if Enrollment.objects.filter(event_id=event.pk).exists():
+        raise ApiError(STATE_CONFLICT, "该赛事下仍有报名记录，不能删除")
+    if (
+        Score.objects.filter(event_id=event.pk).exists()
+        or ResultBatch.objects.filter(event_id=event.pk).exists()
+        or PublicityRecord.objects.filter(event_id=event.pk).exists()
+    ):
+        raise ApiError(STATE_CONFLICT, "该赛事下仍有评分/遴选结果记录，不能删除")
     event.deleted_at = timezone.now()
     bump(event)
     event.save()
@@ -188,7 +203,14 @@ def update_group(event_id: str, group_id: str, data: dict) -> EventGroup:
 def delete_group(event_id: str, group_id: str, version: Optional[int]) -> EventGroup:
     group = get_group(event_id, group_id)
     check_version(group, version)
-    # D1 尚无报名快照/比赛事件引用；存在受保护关联时在此追加 409 判断
+    from apps.enrollments.models import Enrollment
+
+    from .models import Match
+
+    if Match.objects.filter(group_id=group.pk).exists():
+        raise ApiError(STATE_CONFLICT, "该组别下仍有比赛对阵，不能删除")
+    if Enrollment.objects.filter(group_id=group.pk).exists():
+        raise ApiError(STATE_CONFLICT, "该组别下仍有报名记录，不能删除")
     group.deleted_at = timezone.now()
     bump(group)
     group.save()
@@ -276,11 +298,13 @@ def _validate_match_refs(event_id: str, group_id: str) -> None:
             "赛事不存在",
             [{"field": "eventId", "reason": "eventId 指向的赛事不存在或已删除"}],
         )
-    if not EventGroup.objects.filter(pk=group_id, deleted_at__isnull=True).exists():
+    if not EventGroup.objects.filter(
+        pk=group_id, event_id=event_id, deleted_at__isnull=True
+    ).exists():
         raise ApiError(
             BUSINESS_VALIDATION_FAILED,
-            "组别不存在",
-            [{"field": "groupId", "reason": "groupId 指向的组别不存在或已删除"}],
+            "组别不存在或不属于该赛事",
+            [{"field": "groupId", "reason": "groupId 必须属于 eventId 对应的赛事"}],
         )
 
 
@@ -312,43 +336,69 @@ def create_match(data: dict) -> "Match":
     )
 
 
-def get_match(match_id: str) -> "Match":
+def get_match(match_id: str, account=None, for_update: bool = False) -> "Match":
     from .models import Match
 
-    match = Match.objects.filter(pk=match_id).first()
+    queryset = Match.objects.all()
+    if for_update:
+        # 必须在事务内使用；SQLite 下为 no-op，PG/MySQL 下锁行，
+        # 使「检查版本→写入」在同行锁内串行化，堵住并发双写漏算比分
+        queryset = queryset.select_for_update()
+    match = queryset.filter(pk=match_id).first()
     if match is None:
         raise ApiError(NOT_FOUND)
+    if account is not None:
+        scope_ids = _match_scope_team_ids(account)
+        if scope_ids is not None and (
+            match.home_team_id not in scope_ids and match.away_team_id not in scope_ids
+        ):
+            from apps.common.errors import DATA_SCOPE_DENIED
+
+            raise ApiError(DATA_SCOPE_DENIED, "该比赛不在当前账号数据范围内")
     return match
 
 
 def update_match(match_id: str, data: dict) -> "Match":
-    match = get_match(match_id)
-    check_version(match, data.get("version"))
-    _validate_match_refs(data["eventId"], data["groupId"])
-    _validate_sides(data["homeTeamId"], data["awayTeamId"])
-    # PUT 整份替换：未提交的可选字段回到默认，不做 PATCH 合并
-    match.event_id = data["eventId"]
-    match.group_id = data["groupId"]
-    match.home_team_id = data["homeTeamId"]
-    match.away_team_id = data["awayTeamId"]
-    match.kickoff_at = data["kickoffAt"]
-    match.venue = data.get("venue", "")
-    match.stage = data.get("stage", "")
-    match.status = data.get("status", match.status)
-    match.referees = list(data.get("referees") or [])
-    bump(match)
-    match.save()
+    from django.db import transaction
+
+    # 并发安全：锁 match 行后再校验版本并写入
+    with transaction.atomic():
+        match = get_match(match_id, for_update=True)
+        check_version(match, data.get("version"))
+        _validate_match_refs(data["eventId"], data["groupId"])
+        _validate_sides(data["homeTeamId"], data["awayTeamId"])
+        # PUT 整份替换：未提交的可选字段回到默认，不做 PATCH 合并
+        match.event_id = data["eventId"]
+        match.group_id = data["groupId"]
+        match.home_team_id = data["homeTeamId"]
+        match.away_team_id = data["awayTeamId"]
+        match.kickoff_at = data["kickoffAt"]
+        match.venue = data.get("venue", "")
+        match.stage = data.get("stage", "")
+        match.status = data.get("status", match.status)
+        match.referees = list(data.get("referees") or [])
+        bump(match)
+        match.save()
     return match
 
 
 def delete_match(match_id: str, version: Optional[int]) -> "Match":
-    from .models import Match, MatchEvent
+    from .models import LiveLink, LivePost, Match, MatchDocument, MatchEvent
 
     match = get_match(match_id)
     check_version(match, version)
-    # 存在未删除的比赛事件流时 409，不级联破坏历史事件
+    if match.result_published:
+        raise ApiError(STATE_CONFLICT, "该比赛赛果已发布，不能删除")
+    # 存在未删除的历史关联时 409，不级联破坏事件/文件/直播
     if MatchEvent.objects.filter(match_id=match_id, deleted_at__isnull=True).exists():
         raise ApiError(STATE_CONFLICT, "该比赛已存在事件记录，不能删除")
+    if MatchDocument.objects.filter(match_id=match_id).exists():
+        raise ApiError(STATE_CONFLICT, "该比赛已存在赛事文件，不能删除")
+    if (
+        LivePost.objects.filter(match_id=match_id).exists()
+        or LiveLink.objects.filter(match_id=match_id).exists()
+    ):
+        raise ApiError(STATE_CONFLICT, "该比赛已存在直播内容，不能删除")
     match.deleted_at = timezone.now()
     bump(match)
     match.save()
@@ -377,12 +427,27 @@ def unpublish_match(match_id: str, version: int, reason: str) -> "Match":
 # ---------------------------------------------------------------- 比赛事件流（5.2）
 
 def _rescore(match) -> None:
-    """由未撤销 GOAL 事件重算比分；不接受手填比分。teamId 即得分队。"""
+    """由未撤销 GOAL 事件重算比分；不接受手填比分。teamId 即得分队。
+
+    弃权/人工裁定的比分是人工录值，不允许被事件重算覆盖；需要改回事件派生比分时，
+    调用方须先把 resultType 切回 NORMAL（见 write_match_result / delete_match_result）。
+    """
     from .models import MatchEvent
 
+    if match.result_type == "FORFEIT":
+        return
     goals = MatchEvent.objects.filter(match_id=match.pk, event_type="GOAL")
     match.home_score = sum(1 for g in goals if g.team_id == match.home_team_id)
     match.away_score = sum(1 for g in goals if g.team_id == match.away_team_id)
+
+
+def _ensure_result_not_published(match, action: str) -> None:
+    if match.result_published:
+        raise ApiError(
+            STATE_CONFLICT,
+            f"赛果已发布，不能{action}",
+            [{"field": "resultPublished", "reason": "请先撤下赛果发布"}],
+        )
 
 
 def _validate_event_team(match, team_id: str) -> None:
@@ -410,6 +475,79 @@ def _validate_event_payload(data: dict) -> None:
         if not data.get("outAthleteId") or not data.get("inAthleteId"):
             raise ApiError(BUSINESS_VALIDATION_FAILED, "换人必须填写 outAthleteId 与 inAthleteId",
                            [{"field": "event", "reason": "SUBSTITUTION 双方球员必填"}])
+    # 分支字段互斥：其它分支的专用字段一律拒绝，避免混合脏数据落库
+    branch_fields = {
+        "GOAL": ("scorerAthleteId", "ownGoal"),
+        "PENALTY": ("athleteId", "penaltyType", "reason"),
+        "SUBSTITUTION": ("outAthleteId", "inAthleteId"),
+    }
+    allowed = branch_fields[etype]
+    common = ("scorerAthleteId", "ownGoal", "athleteId", "penaltyType",
+              "reason", "outAthleteId", "inAthleteId")
+    for field in common:
+        if field not in allowed and data.get(field) not in (None, "", False):
+            raise ApiError(
+                BUSINESS_VALIDATION_FAILED,
+                f"{etype} 事件不允许携带 {field}",
+                [{"field": field, "reason": f"{field} 仅用于其它事件类型"}],
+            )
+
+
+def _valid_roster_athletes(match, team_id: str) -> set[str]:
+    """本场有效报名名单：该赛事/组别/球队的已通过报名单中资格有效且未删除的球员。"""
+    from apps.enrollments.models import (
+        QUALIFICATION_QUALIFIED,
+        STATUS_APPROVED,
+        Enrollment,
+        RosterItem,
+    )
+
+    enrollment_ids = Enrollment.objects.filter(
+        event_id=match.event_id,
+        group_id=match.group_id,
+        team_id=team_id,
+        status=STATUS_APPROVED,
+    ).values_list("pk", flat=True)
+    return set(
+        RosterItem.objects.filter(
+            enrollment_id__in=enrollment_ids,
+            qualification_status=QUALIFICATION_QUALIFIED,
+        ).values_list("athlete_id", flat=True)
+    )
+
+
+def _raise_not_in_roster(field: str, reason: str) -> None:
+    raise ApiError(
+        BUSINESS_VALIDATION_FAILED,
+        "球员不在本场有效报名名单内",
+        [{"field": field, "reason": reason}],
+    )
+
+
+def _validate_event_roster(match, data: dict) -> None:
+    etype = data["eventType"]
+    team_id = data["teamId"]
+    team_athletes = _valid_roster_athletes(match, team_id)
+    opponent_id = (
+        match.away_team_id if team_id == match.home_team_id else match.home_team_id
+    )
+    if etype == "GOAL":
+        scorer = data["scorerAthleteId"]
+        if data.get("ownGoal"):
+            if scorer not in _valid_roster_athletes(match, opponent_id):
+                _raise_not_in_roster(
+                    "scorerAthleteId", "乌龙球球员必须属于对方球队的有效报名名单"
+                )
+        elif scorer not in team_athletes:
+            _raise_not_in_roster("scorerAthleteId", "进球球员必须属于 teamId 对应球队")
+    elif etype == "PENALTY":
+        if data["athleteId"] not in team_athletes:
+            _raise_not_in_roster("athleteId", "判罚球员必须属于 teamId 对应球队")
+    elif etype == "SUBSTITUTION":
+        if data["outAthleteId"] not in team_athletes:
+            _raise_not_in_roster("outAthleteId", "换出球员必须属于 teamId 对应球队")
+        if data["inAthleteId"] not in team_athletes:
+            _raise_not_in_roster("inAthleteId", "换入球员必须属于 teamId 对应球队")
 
 
 def list_match_events(match_id: str, event_type: Optional[str]):
@@ -437,11 +575,15 @@ def create_match_event(match_id: str, data: dict):
 
     from .models import MatchEvent
 
-    match = get_match(match_id)
-    check_version(match, data.get("matchVersion"))
-    _validate_event_team(match, data["teamId"])
-    _validate_event_payload(data)
+    # 并发安全：锁 match 行后再校验版本并写入；
+    # 同比赛并发的第二个请求会在版本校验处拿 409，而不是双写漏算比分
     with transaction.atomic():
+        match = get_match(match_id, for_update=True)
+        check_version(match, data.get("matchVersion"))
+        _ensure_result_not_published(match, "新增比赛事件")
+        _validate_event_team(match, data["teamId"])
+        _validate_event_payload(data)
+        _validate_event_roster(match, data)
         snapshot_version = int(match.version or 0)
         event = MatchEvent.objects.create(
             id=new_id("mev"),
@@ -464,19 +606,24 @@ def create_match_event(match_id: str, data: dict):
         bump(match)
         match.score_revision = int(match.score_revision or 0) + 1
         match.save()
+    # 响应返回父比赛当前版本，客户端据此做下一次写入；库内列保留录入时快照
+    event.match_version = int(match.version or 0)
     return event
 
 
 def update_match_event(match_id: str, event_id: str, version: int, data: dict):
     from django.db import transaction
 
-    event = get_match_event(match_id, event_id)
-    check_version(event, version)
-    match = get_match(match_id)
-    check_version(match, data.get("matchVersion"))
-    _validate_event_team(match, data["teamId"])
-    _validate_event_payload(data)
+    # 并发安全：与 create 一致，锁 match 行后再校验版本并写入
     with transaction.atomic():
+        event = get_match_event(match_id, event_id)
+        check_version(event, version)
+        match = get_match(match_id, for_update=True)
+        check_version(match, data.get("matchVersion"))
+        _ensure_result_not_published(match, "修改比赛事件")
+        _validate_event_team(match, data["teamId"])
+        _validate_event_payload(data)
+        _validate_event_roster(match, data)
         event.event_type = data["eventType"]
         event.minute = data["minute"]
         event.stoppage_minute = data.get("stoppageMinute")
@@ -496,17 +643,21 @@ def update_match_event(match_id: str, event_id: str, version: int, data: dict):
         bump(match)
         match.score_revision = int(match.score_revision or 0) + 1
         match.save()
+    # 与创建/修改一致：响应返回父比赛当前版本，库内快照不变
+    event.match_version = int(match.version or 0)
     return event
 
 
 def delete_match_event(match_id: str, event_id: str, version: int, match_version: int):
     from django.db import transaction
 
-    event = get_match_event(match_id, event_id)
-    check_version(event, version)
-    match = get_match(match_id)
-    check_version(match, match_version)
+    # 并发安全：与 create 一致，锁 match 行后再校验版本并写入
     with transaction.atomic():
+        event = get_match_event(match_id, event_id)
+        check_version(event, version)
+        match = get_match(match_id, for_update=True)
+        check_version(match, match_version)
+        _ensure_result_not_published(match, "撤销比赛事件")
         event.deleted_at = timezone.now()
         bump(event)
         event.save()
@@ -514,6 +665,8 @@ def delete_match_event(match_id: str, event_id: str, version: int, match_version
         bump(match)
         match.score_revision = int(match.score_revision or 0) + 1
         match.save()
+    # 响应返回父比赛当前版本，客户端据此做下一次写入
+    event.match_version = int(match.version or 0)
     return event
 
 # ---------------------------------------------------------------- 赛事文件（5.3）
@@ -1164,66 +1317,83 @@ def get_match_result(match_id: str) -> "Match":
 def write_match_result(match_id: str, data: dict, roles) -> "Match":
     """保存/修改赛果。NORMAL 比分由有效进球事件派生，不接受手填；
     FORFEIT/ADMIN_CORRECTION 仅 ADMIN/PROVINCE_REVIEWER，必填原因与人工比分。"""
-    match = get_match(match_id)
-    check_version(match, data.get("version"))
-    rtype = data["resultType"]
+    from django.db import transaction
 
-    if rtype == "NORMAL":
-        _rescore(match)
-        match.result_type = "NORMAL"
-        match.manual_home_score = None
-        match.manual_away_score = None
-        match.result_reason = ""
-    else:
-        if not (set(roles or ()) & _ADMIN_RESULT_ROLES):
-            raise ApiError(FORBIDDEN, "弃权/行政更正仅限管理员或省级审核",
-                           [{"field": "resultType", "reason": "需要 ADMIN/PROVINCE_REVIEWER"}])
-        reason = (data.get("reason") or "").strip()
-        if not reason:
-            raise ApiError(BUSINESS_VALIDATION_FAILED, "弃权/行政更正必须填写原因",
-                           [{"field": "reason", "reason": "人工裁定必填 reason"}])
-        mh, ma = data.get("manualHomeScore"), data.get("manualAwayScore")
-        if mh is None or ma is None:
-            raise ApiError(BUSINESS_VALIDATION_FAILED, "弃权/行政更正必须填写双方人工比分",
-                           [{"field": "manualHomeScore", "reason": "必填"}])
-        match.result_type = rtype
-        match.manual_home_score = mh
-        match.manual_away_score = ma
-        match.home_score = mh
-        match.away_score = ma
-        match.result_reason = reason
+    # 并发安全：锁 match 行后再校验版本并写入，防止并发赛果互相覆盖
+    with transaction.atomic():
+        match = get_match(match_id, for_update=True)
+        check_version(match, data.get("version"))
+        _ensure_result_not_published(match, "保存赛果")
+        rtype = data["resultType"]
 
-    match.score_revision = int(match.score_revision or 0) + 1
-    bump(match)
-    match.save()
-    return match
+        if rtype == "NORMAL":
+            # 先切回 NORMAL，_rescore 才会按事件重算；弃权场次的人工分由本操作显式覆盖。
+            match.result_type = "NORMAL"
+            match.manual_home_score = None
+            match.manual_away_score = None
+            match.result_reason = ""
+            _rescore(match)
+        else:
+            if not (set(roles or ()) & _ADMIN_RESULT_ROLES):
+                raise ApiError(FORBIDDEN, "弃权/行政更正仅限管理员或省级审核",
+                               [{"field": "resultType", "reason": "需要 ADMIN/PROVINCE_REVIEWER"}])
+            reason = (data.get("reason") or "").strip()
+            if not reason:
+                raise ApiError(BUSINESS_VALIDATION_FAILED, "弃权/行政更正必须填写原因",
+                               [{"field": "reason", "reason": "人工裁定必填 reason"}])
+            mh, ma = data.get("manualHomeScore"), data.get("manualAwayScore")
+            if mh is None or ma is None:
+                raise ApiError(BUSINESS_VALIDATION_FAILED, "弃权/行政更正必须填写双方人工比分",
+                               [{"field": "manualHomeScore", "reason": "必填"}])
+            match.result_type = rtype
+            match.manual_home_score = mh
+            match.manual_away_score = ma
+            match.home_score = mh
+            match.away_score = ma
+            match.result_reason = reason
+
+        match.score_revision = int(match.score_revision or 0) + 1
+        bump(match)
+        match.save()
+        return match
 
 
 def publish_match_result(match_id: str, version: int) -> "Match":
-    match = get_match(match_id)
-    check_version(match, version)
-    if match.status != "FINISHED":
-        raise ApiError(STATE_CONFLICT, "仅 FINISHED 且已确认赛果可发布",
-                       [{"field": "status", "reason": f"当前状态 {match.status}"}])
-    match.result_published = True
-    bump(match)
-    match.save()
-    return match
+    from django.db import transaction
+
+    # 并发安全：锁 match 行，防止与事件写入/赛果保存并发交错
+    with transaction.atomic():
+        match = get_match(match_id, for_update=True)
+        check_version(match, version)
+        if match.status != "FINISHED":
+            raise ApiError(STATE_CONFLICT, "仅 FINISHED 且已确认赛果可发布",
+                           [{"field": "status", "reason": f"当前状态 {match.status}"}])
+        match.result_published = True
+        bump(match)
+        match.save()
+        return match
 
 
 def delete_match_result(match_id: str, version: int) -> "Match":
     """撤下发布/人工裁定：不删底层比赛事件，回到 NORMAL 由事件重算，不自动重新发布。"""
-    match = get_match(match_id)
-    check_version(match, version)
-    match.result_published = False
-    match.result_type = "NORMAL"
-    match.manual_home_score = None
-    match.manual_away_score = None
-    match.result_reason = ""
-    _rescore(match)
-    bump(match)
-    match.save()
-    return match
+    from django.db import transaction
+
+    # 并发安全：锁 match 行后再校验版本并写入
+    with transaction.atomic():
+        match = get_match(match_id, for_update=True)
+        check_version(match, version)
+        match.result_published = False
+        match.result_type = "NORMAL"
+        match.manual_home_score = None
+        match.manual_away_score = None
+        match.result_reason = ""
+        _rescore(match)
+        # 与 write_match_result 一致：赛果口径变化必须递增 score_revision，
+        # 否则按 revision 判断比分变更的客户端会漏更新
+        match.score_revision = int(match.score_revision or 0) + 1
+        bump(match)
+        match.save()
+        return match
 
 
 # ---------------------------------------------------------------- 进球榜(5.5，由 GOAL 事件派生)
@@ -1381,15 +1551,29 @@ def public_match_detail(match_id: str):
 
 
 def public_live_feed(match_id: str, after_revision: int) -> dict:
-    """短轮询：仅已发布比赛；返回 cursor>afterRevision 的有效帖增量与最新 feedRevision。"""
+    """短轮询：仅已发布比赛；返回 cursor>afterRevision 的有效帖增量与最新 feedRevision。
+
+    删除增量用写入时 cursor 近似（软删行仍带原 cursor）：客户端 cursor 之后写入
+    又被删除的帖子以 deletedIds 通知。局限：cursor 之前写入、之后才删除的帖子
+    无法进入增量（需独立删除游标列才能彻底解决，暂不动 DDL）。
+    """
     from .models import LivePost
 
     match = public_get_match(match_id)
     posts = LivePost.objects.filter(match_id=match_id, cursor__gt=after_revision).order_by("cursor", "id")
+    deleted_ids = list(
+        LivePost.all_objects.filter(
+            match_id=match_id,
+            deleted_at__isnull=False,
+            cursor__gt=after_revision,
+        )
+        .order_by("cursor", "id")
+        .values_list("id", flat=True)
+    )
     return {
         "feedRevision": int(match.feed_revision or 0),
         "items": list(posts),
-        "deletedIds": [],
+        "deletedIds": deleted_ids,
         "resetRequired": after_revision < 0,
     }
 
