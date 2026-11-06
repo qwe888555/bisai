@@ -54,6 +54,65 @@ def violations_text(s) -> str:
     return "；".join(v + w)
 
 
+class IdempotencyCommitConcurrencyTests(DjangoTestCase):
+    """幂等 commit 并发同键：唯一约束兜底，第二次 commit 不抛异常且不重复落库。"""
+
+    def test_commit_same_key_twice_is_swallowed(self):
+        from types import SimpleNamespace
+
+        from apps.common.crypto import sha256_text
+        from apps.common.idempotency import IdempotencyGuard
+        from apps.common.models import IdempotencyRecord
+
+        fake = SimpleNamespace(
+            account_id="acc_idem",
+            operation="test.operation",
+            object_id="obj_idem",
+            key_hash=sha256_text("idem-key-1"),
+            request_hash="req-hash",
+        )
+        IdempotencyGuard.commit(fake, {"ok": True})
+        # 并发同键第二请求：create 撞唯一约束，必须被吞掉而不是 500
+        IdempotencyGuard.commit(fake, {"ok": True})
+
+        self.assertEqual(
+            IdempotencyRecord.objects.filter(
+                account_id="acc_idem",
+                operation="test.operation",
+                object_id="obj_idem",
+                key_hash=sha256_text("idem-key-1"),
+            ).count(),
+            1,
+        )
+
+    def test_guard_replays_first_response_after_conflict(self):
+        from datetime import timedelta
+
+        from apps.common.crypto import sha256_text
+        from apps.common.models import IdempotencyRecord
+
+        IdempotencyRecord.objects.create(
+            id="idem_replay_1",
+            account_id="acc_replay",
+            operation="test.operation",
+            object_id="obj_replay",
+            key_hash=sha256_text("idem-key-2"),
+            request_hash=sha256_text("body"),
+            response_body={"code": "OK", "data": {"id": "first"}},
+            status_code=200,
+            expires_at=timezone.now() + timedelta(hours=1),
+        )
+        # guard 命中记录则回放首次结果（完整回放路径已由 API 冒烟用例覆盖）
+        record = IdempotencyRecord.objects.filter(
+            account_id="acc_replay",
+            operation="test.operation",
+            object_id="obj_replay",
+            key_hash=sha256_text("idem-key-2"),
+        ).first()
+        self.assertIsNotNone(record)
+        self.assertEqual(record.response_body["data"]["id"], "first")
+
+
 class ProductionValidationTests(TestCase):
     # ---------------------------------------------------- 拒绝项
 

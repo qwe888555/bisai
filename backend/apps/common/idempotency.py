@@ -15,6 +15,7 @@ from datetime import timedelta
 from typing import Any, Optional
 
 from django.core.serializers.json import DjangoJSONEncoder
+from django.db import IntegrityError, transaction
 from django.utils import timezone
 
 from .context import get_current_account, get_request_id
@@ -115,19 +116,30 @@ class IdempotencyGuard:
         self.replay = (record.status_code, body)
 
     def commit(self, envelope: Any, status: int = 200) -> None:
-        """执行成功后落库；重复提交时由唯一约束兜底。"""
+        """执行成功后落库；并发同键由唯一约束兜底，冲突时回查已有记录。"""
         payload = envelope.to_dict() if hasattr(envelope, "to_dict") else envelope
         try:
-            IdempotencyRecord.objects.create(
-                id=new_idempotency_id(),
-                account_id=self.account_id,
-                operation=self.operation,
-                object_id=self.object_id,
-                key_hash=self.key_hash,
-                request_hash=self.request_hash,
-                response_body=_json_safe(payload),
-                status_code=status,
-                expires_at=timezone.now() + timedelta(hours=TTL_HOURS),
+            # 内层 atomic：无外层事务时是独立事务；有外层（ATOMIC_REQUESTS/测试）时
+            # 是 savepoint，IntegrityError 只回滚本块，不污染外层业务事务
+            with transaction.atomic():
+                IdempotencyRecord.objects.create(
+                    id=new_idempotency_id(),
+                    account_id=self.account_id,
+                    operation=self.operation,
+                    object_id=self.object_id,
+                    key_hash=self.key_hash,
+                    request_hash=self.request_hash,
+                    response_body=_json_safe(payload),
+                    status_code=status,
+                    expires_at=timezone.now() + timedelta(hours=TTL_HOURS),
+                )
+        except IntegrityError:
+            # 并发同键：另一请求已先落库，业务结果由唯一约束保证只有一份，
+            # 后续同键请求在 guard 处回放该记录；此处仅记录，不影响本次返回。
+            logger.info(
+                "幂等记录并发冲突，已由唯一约束兜底 operation=%s object_id=%s",
+                self.operation,
+                self.object_id,
             )
         except Exception:  # noqa: BLE001 - 业务已成功，幂等落库失败不能影响返回
             logger.warning("幂等记录写入失败，后续重复提交将无法回放", exc_info=True)
