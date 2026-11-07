@@ -41,6 +41,11 @@ class TeamCreateBody(StrictSchema):
     # 登记（规则文档待决 11）。
     groupCategory: Literal["PRIMARY", "MIDDLE"]
     schoolOrgId: Optional[str] = Field(None, min_length=1, max_length=64)
+    # 2026-11-02 契约对齐（用户管理端全量联调发现）：docs/后端接口文档.md
+    # teamCreate 请求表列出 cityOrgId（可选），前端 TeamsView 创建表单也提交
+    # 该字段；此前未声明导致 extra=forbid 直接 400。市州组织用于确定球队
+    # region（沿学校上溯的市州兜底），详见 services.create_team。
+    cityOrgId: Optional[str] = Field(None, min_length=1, max_length=64)
     intro: Optional[str] = None
     # ---- 2026-10-29 起落库（补列）：gender/campusName ----
     gender: Optional[str] = Field(None, max_length=20)
@@ -65,6 +70,9 @@ class TeamUpdateBody(StrictSchema):
     gender: Optional[str] = Field(None, max_length=20)
     coachName: Optional[str] = Field(None, max_length=100)
     schoolOrgId: Optional[str] = Field(None, min_length=1, max_length=64)
+    # 契约可选字段（同 teamCreate）：前端编辑未提交，声明以放行；市州随学校
+    # 派生，不在此处改绑（改绑需与学校一致性校验，契约未定义该流程）。
+    cityOrgId: Optional[str] = Field(None, min_length=1, max_length=64)
     groupCategory: Optional[Literal["PRIMARY", "MIDDLE"]] = Field(None)  # 回传原值：同 create 无高校组
     version: int = Field(ge=0)
 
@@ -88,6 +96,17 @@ class CoachAddBody(StrictSchema):
 class MemberSearchBody(StrictSchema):
     """POST /teams/{id}/members/search 正文（前端 TeamMembersView L93 只传 keyword，
     与 persons PersonSearchBody 同款值域约束）。"""
+
+    keyword: str = Field(min_length=1, max_length=50)
+
+
+class CoachSearchBody(StrictSchema):
+    """POST /teams/{id}/coaches/search 正文（与 MemberSearchBody 同值域）。
+
+    TeamCoachesView 添加弹窗原用通用 POST /people/search：TEAM 账号数据范围
+    只含本队现役成员（均运动员），按 kinds=COACH 过滤后恒为空 → 教练候选
+    必须走球队域接口（2026-11-04 缺陷修复）。
+    """
 
     keyword: str = Field(min_length=1, max_length=50)
 

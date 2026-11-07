@@ -152,9 +152,18 @@ def dict_item_out(item) -> dict:
 
 class PersonSearchBody(StrictSchema):
     """POST /people/search 正文：前端三处调用（PublicationsManageView L160、
-    TeamCoachesView L77、EnrollmentDetailView L253）均只传 keyword。"""
+    TeamCoachesView L77、EnrollmentDetailView L253）均只传 keyword。
+
+    reviewStatus 默认 APPROVED（2026-11-03 复测问题 1）：该接口用于下游
+    人员选择器，草稿/待审/驳回档案不应可选；人员管理页查看全状态走
+    GET /people?reviewStatus=…，需要指定其他状态时可显式传本字段。
+    """
 
     keyword: str = Field(min_length=1, max_length=50)
+    reviewStatus: Literal["DRAFT", "PENDING", "APPROVED", "REJECTED"] = Field(
+        default="APPROVED",
+        description="审核状态，默认仅返回已通过档案",
+    )
 
 
 class PersonReviewBody(StrictSchema):
@@ -170,15 +179,24 @@ class PersonReviewBody(StrictSchema):
     version: int = Field(ge=0)
 
 
+class PersonSubmitBody(StrictSchema):
+    """学校提交档案复核（POST /people/{id}/submit）。
+
+    建档权限下沉学校后，学校录入的 DRAFT 必须由学校提交进入 PENDING，
+    否则学校侧没有把 DRAFT 转交审核的入口；version 必填乐观锁。
+    """
+
+    version: int = Field(ge=0)
+
+
 class DossierSearchBody(StrictSchema):
     """POST /selection-dossiers/search 请求体（接口文档 §6.8 dossierSearch + §7 DossierSearch）。
 
     - idNumber：受控检索（文档 L4713"服务端加密并生成查重索引；不回显到响应
       与日志"）→ 服务层 lookup_hash 精确匹配（与 create_person 写链同款），
       响应仅 maskedIdNumber；
-    - eventId/groupId：契约仅定义"内部ID"参数、未规定筛选行为，报名/比赛读
-      模型未落地（冻结 22 表无此域）→ 服务层遇非空值返回 400 明确未开放
-      （待决策项 D-A：不默认空集、不虚构过滤语义）；
+    - eventId/groupId：按已通过报名名单收窄（与遴选候选人口径一致），
+      不再拒绝非空值；
     - 检索资格：文档 L4708"仅运动员遴选档案受控检索，不允许借用教练员或
       其他人员过滤字段扩大数据范围"→ 服务层强制 AthleteProfile 行存在。
     """

@@ -91,8 +91,9 @@ class MaterialApiTests(TestCase):
         Organization.objects.create(
             id="ORG-MSA", code="SCH-900100-101", name="丙一小组织", org_type="SCHOOL"
         )
-        # D1（2026-10-28）：普通材料审核权限仅学校端——审核类测试统一改用
-        # 本校审核账号；ADMIN 仅保留创建/更新/删除/列表等系统管理能力
+        # 审核类测试统一改用本校审核账号（多数用例验证学校端口径）；
+        # 2026-11-02 管理端联调后 materialReview 含 ADMIN，ADMIN 审核见
+        # test_admin_review_allowed_without_audit_evidence / _denied_for_own_material
         cls.uni_reviewer = Account.objects.create(
             id=new_account_id(),
             username="materials-reviewer",
@@ -122,6 +123,27 @@ class MaterialApiTests(TestCase):
         cls.person_b = _person(2, "材料乙")
         cls.person_c = _person(3, "材料丙")
         cls.person_del = _person(4, "材料删", deleted=True)
+        # 本人自服务账号（2026-11-04 开放材料自范围）：绑定人员档案
+        cls.athlete_self = Account.objects.create(
+            id=new_account_id(),
+            username="materials-athlete-self",
+            display_name="运动员本人",
+            roles=["ATHLETE"],
+            password=make_password("athlete-self-pass"),
+            enabled=True,
+            person_id=str(cls.person_a.pk),
+        )
+        cls.coach_self = Account.objects.create(
+            id=new_account_id(),
+            username="materials-coach-self",
+            display_name="教练本人",
+            roles=["COACH"],
+            password=make_password("coach-self-pass"),
+            enabled=True,
+            person_id=str(cls.person_b.pk),
+        )
+        cls.athlete_self_token = _token(cls.athlete_self)
+        cls.coach_self_token = _token(cls.coach_self)
         cls.team_a = Team.objects.create(
             team_no="T202600000101", name="丙一小男足队", category_code="PRIMARY",
             region=cls.city, school=cls.school_a,
@@ -280,10 +302,44 @@ class MaterialApiTests(TestCase):
         )
 
     def test_list_athlete_scope_denied(self):
-        """ATHLETE 本批未开放材料数据范围（P1-9：仅全局 ADMIN/UNIVERSITY 本校），保持拒绝。"""
+        """未绑定人员档案的 ATHLETE 账号仍拒绝（自范围以 person_id 为依据）。"""
         resp = self._get(BASE, token=self.athlete_token)
         self.assertEqual(resp.status_code, 403)
         self.assertEqual(resp.json()["code"], "DATA_SCOPE_DENIED")
+
+    def test_athlete_self_lists_own_material(self):
+        """ATHLETE 绑定本人档案后仅可见本人材料（2026-11-04 开放）。"""
+        resp = self._get(
+            BASE,
+            token=self.athlete_self_token,
+            query={"ownerType": "PERSON", "ownerId": str(self.person_a.pk)},
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["data"]["total"], 1)
+        self.assertEqual(resp.json()["data"]["items"][0]["ownerId"], str(self.person_a.pk))
+
+    def test_athlete_self_cannot_see_others(self):
+        """ATHLETE 自范围不得外溢到他人材料。"""
+        resp = self._get(
+            BASE,
+            token=self.athlete_self_token,
+            query={"ownerType": "PERSON", "ownerId": str(self.person_b.pk)},
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["data"]["total"], 0)
+        detail = self._get(f"{BASE}/{self.pm_approved.pk}", token=self.athlete_self_token)
+        self.assertEqual(detail.status_code, 403)
+        self.assertEqual(detail.json()["code"], "DATA_SCOPE_DENIED")
+
+    def test_coach_self_lists_own_material(self):
+        """COACH 与运动员同口径：仅本人 PERSON 材料。"""
+        resp = self._get(
+            BASE,
+            token=self.coach_self_token,
+            query={"ownerType": "PERSON", "ownerId": str(self.person_b.pk)},
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["data"]["total"], 1)
 
     def test_list_university_scope_denied(self):
         """UNIVERSITY 无组织绑定（幽灵范围）默认拒绝；本校正向口径见 MaterialUniversityScopeTests。"""
@@ -358,12 +414,30 @@ class MaterialApiTests(TestCase):
 
     # ------------------------------------------------------------ 创建：类型
 
-    def test_create_type_missing_when_table_empty(self):
-        """类型表无该 code → 400 INVALID_ARGUMENT（不伪造成功、不硬编码 13 种类型）。"""
+    def test_create_type_unknown_code_rejected(self):
+        """字典已初始化但无该 code → 400，不再误报“字典尚未初始化”。"""
         resp = self._post(BASE, self._create_payload(materialType="NO_SUCH_TYPE"), token=self.admin_token)
         self.assertEqual(resp.status_code, 400)
         self.assertEqual(resp.json()["code"], "INVALID_ARGUMENT")
-        self.assertIn("尚未初始化", resp.json()["message"])
+        self.assertIn("不存在", resp.json()["message"])
+        self.assertNotIn("尚未初始化", resp.json()["message"])
+        self.assertEqual(resp.json()["data"][0]["field"], "materialType")
+
+    def test_create_enrollment_attachment_type_rejected(self):
+        """STAMPED_FORM/STUDENT_STATUS 是报名附件类型，不能当球队/人员材料。"""
+        for code in ("STAMPED_FORM", "STUDENT_STATUS"):
+            with self.subTest(code=code):
+                resp = self._post(
+                    BASE,
+                    self._create_payload(
+                        ownerType="TEAM", ownerId=str(self.team_a.pk), materialType=code
+                    ),
+                    token=self.admin_token,
+                )
+                self.assertEqual(resp.status_code, 400, resp.content)
+                self.assertEqual(resp.json()["code"], "INVALID_ARGUMENT")
+                self.assertIn("报名附件", resp.json()["message"])
+                self.assertEqual(resp.json()["data"][0]["field"], "materialType")
 
     def test_create_type_inactive(self):
         resp = self._post(BASE, self._create_payload(materialType="OFF_TYPE"), token=self.admin_token)
@@ -588,11 +662,12 @@ class MaterialApiTests(TestCase):
         )
         self.assertEqual(resp.status_code, 404)
 
-    def test_admin_review_permission_denied(self):
-        """D1（2026-10-28 批准）：ADMIN 不拥有普通材料审核权限 → 403 FORBIDDEN。
+    def test_admin_review_denied_for_own_material(self):
+        """2026-11-02 管理端联调：ADMIN 已登记 materialReview（接口契约角色含
+        ADMIN，管理端人员管理/参赛队伍页面提供通过/驳回按钮），但防自审规则
+        不变——夹具中 pm_pending 的创建审计记录操作人即 admin，故仍 403。
 
-        权限点拒绝先于数据范围判定；全局 ADMIN 的数据范围能力（全库）
-        不推导审核权。状态不变、无审核日志。
+        状态不变、无审核日志。
         """
         resp = self._post(
             f"{BASE}/{self.pm_pending.pk}/review",
@@ -605,6 +680,27 @@ class MaterialApiTests(TestCase):
         self.assertEqual(self.pm_pending.status, enums.MaterialStatus.PENDING)
         self.assertFalse(
             MaterialAuditLog.objects.filter(material_id=self.pm_pending.pk).exists()
+        )
+
+    def test_admin_review_allowed_without_audit_evidence(self):
+        """2026-11-02 管理端联调：seed 脚本直写数据库的材料无创建/修改审计
+        记录，全局 ADMIN 的缺证据例外放行（学校端仍阻断，见
+        test_review_blocked_without_audit_log）。"""
+        AuditLog.objects.filter(
+            object_type="Material", object_id=f"PERSON:{self.pm_pending.pk}"
+        ).delete()
+        resp = self._post(
+            f"{BASE}/{self.pm_pending.pk}/review",
+            {"decision": "APPROVE", "version": self._mver(self.pm_pending)},
+            token=self.admin_token,
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.pm_pending.refresh_from_db()
+        self.assertEqual(self.pm_pending.status, enums.MaterialStatus.APPROVED)
+        self.assertTrue(
+            MaterialAuditLog.objects.filter(
+                material_id=self.pm_pending.pk, material_kind="PERSON"
+            ).exists()
         )
 
     # ------------------------------------------------------------ 软删
@@ -672,7 +768,7 @@ class MaterialApiTests(TestCase):
         self._delete(
             f"{BASE}/{self.pm_pending.pk}", token=self.admin_token, version=self._mver(self.pm_pending)
         )
-        # 审核（material.review）由学校端审核账号触发（D1：ADMIN 无普通审核权限）
+        # 审核（material.review）由学校端审核账号触发（学校端口径；ADMIN 审核见专项用例）
         actions = set(
             AuditLog.objects.filter(
                 operator_account_id__in=[self.admin.pk, self.uni_reviewer.pk]
@@ -1562,9 +1658,11 @@ class MaterialUniversityScopeTests(TestCase):
     def test_review_permission_includes_university(self):
         from apps.common.permissions import operation_roles
 
-        # D1（2026-10-28 批准）：普通材料审核权限仅学校端；
-        # ADMIN/CITY/PROVINCE_REVIEWER 均不在审核点。
-        self.assertEqual(operation_roles("materialReview"), ("UNIVERSITY",))
+        # 2026-11-02 管理端联调：接口契约 docs §materialReview 角色含 ADMIN，
+        # 管理端人员管理/参赛队伍页面提供通过/驳回按钮，权限点恢复
+        # ADMIN+UNIVERSITY；CITY/PROVINCE_REVIEWER 仍只审报名，不在审核点
+        # （见 test_city_review_permission_denied）。
+        self.assertEqual(operation_roles("materialReview"), ("ADMIN", "UNIVERSITY"))
 
     def test_city_review_permission_denied(self):
         """CITY 无材料审核权限（统一规则：只审报名）→ 权限点 403 FORBIDDEN，
@@ -1593,9 +1691,14 @@ class MaterialUniversityScopeTests(TestCase):
             ).exists()
         )
 
-    def test_city_history_scope_denied(self):
-        """CITY 在 materialHistory 角色集内（同 materialGet），但数据范围拒绝。"""
+    def test_city_history_scope_allowed_within_city(self):
+        """CITY 可读本市材料审核历史（2026-11-04 开放市州范围）。"""
         resp = self._get(f"{BASE}/{self.pm_a.pk}/audit-logs", token=self.city_token)
+        self.assertEqual(resp.status_code, 200)
+
+    def test_city_detail_other_city_denied(self):
+        """CITY 范围外（省直属学校）材料详情仍 403。"""
+        resp = self._get(f"{BASE}/{self.pm_b.pk}", token=self.city_token)
         self.assertEqual(resp.status_code, 403)
         self.assertEqual(resp.json()["code"], "DATA_SCOPE_DENIED")
 
@@ -1752,11 +1855,32 @@ class MaterialUniversityScopeTests(TestCase):
         self.assertEqual(resp.status_code, 403)
         self.assertEqual(resp.json()["code"], "DATA_SCOPE_DENIED")
 
-    def test_city_role_still_denied(self):
-        """CITY 本批未开放材料数据范围（P1-9 批次边界），保持拒绝。"""
-        resp = self._get(BASE, token=self.city_token)
-        self.assertEqual(resp.status_code, 403)
-        self.assertEqual(resp.json()["code"], "DATA_SCOPE_DENIED")
+    def test_city_list_scoped_to_own_city(self):
+        """CITY 列表仅含本市学校材料，省直属学校材料不可见（2026-11-04 开放）。"""
+        own = self._get(
+            BASE,
+            token=self.city_token,
+            query={"ownerType": "PERSON", "ownerId": str(self.p_a.pk)},
+        )
+        self.assertEqual(own.status_code, 200)
+        self.assertEqual(own.json()["data"]["total"], 1)
+        other = self._get(
+            BASE,
+            token=self.city_token,
+            query={"ownerType": "PERSON", "ownerId": str(self.p_b.pk)},
+        )
+        self.assertEqual(other.status_code, 200)
+        self.assertEqual(other.json()["data"]["total"], 0)
+
+    def test_province_list_covers_all_schools(self):
+        """PROVINCE_REVIEWER 可读全省学校材料（2026-11-04 开放）。"""
+        resp = self._get(
+            BASE,
+            token=self.prov_token,
+            query={"ownerType": "PERSON", "ownerId": str(self.p_b.pk)},
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["data"]["total"], 1)
 
     def test_create_own_school_owner_ok(self):
         """UNIVERSITY 本校创建材料正向：先传后绑文件认领成功（多份类型避开 R6）。"""

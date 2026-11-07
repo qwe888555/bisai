@@ -19,7 +19,9 @@ from apps.common.pagination import paginate
 from apps.common.permissions import (
     ADMIN,
     ALL_ROLES,
+    ATHLETE,
     CITY,
+    COACH,
     MATCH_RECORDER,
     PROVINCE_REVIEWER,
     TEAM,
@@ -35,11 +37,11 @@ from . import services
 router = Router(tags=["events"])
 _auth = JWTAuth()
 
-# 管理端写操作：ADMIN / PROVINCE_REVIEWER
-register_operation("eventCreate", (ADMIN, PROVINCE_REVIEWER))
+# 管理端写操作：ADMIN / PROVINCE_REVIEWER / CITY（市州可发布本级赛事）
+register_operation("eventCreate", (ADMIN, PROVINCE_REVIEWER, CITY))
 register_operation("eventGet", ALL_ROLES)
-register_operation("eventUpdate", (ADMIN, PROVINCE_REVIEWER))
-register_operation("eventDelete", (ADMIN, PROVINCE_REVIEWER))
+register_operation("eventUpdate", (ADMIN, PROVINCE_REVIEWER, CITY))
+register_operation("eventDelete", (ADMIN, PROVINCE_REVIEWER, CITY))
 # 只读查询：比赛页/报名页筛选依赖，学校端、市州、球队都需读取
 _REFERENCE_READ_ROLES = (
     ADMIN,
@@ -55,10 +57,10 @@ register_operation("availableEvents", ALL_ROLES)
 # 组别只读：同赛事读取范围
 register_operation("eventGroupList", _REFERENCE_READ_ROLES)
 register_operation("eventGroupGet", _REFERENCE_READ_ROLES)
-# 组别管理端写操作
-register_operation("eventGroupCreate", (ADMIN, PROVINCE_REVIEWER))
-register_operation("eventGroupUpdate", (ADMIN, PROVINCE_REVIEWER))
-register_operation("eventGroupDelete", (ADMIN, PROVINCE_REVIEWER))
+# 组别管理端写操作（市州随赛事发布开放）
+register_operation("eventGroupCreate", (ADMIN, PROVINCE_REVIEWER, CITY))
+register_operation("eventGroupUpdate", (ADMIN, PROVINCE_REVIEWER, CITY))
+register_operation("eventGroupDelete", (ADMIN, PROVINCE_REVIEWER, CITY))
 # 报名可选组别：全角色
 register_operation("availableGroups", ALL_ROLES)
 
@@ -252,8 +254,9 @@ def available_groups(request, event_id: str):
 # ---------------------------------------------------------------- 比赛对阵管理（5.1）
 
 _MATCH_ROLES = (MATCH_RECORDER, ADMIN, PROVINCE_REVIEWER)
-# 对阵只读：比赛页需要学校端、市州、球队也能查看，写操作仍限制在 _MATCH_ROLES
-_MATCH_READ_ROLES = _MATCH_ROLES + (CITY, UNIVERSITY, TEAM)
+# 对阵只读：比赛页需要学校端、市州、球队、运动员/教练也能查看，写操作仍限制在 _MATCH_ROLES
+# （2026-11-01 用户裁定：运动员/教练个人页放开认证业务接口只读，去掉「403 只能走公开接口」的限制）
+_MATCH_READ_ROLES = _MATCH_ROLES + (CITY, UNIVERSITY, TEAM, ATHLETE, COACH)
 register_operation("matchList", _MATCH_READ_ROLES)
 register_operation("matchGet", _MATCH_READ_ROLES)
 register_operation("matchCreate", _MATCH_ROLES)
@@ -370,6 +373,20 @@ register_operation("matchEventCreate", _MATCH_ROLES)
 register_operation("matchEventGet", _MATCH_ROLES)
 register_operation("matchEventUpdate", _MATCH_ROLES)
 register_operation("matchEventDelete", _MATCH_ROLES)
+# 记录台球员选择器：记录员可读取本场两队现役名单（仅姓名/球衣号/档案 ID）。
+register_operation("matchRoster", _MATCH_ROLES)
+
+
+@router.get(
+    "/matches/{match_id}/rosters",
+    auth=_auth,
+    response=EnvelopeOut,
+    summary="本场双方球员名单（记录台选择器）",
+)
+def match_roster_list(request, match_id: str):
+    require("matchRoster")
+    members = services.match_rosters(match_id)
+    return ok([s.match_roster_out(member) for member in members])
 
 
 @router.get(
@@ -870,7 +887,11 @@ register_operation("matchResultGet", _RESULT_ROLES)
 register_operation("matchResultWrite", _RESULT_ROLES)
 register_operation("matchResultPublish", _RESULT_ROLES)
 register_operation("matchResultDelete", _RESULT_ROLES)
-register_operation("goalRanking", _RESULT_ROLES)
+# 统计只读（2026-11-01）：进球榜/积分榜属公开数据，运动员/教练与各端均可读取；
+# 赛果读写仍限制在 _RESULT_ROLES。
+_STATS_READ_ROLES = _RESULT_ROLES + (CITY, UNIVERSITY, TEAM, ATHLETE, COACH)
+register_operation("goalRanking", _STATS_READ_ROLES)
+register_operation("standingList", _STATS_READ_ROLES)
 
 
 @router.get("/matches/{match_id}/result", auth=_auth, response=EnvelopeOut, summary="赛果信息")
@@ -920,6 +941,137 @@ def goal_ranking(
     page = max(1, page)
     pageSize = min(100, max(1, pageSize))
     return ok(services.goal_ranking(eventId, groupId, category, page, pageSize))
+
+
+@router.get("/statistics/standings", auth=_auth, response=EnvelopeOut, summary="赛事官方积分榜")
+def standings(
+    request,
+    eventId: str,
+    groupId: Optional[str] = None,
+):
+    require("standingList")
+    result = services.standings(eventId, groupId)
+    result["items"] = [s.standing_row_out(row) for row in result["items"]]
+    return ok(result)
+
+
+# ---------------------------------------------------------------- 官方名次与奖项(P1-3，2026-11-02)
+#
+# 与积分榜（standings，赛果实时推算）分工：本组接口承载组委会录定的官方
+# 最终名次与奖项，写操作限赛果角色，门户只读走下方免登录聚合接口。
+
+register_operation("rankingList", _RESULT_ROLES)
+register_operation("rankingWrite", _RESULT_ROLES)
+register_operation("awardList", _RESULT_ROLES)
+register_operation("awardWrite", _RESULT_ROLES)
+
+
+@router.get("/events/{event_id}/rankings", auth=_auth, response=EnvelopeOut, summary="赛事官方名次列表")
+def ranking_list(request, event_id: str, groupId: Optional[str] = None):
+    require("rankingList")
+    rows = services.list_rankings(event_id, groupId)
+    items = [s.ranking_out(row) for row in rows]
+    return ok({"items": items, "total": len(items)})
+
+
+@router.post("/events/{event_id}/rankings", auth=_auth, response=EnvelopeOut, summary="录入官方名次")
+def ranking_create(request, event_id: str, body: s.RankingCreate):
+    require("rankingWrite")
+    ranking = services.create_ranking(event_id, body.model_dump())
+    audit_state(request, "ranking.create", object_type="EventRanking",
+                object_id=ranking.pk, summary=f"录入官方名次 #{ranking.final_rank}")
+    return ok(s.ranking_out(ranking))
+
+
+@router.put("/rankings/{ranking_id}", auth=_auth, response=EnvelopeOut, summary="修改官方名次")
+def ranking_update(request, ranking_id: str, body: s.RankingUpdate):
+    require("rankingWrite")
+    ranking = services.update_ranking(ranking_id, body.model_dump())
+    audit_state(request, "ranking.update", object_type="EventRanking",
+                object_id=ranking.pk, summary="修改官方名次")
+    return ok(s.ranking_out(ranking))
+
+
+@router.delete("/rankings/{ranking_id}", auth=_auth, response=EnvelopeOut, summary="删除官方名次")
+def ranking_delete(request, ranking_id: str, version: Optional[int] = None):
+    require("rankingWrite")
+    version = _require_version(version)
+    ranking = services.delete_ranking(ranking_id, version)
+    audit_state(request, "ranking.delete", object_type="EventRanking",
+                object_id=ranking.pk, summary="删除官方名次")
+    return action_result(True, ranking.pk, ranking.version)
+
+
+@router.post("/rankings/{ranking_id}/publish", auth=_auth, response=EnvelopeOut, summary="发布官方名次")
+def ranking_publish(request, ranking_id: str, body: s.VersionRequest):
+    require("rankingWrite")
+    ranking = services.set_ranking_published(ranking_id, body.version, True)
+    audit_state(request, "ranking.publish", object_type="EventRanking",
+                object_id=ranking.pk, summary="发布官方名次")
+    return ok(s.ranking_out(ranking))
+
+
+@router.post("/rankings/{ranking_id}/unpublish", auth=_auth, response=EnvelopeOut, summary="下线官方名次")
+def ranking_unpublish(request, ranking_id: str, body: s.VersionRequest):
+    require("rankingWrite")
+    ranking = services.set_ranking_published(ranking_id, body.version, False)
+    audit_state(request, "ranking.unpublish", object_type="EventRanking",
+                object_id=ranking.pk, summary="下线官方名次")
+    return ok(s.ranking_out(ranking))
+
+
+@router.get("/events/{event_id}/awards", auth=_auth, response=EnvelopeOut, summary="赛事官方奖项列表")
+def award_list(request, event_id: str, groupId: Optional[str] = None):
+    require("awardList")
+    rows = services.list_awards(event_id, groupId)
+    items = [s.award_out(row) for row in rows]
+    return ok({"items": items, "total": len(items)})
+
+
+@router.post("/events/{event_id}/awards", auth=_auth, response=EnvelopeOut, summary="录入官方奖项")
+def award_create(request, event_id: str, body: s.AwardCreate):
+    require("awardWrite")
+    award = services.create_award(event_id, body.model_dump())
+    audit_state(request, "award.create", object_type="EventAward",
+                object_id=award.pk, summary=f"录入官方奖项 {award.award_type}")
+    return ok(s.award_out(award))
+
+
+@router.put("/awards/{award_id}", auth=_auth, response=EnvelopeOut, summary="修改官方奖项")
+def award_update(request, award_id: str, body: s.AwardUpdate):
+    require("awardWrite")
+    award = services.update_award(award_id, body.model_dump())
+    audit_state(request, "award.update", object_type="EventAward",
+                object_id=award.pk, summary="修改官方奖项")
+    return ok(s.award_out(award))
+
+
+@router.delete("/awards/{award_id}", auth=_auth, response=EnvelopeOut, summary="删除官方奖项")
+def award_delete(request, award_id: str, version: Optional[int] = None):
+    require("awardWrite")
+    version = _require_version(version)
+    award = services.delete_award(award_id, version)
+    audit_state(request, "award.delete", object_type="EventAward",
+                object_id=award.pk, summary="删除官方奖项")
+    return action_result(True, award.pk, award.version)
+
+
+@router.post("/awards/{award_id}/publish", auth=_auth, response=EnvelopeOut, summary="发布官方奖项")
+def award_publish(request, award_id: str, body: s.VersionRequest):
+    require("awardWrite")
+    award = services.set_award_published(award_id, body.version, True)
+    audit_state(request, "award.publish", object_type="EventAward",
+                object_id=award.pk, summary="发布官方奖项")
+    return ok(s.award_out(award))
+
+
+@router.post("/awards/{award_id}/unpublish", auth=_auth, response=EnvelopeOut, summary="下线官方奖项")
+def award_unpublish(request, award_id: str, body: s.VersionRequest):
+    require("awardWrite")
+    award = services.set_award_published(award_id, body.version, False)
+    audit_state(request, "award.unpublish", object_type="EventAward",
+                object_id=award.pk, summary="下线官方奖项")
+    return ok(s.award_out(award))
 
 # ---------------------------------------------------------------- 门户公开读(T5-07，免登录)
 
@@ -983,3 +1135,25 @@ def public_goal_ranking(
     page = max(1, page)
     pageSize = min(100, max(1, pageSize))
     return ok(services.goal_ranking(eventId, groupId, category, page, pageSize, published_only=True))
+
+
+@router.get("/public/statistics/standings", auth=None, response=EnvelopeOut, summary="门户赛事积分榜")
+def public_standings(
+    request,
+    eventId: str,
+    groupId: Optional[str] = None,
+):
+    result = services.standings(eventId, groupId)
+    result["items"] = [s.standing_row_out(row) for row in result["items"]]
+    return ok(result)
+
+
+@router.get("/public/events/{event_id}/rankings", auth=None, response=EnvelopeOut,
+            summary="门户官方名次与奖项（已发布）")
+def public_official_results(request, event_id: str, groupId: Optional[str] = None):
+    """成绩页聚合：仅返回 published 记录，未发布的录定数据对访客不可见。"""
+    result = services.public_official_results(event_id, groupId)
+    return ok({
+        "rankings": [s.public_ranking_out(row) for row in result["rankings"]],
+        "awards": [s.public_award_out(row) for row in result["awards"]],
+    })

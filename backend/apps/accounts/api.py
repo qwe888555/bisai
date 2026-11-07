@@ -126,6 +126,7 @@ def current_user(request):
         "displayName": actor.display_name,
         "roles": list(actor.roles or []),
         "orgId": actor.organization_id or "",
+        "orgName": actor.organization.name if actor.organization_id else None,
         "teamIds": list(actor.team_ids or []),
         "permissions": permissions_for(actor.roles),
         "menus": menus_for(actor.roles),
@@ -221,6 +222,7 @@ def account_list(
     role: Optional[str] = None,
     orgId: Optional[str] = None,
     enabled: Optional[str] = None,
+    unbound: Optional[str] = None,
 ):
     actor = require("accountList")
     queryset = services.list_accounts(
@@ -230,6 +232,8 @@ def account_list(
             "role": role,
             "orgId": orgId,
             "enabled": _bool_param(enabled),
+            # 改造说明 §4.3：无人员档案的运动员/教练账号治理入口。
+            "unbound": _bool_param(unbound),
         },
     )
     return paginate(request, queryset, mapper=s.account_out)

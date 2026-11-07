@@ -11,8 +11,11 @@
 from __future__ import annotations
 
 from typing import Optional
+from urllib.parse import quote
 
-from ninja import Query, Router
+from django.http import HttpResponse
+from ninja import File, Form, Query, Router
+from ninja.files import UploadedFile
 
 from apps.common.authentication import JWTAuth
 from apps.common.conf import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE
@@ -40,6 +43,7 @@ from apps.common.permissions import (
 )
 from apps.common.schemas import EnvelopeOut
 
+from . import imports as person_imports
 from . import schemas as s
 from . import services
 
@@ -437,8 +441,13 @@ def people_list(
     total = queryset.count()
     rows = list(queryset[(page_number - 1) * page_size : page_number * page_size])
     duties = services.coach_duties_map([row.pk for row in rows])
+    can_review = services.can_review_map(rows, account)
     items = [
-        {**s.person_out(row), "coachDuties": duties.get(row.pk, [])}
+        {
+            **s.person_out(row),
+            "coachDuties": duties.get(row.pk, []),
+            "canReview": can_review.get(row.pk, False),
+        }
         for row in rows
     ]
     return page(items, page_number, page_size, total)
@@ -449,7 +458,7 @@ def people_list(
 )
 def people_search(request, body: s.PersonSearchBody):
     account = require("personSearch")
-    items = services.search_people(body.keyword, account)
+    items = services.search_people(body.keyword, account, body.reviewStatus)
     # 检索正文不入审计（文档：精确检索服务端不记正文），仅记操作发生
     audit_state(
         request,
@@ -458,7 +467,82 @@ def people_search(request, body: s.PersonSearchBody):
         summary="人员档案检索",
     )
     # 前端 personApi.search 类型为 Person[]（数组非分页），直接返回列表
-    return ok([s.person_out(item) for item in items])
+    can_review = services.can_review_map(items, account)
+    return ok(
+        [
+            {**s.person_out(item), "canReview": can_review.get(item.pk, False)}
+            for item in items
+        ]
+    )
+
+
+# ---------------------------------------------------------------- 批量导入（§3）
+# 字面量路由必须注册在 /people/{person_id} 之前，否则 POST /people/imports
+# 会先命中详情路由而得到 405（与 teams member/search 同类问题）。
+# 学校建档下沉后，逐个录入/前端逐行调用 POST /people 不可持续：
+# 提供固定模板、批量校验/写入、错误清单下载三条接口；权限与单条建档一致。
+
+register_operation("personImportTemplate", (ADMIN, UNIVERSITY))
+register_operation("personImport", (ADMIN, UNIVERSITY))
+register_operation("personImportErrors", (ADMIN, UNIVERSITY))
+
+
+def _binary(data: bytes, filename: str, content_type: str) -> HttpResponse:
+    response = HttpResponse(data, content_type=content_type)
+    response["Content-Disposition"] = f"attachment; filename*=UTF-8''{quote(filename)}"
+    response["Cache-Control"] = "private, no-store"
+    return response
+
+
+@router.get(
+    "/people/imports/templates/person.xlsx",
+    auth=_auth,
+    response=None,
+    summary="下载人员档案导入模板",
+)
+def person_import_template(request):
+    require("personImportTemplate")
+    return _binary(
+        person_imports.render_template(),
+        "人员档案导入模板.xlsx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+
+@router.post(
+    "/people/imports",
+    auth=_auth,
+    response=EnvelopeOut,
+    summary="人员档案 Excel 校验/导入",
+)
+def person_import(
+    request,
+    mode: str = Form(...),
+    file: UploadedFile = File(...),
+    schoolOrgId: str = Form(""),
+):
+    actor = require("personImport")
+    result = person_imports.import_people(actor, mode, schoolOrgId, file)
+    audit_state(
+        request,
+        "person.import",
+        object_type="PersonImportBatch",
+        object_id=result["batchId"],
+        summary=f"人员导入 {mode}",
+    )
+    return ok(result)
+
+
+@router.get(
+    "/people/imports/{batch_id}/errors.csv",
+    auth=_auth,
+    response=None,
+    summary="下载人员导入错误清单",
+)
+def person_import_errors(request, batch_id: str):
+    actor = require("personImportErrors")
+    data, filename = person_imports.import_errors_csv(actor, batch_id)
+    return _binary(data, filename, "text/csv; charset=utf-8")
 
 
 @router.get(
@@ -473,6 +557,7 @@ def people_get(request, person_id: str):
     person = services.get_person(person_id, account)
     data = s.person_out(person)
     data["coachQualification"] = services.coach_qualification(person)
+    data["canReview"] = services.can_review_person(person, account)
     return ok(data)
 
 
@@ -497,12 +582,46 @@ def people_review(request, person_id: str, body: s.PersonReviewBody):
         object_id=str(person.pk),
         summary=f"审核人员 {person.full_name}：{body.decision}",
     )
-    return ok(s.person_out(person))
+    return ok(
+        {
+            **s.person_out(person),
+            "canReview": services.can_review_person(person, account),
+        }
+    )
 
 
-# 写操作仅 ADMIN（PeopleManageView 为管理端页面；学校端可否创建人员待确认④）
-register_operation("personCreate", (ADMIN,))
-register_operation("personUpdate", (ADMIN,))
+# 建档权限下沉学校（人员档案与账号流程后端改造 §2.1/§6）：学校账号可为本校
+# 建档、修改草稿并提交复核；删除仍仅 ADMIN（重复档案/异常由管理员处理）。
+# 数据范围由 apply_person_scope / _ensure_school_in_operator_scope 双重收口。
+register_operation("personSubmit", (ADMIN, UNIVERSITY))
+
+
+@router.post(
+    "/people/{person_id}/submit",
+    auth=_auth,
+    response=EnvelopeOut,
+    summary="提交人员档案复核",
+)
+def people_submit(request, person_id: str, body: s.PersonSubmitBody):
+    account = require("personSubmit")
+    person = services.submit_person(person_id, body.version, account)
+    audit_state(
+        request,
+        "person.submit",
+        object_type="Person",
+        object_id=str(person.pk),
+        summary=f"提交人员 {person.full_name} 复核",
+    )
+    return ok(
+        {
+            **s.person_out(person),
+            "canReview": services.can_review_person(person, account),
+        }
+    )
+
+
+register_operation("personCreate", (ADMIN, UNIVERSITY))
+register_operation("personUpdate", (ADMIN, UNIVERSITY))
 register_operation("personDelete", (ADMIN,))
 
 
@@ -672,6 +791,53 @@ def my_teams(request):
     return ok(services.list_own_teams(person_id))
 
 
+# GET /me/team-affiliations（2026-11-01 补齐）：前端 MyTeamsView 的「归属记录」
+# 表格此前只有 mock 实现，真实模式下接口 404 只能隐藏。本接口只读回放正式关系
+# 表（TeamMember + TeamCoach，含 EXITED 历史），分页信封与前端 meApi.affiliations
+# 的 PageResult<MyAffiliation> 一致；自报归属（UNVERIFIED）需申请表，B5 未采用，
+# 写操作仍未提供，前端在真实模式下不展示新增/结束/删除入口。
+register_operation("myTeamAffiliations", (ATHLETE, COACH))
+
+
+@router.get(
+    "/me/team-affiliations",
+    auth=_auth,
+    response=EnvelopeOut,
+    summary="本人球队归属记录",
+)
+def my_team_affiliations(request):
+    account = require("myTeamAffiliations")
+    person_id = _own_person_id(account)
+    if not person_id:
+        raise ApiError(NOT_FOUND, "当前账号未绑定人员档案")
+    return paginate_list(request, services.list_own_team_affiliations(person_id))
+
+
+# GET /me/competitions（2026-11-02 P0-4）：运动员个人参赛数据。个人页此前只有
+# /me/profile 与 /me/teams，「赛事 / 场次 / 进球 / 红黄牌」无接口可读——
+# /enrollments 对 ATHLETE 未注册权限点（403），前端只能按球队名称匹配公开赛果，
+# 重名或改名即漏匹配。本接口按 athlete_id 精确聚合（口径见 services
+# .list_own_competitions），数组直出，同 /me/teams 惯例。
+# 未绑定档案 → 404（对齐 myProfileGet 口径）；读接口不留审计。
+register_operation("myCompetitions", (ATHLETE, COACH))
+
+
+@router.get(
+    "/me/competitions",
+    auth=_auth,
+    response=EnvelopeOut,
+    summary="本人参赛数据（赛事/场次/进球/红黄牌）",
+)
+def my_competitions(request):
+    account = require("myCompetitions")
+    person_id = _own_person_id(account)
+    if not person_id:
+        raise ApiError(NOT_FOUND, "当前账号未绑定人员档案")
+    # dict 数组直出（EnvelopeOut.data=Any），字段口径见 services
+    # .list_own_competitions
+    return ok(services.list_own_competitions(person_id))
+
+
 # §6.8 档案聚合（批次 D-1）：文档角色 ADMIN/PROVINCE_REVIEWER（接口文档
 # L1740/L1762）；数据范围复用 apply_person_scope（非 ADMIN → 403
 # DATA_SCOPE_DENIED，D5 同口径，PROVINCE_REVIEWER 权限点通过但范围拒绝）。
@@ -698,7 +864,7 @@ def dossier_search(request, body: s.DossierSearchBody):
     page_size = min(max(payload.get("pageSize") or DEFAULT_PAGE_SIZE, 1), MAX_PAGE_SIZE)
     start = (page_number - 1) * page_size
     items = [
-        services.dossier_out(row, account)
+        services.dossier_out(row, account, include_aggregates=False)
         for row in queryset[start : start + page_size]
     ]
     # page() 已含完整信封（ok 包装），不再二次包装

@@ -222,7 +222,12 @@ def current_account() -> Optional[object]:
 
 
 def assert_not_self_review(
-    account, object_type: str, object_id: str, actions: tuple[str, ...]
+    account,
+    object_type: str,
+    object_id: str,
+    actions: tuple[str, ...],
+    *,
+    allow_missing_evidence: bool = False,
 ) -> None:
     """防自审校验：当前账号不得审核自己创建或修改的对象。
 
@@ -232,12 +237,20 @@ def assert_not_self_review(
       匹配键为 operator_account_id（账号主键），与角色无关。
     - person.self_confirm 不作为创建或修改证据（仅改 audit_status）。
     - material.remove 不纳入（软删后对象不可审核）。
-    - 无法找到对应的成功创建或修改 AuditLog 时，保持阻断，不自动放行。
+    - 无法找到对应的成功创建或修改 AuditLog 时，默认保持阻断，不自动放行。
 
     判定逻辑（查询 AuditLog.accounts_audit_log）：
     - 无任何成功创建/修改记录 → 阻断（缺乏审计证据，无法排除自审）；
     - 存在当前账号的创建/修改记录 → 阻断（自审）；
     - 仅存在其他账号的记录 → 放行。
+
+    例外（2026-11-02 管理端联调）：`allow_missing_evidence=True` 时，
+    仅「无任何创建/修改记录」分支放行，「当前账号创建/修改过」仍阻断。
+    调用方仅限材料审核中的全局 ADMIN：管理端人员管理/参赛队伍页面按接口
+    契约（docs §materialReview 角色含 ADMIN）提供「通过/驳回」按钮，而演练
+    与演示数据由 seed 脚本直写数据库、不产生 API 审计日志，按缺证据阻断会
+    使该功能对全量种子材料恒 403；ADMIN 本身是全局数据范围，不存在越权
+    扩面，自审风险仍由第二分支覆盖。学校端（UNIVERSITY）不启用该例外。
 
     阻断仅表示缺乏足够审计证据或存在自审嫌疑，错误信息不宣称已证明发生自审。
     依赖 AuditLog 由 AuditMiddleware 在响应后写入；业务提交与审计写入非同一
@@ -254,6 +267,8 @@ def assert_not_self_review(
         ).values_list("operator_account_id", flat=True)
     )
     if not operators:
+        if allow_missing_evidence:
+            return
         raise ApiError(FORBIDDEN, "当前账号无权审核该记录")
     if str(account.pk) in operators:
         raise ApiError(FORBIDDEN, "当前账号无权审核该记录")

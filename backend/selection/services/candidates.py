@@ -14,7 +14,12 @@ from .archive import get_archive_client
 MAX_CANDIDATES = 500
 
 
-def list_candidates(event_id=None, group_type=None, keyword=""):
+def list_candidates(
+    event_id=None,
+    group_type=None,
+    keyword="",
+    candidate_id="",
+):
     if not group_type:
         raise BusinessError(400, "组别不能为空")
 
@@ -22,16 +27,23 @@ def list_candidates(event_id=None, group_type=None, keyword=""):
     candidates = get_archive_client().list_candidates(group_type)
 
     event_text = str(event_id or "").strip()
+    candidate_text = str(candidate_id or "").strip()
     keyword = str(keyword or "").strip().lower()
 
     result = []
     for candidate in candidates:
         if event_text and str(candidate.event_id) != event_text:
             continue
-        if keyword and keyword not in candidate.name.lower() and keyword not in (
-            candidate.team_name or ""
-        ).lower():
+        if candidate_text and str(candidate.candidate_id) != candidate_text:
             continue
+        if keyword:
+            haystacks = (
+                candidate.name.lower(),
+                (candidate.team_name or "").lower(),
+                (candidate.id_card_masked or "").lower(),
+            )
+            if not any(keyword in value for value in haystacks):
+                continue
         result.append(
             {
                 "candidate_id": str(candidate.candidate_id),

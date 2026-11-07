@@ -188,7 +188,15 @@ def _ask_model(question: str, documents: list[PolicyDocument]) -> Optional[str]:
         with httpx.Client(timeout=conf.AI_TIMEOUT_SECONDS) as client:
             response = client.post(
                 f"{conf.AI_BASE_URL.rstrip('/')}/chat/completions",
-                json={"model": conf.AI_MODEL, "messages": messages, "temperature": 0},
+                json={
+                    "model": conf.AI_MODEL,
+                    "messages": messages,
+                    "temperature": 0,
+                    # GLM-5.3-Flash 始终思考、不接受 thinking 关闭（400/1210）；
+                    # 用 reasoning_effort=low 压低推理开销，避免超出
+                    # AI_TIMEOUT_SECONDS 后拿到空 content 降级 UNAVAILABLE
+                    "reasoning_effort": "low",
+                },
                 headers={"Authorization": f"Bearer {conf.AI_API_KEY}"},
             )
         if response.status_code >= 400:
@@ -245,7 +253,12 @@ def _ask_general(question: str) -> Optional[str]:
         with httpx.Client(timeout=conf.AI_TIMEOUT_SECONDS) as client:
             response = client.post(
                 f"{conf.AI_BASE_URL.rstrip('/')}/chat/completions",
-                json={"model": conf.AI_MODEL, "messages": messages, "temperature": 0.3},
+                json={
+                    "model": conf.AI_MODEL,
+                    "messages": messages,
+                    "temperature": 0.3,
+                    "reasoning_effort": "low",
+                },
                 headers={"Authorization": f"Bearer {conf.AI_API_KEY}"},
             )
         if response.status_code >= 400:

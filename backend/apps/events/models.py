@@ -56,6 +56,55 @@ GROUP_GENDERS = (
     ("MIXED", "混合"),
 )
 
+# 赛事层级标准枚举：取代自由文本 event_category，稳定区分省/市/校/杯赛。
+# 历史自由文本经 0008 数据迁移归一化；未知值一律归入 OTHER。
+EVENT_CATEGORIES = (
+    ("PROVINCIAL_LEAGUE", "省级联赛"),
+    ("CITY_LEAGUE", "市级联赛"),
+    ("SCHOOL_LEAGUE", "校级联赛"),
+    ("CHAMPIONSHIP", "锦标赛"),
+    ("FRIENDLY", "友谊赛"),
+    ("OTHER", "其他"),
+)
+
+_EVENT_CATEGORY_KEYS = {code for code, _ in EVENT_CATEGORIES}
+
+# 历史自由文本 → 标准枚举映射（0008 迁移与写入归一化共用，保持单一口径）
+EVENT_CATEGORY_ALIASES = {
+    "PROVINCIAL": "PROVINCIAL_LEAGUE",
+    "PROVINCIAL_LEAGUE": "PROVINCIAL_LEAGUE",
+    "CITY": "CITY_LEAGUE",
+    "CITY_LEAGUE": "CITY_LEAGUE",
+    "CITY_TOURNAMENT": "CITY_LEAGUE",
+    "SCHOOL": "SCHOOL_LEAGUE",
+    "SCHOOL_LEAGUE": "SCHOOL_LEAGUE",
+    "SCHOOL_GAMES": "SCHOOL_LEAGUE",
+    "CHAMPIONSHIP": "CHAMPIONSHIP",
+    "CHAMPIONSHIPS": "CHAMPIONSHIP",
+    "TOURNAMENT": "CHAMPIONSHIP",
+    "FRIENDLY": "FRIENDLY",
+}
+
+
+def normalize_event_category(value: str) -> str:
+    """把任意赛事分类输入归一化为标准枚举编码；空值/未知值返回 OTHER。"""
+    if not value:
+        return ""
+    key = str(value).strip().upper()
+    if key in _EVENT_CATEGORY_KEYS:
+        return key
+    return EVENT_CATEGORY_ALIASES.get(key, "OTHER")
+
+
+def event_category_label(value: str) -> str:
+    """标准枚举编码 → 中文标签；未知/空值显示「未分级」，前端无需自行兜底。"""
+    if not value:
+        return "未分级"
+    for code, label in EVENT_CATEGORIES:
+        if code == value:
+            return label
+    return "未分级"
+
 
 class Event(SoftDeleteVersionedModel):
     """赛事配置：赛季、报名时间窗与状态。"""
@@ -63,8 +112,10 @@ class Event(SoftDeleteVersionedModel):
     id = models.CharField(primary_key=True, max_length=64)
     name = models.CharField(max_length=200)
     season = models.CharField(max_length=30)
-    # 赛事类别字典编码，可空
-    event_category = models.CharField(max_length=64, blank=True, default="")
+    # 赛事层级标准枚举（见 EVENT_CATEGORIES），写入前经 normalize_event_category 归一化
+    event_category = models.CharField(
+        max_length=32, choices=EVENT_CATEGORIES, blank=True, default=""
+    )
     registration_opens_at = models.DateTimeField()
     registration_closes_at = models.DateTimeField()
     status = models.CharField(
@@ -298,6 +349,8 @@ class Content(SoftDeleteVersionedModel):
     body_text = models.TextField(max_length=50000, blank=True, default="")
     # 由「门户资源·新闻配图」自动创建：标题/摘要/正文跟随配图同步，删除配图时一并下线。
     auto_created = models.BooleanField(default=False)
+    # 自动赛果快讯溯源：publish_match_result 生成的快讯记录来源比赛，幂等 upsert/下线。
+    source_match_id = models.CharField(max_length=64, blank=True, default="")
 
     class Meta:
         db_table = "events_content"
@@ -386,6 +439,94 @@ class LivePost(SoftDeleteVersionedModel):
 
     def __str__(self) -> str:  # pragma: no cover
         return f"LivePost@{self.match_id}"
+
+
+# ---------------------------------------------------------------- 官方名次与奖项（P1-3，2026-11-02）
+
+# 与小组赛积分榜（standings，按已发布赛果实时推算）分工：本表承载赛事
+# 结束后由组委会录定的官方最终名次与奖项，人工确认，不从比赛自动推导。
+RANK_MEDALS = (
+    ("GOLD", "金牌"),
+    ("SILVER", "银牌"),
+    ("BRONZE", "铜牌"),
+)
+
+RANK_SOURCES = (
+    ("AUTO", "按积分榜推导"),
+    ("MANUAL", "人工录定"),
+)
+
+AWARD_TYPES = (
+    ("TOP_SCORER", "最佳射手"),
+    ("MVP", "最有价值球员"),
+    ("BEST_GOALKEEPER", "最佳门将"),
+    ("BEST_DEFENDER", "最佳后卫"),
+    ("FAIR_PLAY", "公平竞赛奖"),
+    ("OTHER", "其他奖项"),
+)
+
+
+class EventRanking(SoftDeleteVersionedModel):
+    """赛事官方最终名次：一支球队在赛事（可细分组别）中的官方名次。
+
+    唯一性（同赛事同组别同球队仅一行）由服务层校验，不用条件唯一索引
+    —— MySQL 不支持部分索引，软删行也不能占用唯一键。
+    """
+
+    id = models.CharField(primary_key=True, max_length=64)
+    event_id = models.CharField(max_length=64, db_index=True)
+    # 空串表示赛事整体名次（不按组别拆分）
+    group_id = models.CharField(max_length=64, blank=True, default="")
+    team_id = models.CharField(max_length=64, db_index=True)
+    # 官方名次从 1 开始；允许并列（同名次多行），故不做唯一约束
+    final_rank = models.PositiveIntegerField()
+    medal = models.CharField(max_length=10, choices=RANK_MEDALS, blank=True, default="")
+    source = models.CharField(
+        max_length=10, choices=RANK_SOURCES, default="MANUAL"
+    )
+    published = models.BooleanField(default=False)
+    published_at = models.DateTimeField(null=True, blank=True)
+    remark = models.CharField(max_length=500, blank=True, default="")
+
+    class Meta:
+        db_table = "events_event_ranking"
+        indexes = [
+            models.Index(fields=["event_id", "group_id"]),
+            models.Index(fields=["published"]),
+        ]
+        ordering = ["final_rank", "id"]
+
+    def __str__(self) -> str:  # pragma: no cover
+        return f"#{self.final_rank}@{self.event_id}"
+
+
+class EventAward(SoftDeleteVersionedModel):
+    """赛事官方奖项：个人或球队获奖记录，published 控制门户可见。"""
+
+    id = models.CharField(primary_key=True, max_length=64)
+    event_id = models.CharField(max_length=64, db_index=True)
+    group_id = models.CharField(max_length=64, blank=True, default="")
+    award_type = models.CharField(max_length=24, choices=AWARD_TYPES)
+    # 个人奖填运动员、球队奖（如公平竞赛）填球队；OTHER 奖项两者可同时为空
+    athlete_id = models.CharField(max_length=64, blank=True, default="")
+    team_id = models.CharField(max_length=64, blank=True, default="")
+    # 量化值展示：如最佳射手进球数「12球」，纯文本不参与计算
+    value = models.CharField(max_length=100, blank=True, default="")
+    published = models.BooleanField(default=False)
+    published_at = models.DateTimeField(null=True, blank=True)
+    remark = models.CharField(max_length=500, blank=True, default="")
+
+    class Meta:
+        db_table = "events_event_award"
+        indexes = [
+            models.Index(fields=["event_id", "group_id"]),
+            models.Index(fields=["award_type"]),
+            models.Index(fields=["published"]),
+        ]
+        ordering = ["award_type", "id"]
+
+    def __str__(self) -> str:  # pragma: no cover
+        return f"{self.award_type}@{self.event_id}"
 
 
 class LiveLink(SoftDeleteVersionedModel):

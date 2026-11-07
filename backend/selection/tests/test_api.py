@@ -135,6 +135,35 @@ class SelectionApiTests(TestCase):
         )
 
     # ------------------------------------------------------------------
+    # Candidates
+    # ------------------------------------------------------------------
+    def test_candidates_filter_by_keyword_and_candidate_id(self):
+        """档案跳转评分依赖 candidate_id 精确定位；关键字兼容姓名/球队/掩码号。"""
+        response = self.get_json(
+            f"{API_PREFIX}candidates/",
+            {"group_type": "MIDDLE", "keyword": "张伟"},
+        )
+        self.assertEqual(response.status_code, 200)
+        rows = self.body(response)["data"]
+        self.assertEqual([row["candidate_id"] for row in rows], ["10001"])
+
+        response = self.get_json(
+            f"{API_PREFIX}candidates/",
+            {"group_type": "MIDDLE", "candidate_id": "10002"},
+        )
+        self.assertEqual(response.status_code, 200)
+        rows = self.body(response)["data"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["name"], "王芳")
+
+        response = self.get_json(
+            f"{API_PREFIX}candidates/",
+            {"group_type": "MIDDLE", "candidate_id": "99999"},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.body(response)["data"], [])
+
+    # ------------------------------------------------------------------
     # Templates
     # ------------------------------------------------------------------
     def test_create_list_update_template(self):

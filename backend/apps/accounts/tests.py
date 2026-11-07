@@ -202,6 +202,7 @@ class AuthFlowTests(AccountScopeTestBase):
         data = resp.json()["data"]
         self.assertEqual(data["username"], "scope-admin")
         self.assertEqual(data["orgId"], self.P.pk)
+        self.assertEqual(data["orgName"], "测试省")
         self.assertIn("api:accountList", data["permissions"])
         self.assertIn("api:organizationList", data["permissions"])
         menu_keys = {m["key"] for m in data["menus"]}
@@ -329,6 +330,14 @@ class DataScopeTests(AccountScopeTestBase):
         self.assertIn("scope-school", usernames)
         self.assertIn("scope-city-far", usernames)
         self.assertNotIn("scope-outsider", usernames)
+
+    def test_account_list_includes_org_name(self):
+        """2026-11-03 复测问题 3：账号列表输出组织名称，前端不再显示裸 orgId。"""
+        resp = self._get(f"{BASE}/accounts", token=self._login("scope-prov"))
+        self.assertEqual(resp.status_code, 200)
+        rows = {a["username"]: a for a in resp.json()["data"]["items"]}
+        self.assertEqual(rows["scope-school"]["orgName"], "测试学校")
+        self.assertEqual(rows["scope-school"]["orgId"], self.S.pk)
 
     def test_city_role_has_account_list_permission(self):
         """main 方案3 后反转断言：accountList 权限点含 CITY，市级 200（服务层仍按子树过滤）。"""
@@ -657,6 +666,47 @@ class OrganizationBehaviorTests(AccountScopeTestBase):
             Organization.all_objects.filter(parent_id=disabled.pk).count(), 0
         )
 
+    def test_parent_enable_state_cascades_to_descendants(self):
+        """父级启停级联整棵子树：学校停用时其下的球队组织同步停用。
+
+        用户要求：停用中小学时，把该学校对应的独立球队节点一起停用；
+        重新启用时同步恢复。级联逐层处理，子树内每个节点版本各自递增，
+        避免“父级已停用、子级仍启用”的矛盾状态。
+        """
+        token = self._admin_token()
+        parent = self._org("EF00", "待停用市", "CITY", self.P)
+        child = self._org("EF10", "下属学校", "UNIVERSITY", parent)
+        grandchild = self._org("EF11", "下属球队", "TEAM", child)
+
+        resp = self._put(
+            f"{BASE}/organizations/{parent.pk}",
+            self._org_body("EF00", "待停用市", "CITY", parent_id=self.P.pk, enabled=False, version=0),
+            token=token,
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        for node in (parent, child, grandchild):
+            node.refresh_from_db()
+            self.assertFalse(node.enabled, f"{node.code} 应随父级停用")
+            self.assertGreaterEqual(node.version, 1)
+
+        parent.refresh_from_db()
+        resp = self._put(
+            f"{BASE}/organizations/{parent.pk}",
+            self._org_body(
+                "EF00",
+                "待停用市",
+                "CITY",
+                parent_id=self.P.pk,
+                enabled=True,
+                version=parent.version,
+            ),
+            token=token,
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        for node in (parent, child, grandchild):
+            node.refresh_from_db()
+            self.assertTrue(node.enabled, f"{node.code} 应随父级启用")
+
     def test_illegal_parent_type_combo_rejected(self):
         """越级组合（TEAM 挂 PROVINCE）创建被拒（400），库中无残留。
 
@@ -813,15 +863,22 @@ class PersonBindingTests(AccountScopeTestBase):
             payload["personId"] = person_id
         return self._post(f"{BASE}/accounts/registration-invitations", payload, token=token)
 
-    def _register(self, token: str, username: str):
+    def _register(
+        self,
+        token: str,
+        username: str,
+        real_name: str = "绑定甲",
+        id_number: str = "110101200001010011",
+    ):
+        # 改造说明 §4.2：注册姓名/身份证必须与邀请绑定档案一致。
         return self._post(
             f"{BASE}/auth/registrations",
             {
                 "registrationToken": token,
                 "username": username,
                 "password": PASSWORD,
-                "realName": "激活人",
-                "idNumber": "110101201305011234",
+                "realName": real_name,
+                "idNumber": id_number,
             },
         )
 
@@ -958,6 +1015,27 @@ class PersonBindingTests(AccountScopeTestBase):
         invitation = RegistrationInvitation.objects.get()
         self.assertEqual(invitation.person_id, str(self.person_a.pk))
 
+    def test_invitation_without_person_rejected(self):
+        """改造说明 §4.1：personId 必填，缺失按 422 业务校验失败返回字段级错误。"""
+        resp = self._invite("")
+        self.assertEqual(resp.status_code, 422, resp.content)
+        self.assertEqual(resp.json()["code"], "BUSINESS_VALIDATION_FAILED")
+        self.assertEqual(resp.json()["data"][0]["field"], "personId")
+        self.assertIn("人员档案", resp.json()["message"])
+        self.assertFalse(RegistrationInvitation.objects.exists())
+
+    def test_invitation_kind_mismatch_rejected(self):
+        """改造说明 §4.1：邀请类型与人员档案类型必须一致。"""
+        token = self._login("scope-admin")
+        resp = self._post(
+            f"{BASE}/accounts/registration-invitations",
+            {"kind": "COACH", "orgId": self.S.pk, "personId": str(self.person_a.pk)},
+            token=token,
+        )
+        self.assertEqual(resp.status_code, 400, resp.content)
+        self.assertEqual(resp.json()["code"], "INVALID_ARGUMENT")
+        self.assertFalse(RegistrationInvitation.objects.exists())
+
     # ------------------------------------------------------------ 邀请激活
 
     def test_register_with_valid_person_binds_account(self):
@@ -971,6 +1049,81 @@ class PersonBindingTests(AccountScopeTestBase):
         self.assertEqual(account.person_id, str(self.person_a.pk))
         invitation = RegistrationInvitation.objects.get()
         self.assertIsNotNone(invitation.used_at)
+
+    def test_register_name_mismatch_rejected(self):
+        """改造说明 §4.2：注册姓名必须与绑定档案一致，凭证不消费。"""
+        resp = self._invite(str(self.person_a.pk))
+        plain_token = resp.json()["data"]["registrationToken"]
+
+        resp = self._register(plain_token, "reg-bad-name", real_name="冒名")
+        self.assertEqual(resp.status_code, 400, resp.content)
+        self.assertEqual(resp.json()["code"], "INVALID_ARGUMENT")
+        self.assertEqual(resp.json()["data"][0]["field"], "realName")
+        self.assertFalse(Account.objects.filter(username="reg-bad-name").exists())
+        self.assertIsNone(RegistrationInvitation.objects.get().used_at)
+
+    def test_register_id_number_mismatch_rejected(self):
+        """改造说明 §4.2：身份证号必须与绑定档案一致，禁止凭姓名认领。"""
+        resp = self._invite(str(self.person_a.pk))
+        plain_token = resp.json()["data"]["registrationToken"]
+
+        resp = self._register(
+            plain_token, "reg-bad-id", id_number="110101200001019999"
+        )
+        self.assertEqual(resp.status_code, 400, resp.content)
+        self.assertEqual(resp.json()["code"], "INVALID_ARGUMENT")
+        self.assertEqual(resp.json()["data"][0]["field"], "idNumber")
+        self.assertFalse(Account.objects.filter(username="reg-bad-id").exists())
+        self.assertIsNone(RegistrationInvitation.objects.get().used_at)
+
+    def test_unbound_account_filter(self):
+        """改造说明 §4.3：GET /accounts?unbound=true 只返回未绑定档案的
+        运动员/教练账号。"""
+        Account.objects.create(
+            id=new_account_id(),
+            username="unbound-athlete",
+            display_name="未绑定运动员",
+            roles=["ATHLETE"],
+            organization=self.S,
+            password=make_password(PASSWORD),
+            enabled=True,
+        )
+        Account.objects.create(
+            id=new_account_id(),
+            username="unbound-coach",
+            display_name="未绑定教练",
+            roles=["COACH"],
+            organization=self.S,
+            password=make_password(PASSWORD),
+            enabled=True,
+        )
+        Account.objects.create(
+            id=new_account_id(),
+            username="bound-athlete",
+            display_name="已绑定运动员",
+            roles=["ATHLETE"],
+            organization=self.S,
+            person_id=str(self.person_a.pk),
+            password=make_password(PASSWORD),
+            enabled=True,
+        )
+        Account.objects.create(
+            id=new_account_id(),
+            username="unbound-university",
+            display_name="未绑定学校账号",
+            roles=["UNIVERSITY"],
+            organization=self.S,
+            password=make_password(PASSWORD),
+            enabled=True,
+        )
+
+        resp = self._get(
+            f"{BASE}/accounts", token=self._login("scope-admin"),
+            query={"unbound": "true", "pageSize": 50},
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        usernames = {item["username"] for item in resp.json()["data"]["items"]}
+        self.assertEqual(usernames, {"unbound-athlete", "unbound-coach"})
 
     def test_register_revalidates_person_deleted_after_invitation(self):
         """签发后人员被软删 → 激活时 400 拒绝建号（服务端重验），无部分写入。"""
@@ -1177,7 +1330,11 @@ class InvitationBatchTests(AccountScopeTestBase):
         token = self._login("scope-admin")
         resp = self._post(
             f"{BASE}/accounts/registration-invitations",
-            {"kind": "ATHLETE", "orgId": self.P.pk},
+            {
+                "kind": "ATHLETE",
+                "orgId": self.P.pk,
+                "personId": str(self.person.pk),
+            },
             token=token,
         )
         self.assertEqual(resp.status_code, 400, resp.content)

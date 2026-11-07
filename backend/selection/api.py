@@ -331,13 +331,14 @@ def update_template(request, template_id: int, payload: dict = Body(...)):
 # ---------------------------------------------------------------------------
 @router.get("/candidates/", response=ResponseEnvelope)
 def list_candidates(request):
-    """可评分运动员列表：来自已通过报名名册，按组别/赛事/关键字过滤。"""
+    """可评分运动员列表：来自已通过报名名册，按组别/赛事/关键字/档案ID过滤。"""
     _require_operation("selectionCandidateList")
     return ok(
         candidate_service.list_candidates(
             event_id=_query(request, "event_id", "eventId"),
             group_type=_query(request, "group_type", "groupType"),
             keyword=_query(request, "keyword") or "",
+            candidate_id=_query(request, "candidate_id", "candidateId") or "",
         )
     )
 

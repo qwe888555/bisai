@@ -15,6 +15,7 @@ from apps.common.schemas import StrictSchema
 from .services import event_phase
 
 from . import display
+from .models import event_category_label
 
 EventStatus = Literal["DRAFT", "REGISTRATION_OPEN", "REGISTRATION_CLOSED", "RUNNING", "FINISHED"]
 # 2026-10-28 业务规则：本项目无"高校组"，学段仅小学/初中/高中（PRIMARY/MIDDLE）；
@@ -74,6 +75,7 @@ def event_out(event) -> dict:
         "name": event.name,
         "season": event.season,
         "eventCategory": event.event_category,
+        "eventCategoryLabel": event_category_label(event.event_category),
         "registrationOpensAt": event.registration_opens_at,
         "registrationClosesAt": event.registration_closes_at,
         "status": event.status,
@@ -281,6 +283,18 @@ def match_event_out(event, match=None) -> dict:
         data["inAthleteName"] = _name(event.in_athlete_id, event.in_athlete_id)
     return data
 
+
+def match_roster_out(member) -> dict:
+    """记录台球员选择项：只暴露姓名、球衣号与档案 ID，不含证件信息。"""
+    return {
+        "teamId": str(member.team_id),
+        "athleteId": str(member.person_id),
+        "athleteName": member.person.full_name,
+        "jerseyNumber": member.jersey_number,
+        "position": member.position_code or "",
+        "status": member.status,
+    }
+
 # ---------------------------------------------------------------- 赛事文件 / 图文直播 / 直播链接（5.3 / 5.4）
 
 DocumentType = Literal["SIGN_IN", "SIGNED_RECORD", "REFEREE_REPORT"]
@@ -427,6 +441,10 @@ def content_out(content) -> dict:
         "revision": int(content.revision or 1),
         "bodyText": content.body_text or "",
         "version": int(content.version or 0),
+        # 赛果快讯自动生成标记（2026-11-01）：返回值让调用方/验收可确认这条
+        # 「赛果：…」是系统按 source_match_id 幂等生成的，而不是人工录入。
+        "autoCreated": bool(content.auto_created),
+        "sourceMatchId": content.source_match_id or "",
         "createdAt": content.created_at,
         "updatedAt": content.updated_at,
     }
@@ -466,6 +484,9 @@ def public_content_out(content, base_url: str = "") -> dict:
         "groupId": content.group_id or "",
         "publishedAt": content.published_at,
         "revision": int(content.revision or 1),
+        # 赛果快讯自动生成标记：门户侧同样可据此展示「自动生成」来源。
+        "autoCreated": bool(content.auto_created),
+        "sourceMatchId": content.source_match_id or "",
     }
 
 
@@ -536,6 +557,123 @@ def goal_ranking_row_out(rank: int, athlete_id: str, athlete_name: str,
         "goals": int(goals),
     }
 
+
+def standing_row_out(row: dict) -> dict:
+    """积分榜行投影：球队名称取成员4 Team 主档，查不到回退 ID。"""
+    return {
+        "rank": row["rank"],
+        "teamId": row["teamId"],
+        "teamName": display.team_name(row["teamId"], row["teamId"]),
+        "played": row["played"],
+        "wins": row["wins"],
+        "draws": row["draws"],
+        "losses": row["losses"],
+        "goalsFor": row["goalsFor"],
+        "goalsAgainst": row["goalsAgainst"],
+        "goalDiff": row["goalDiff"],
+        "points": row["points"],
+    }
+
+# ---------------------------------------------------------------- 官方名次与奖项（P1-3，2026-11-02）
+
+MedalCode = Literal["", "GOLD", "SILVER", "BRONZE"]
+AwardType = Literal[
+    "TOP_SCORER", "MVP", "BEST_GOALKEEPER", "BEST_DEFENDER", "FAIR_PLAY", "OTHER"
+]
+
+
+class RankingCreate(StrictSchema):
+    teamId: str = Field(min_length=1, max_length=64)
+    finalRank: int = Field(ge=1)
+    # 空串表示赛事整体名次（不按组别拆分）
+    groupId: str = Field(default="", max_length=64)
+    medal: MedalCode = ""
+    remark: str = Field(default="", max_length=500)
+
+
+class RankingUpdate(RankingCreate):
+    version: int = Field(ge=0)
+
+
+class AwardCreate(StrictSchema):
+    awardType: AwardType
+    athleteId: str = Field(default="", max_length=64)
+    teamId: str = Field(default="", max_length=64)
+    groupId: str = Field(default="", max_length=64)
+    value: str = Field(default="", max_length=100)
+    remark: str = Field(default="", max_length=500)
+
+
+class AwardUpdate(AwardCreate):
+    version: int = Field(ge=0)
+
+
+def ranking_out(row) -> dict:
+    """管理端投影：含 version/published/source 等内部字段。"""
+    return {
+        "id": row.pk,
+        "eventId": row.event_id,
+        "groupId": row.group_id or "",
+        "teamId": row.team_id,
+        "teamName": display.team_name(row.team_id, row.team_id),
+        "finalRank": int(row.final_rank),
+        "medal": row.medal or "",
+        "source": row.source,
+        "published": bool(row.published),
+        "publishedAt": row.published_at,
+        "remark": row.remark or "",
+        "version": int(row.version or 0),
+        "createdAt": row.created_at,
+        "updatedAt": row.updated_at,
+    }
+
+
+def award_out(row) -> dict:
+    return {
+        "id": row.pk,
+        "eventId": row.event_id,
+        "groupId": row.group_id or "",
+        "awardType": row.award_type,
+        "athleteId": row.athlete_id or "",
+        "athleteName": display.athlete_name(row.athlete_id, row.athlete_id)
+        if row.athlete_id
+        else "",
+        "teamId": row.team_id or "",
+        "teamName": display.team_name(row.team_id, row.team_id) if row.team_id else "",
+        "value": row.value or "",
+        "published": bool(row.published),
+        "publishedAt": row.published_at,
+        "remark": row.remark or "",
+        "version": int(row.version or 0),
+        "createdAt": row.created_at,
+        "updatedAt": row.updated_at,
+    }
+
+
+def public_ranking_out(row) -> dict:
+    """门户安全投影：不含 version/source/remark 等内部字段。"""
+    return {
+        "teamId": row.team_id,
+        "teamName": display.team_name(row.team_id, row.team_id),
+        "finalRank": int(row.final_rank),
+        "medal": row.medal or "",
+        "publishedAt": row.published_at,
+    }
+
+
+def public_award_out(row) -> dict:
+    return {
+        "awardType": row.award_type,
+        "athleteId": row.athlete_id or "",
+        "athleteName": display.athlete_name(row.athlete_id, row.athlete_id)
+        if row.athlete_id
+        else "",
+        "teamId": row.team_id or "",
+        "teamName": display.team_name(row.team_id, row.team_id) if row.team_id else "",
+        "value": row.value or "",
+        "publishedAt": row.published_at,
+    }
+
 # ---------------------------------------------------------------- 门户公开只读(T5-07)
 
 def public_event_out(event) -> dict:
@@ -547,6 +685,7 @@ def public_event_out(event) -> dict:
         "name": event.name,
         "season": event.season,
         "eventCategory": event.event_category,
+        "eventCategoryLabel": event_category_label(event.event_category),
         "status": event.status,
         "currentPhase": phase["currentPhase"],
         "phaseStartedAt": phase["phaseStartedAt"],
@@ -565,6 +704,8 @@ def public_match_out(match) -> dict:
         "eventName": display.event_name(match.event_id, match.event_id),
         "groupId": match.group_id,
         "groupName": display.group_name(match.group_id, match.group_id),
+        "homeTeamId": match.home_team_id,
+        "awayTeamId": match.away_team_id,
         "homeTeamName": display.team_name(match.home_team_id, match.home_team_id),
         "awayTeamName": display.team_name(match.away_team_id, match.away_team_id),
         "kickoffAt": match.kickoff_at,

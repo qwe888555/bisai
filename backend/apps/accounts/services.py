@@ -103,10 +103,10 @@ def change_password(account: Account, old_password: str, new_password: str) -> N
 
 
 def register(data: dict) -> Account:
-    """消费一次性邀请凭证后建账号。
+    """消费一次性邀请凭证后建账号，并强制绑定到邀请指定的人员档案。
 
-    注意：人员主档的建立/绑定归成员4 的 /people 接口，本接口只建账号并
-    记录 personId 绑定意图，避免只凭身份证认领已有档案。
+    改造说明 §4.2：邀请未绑定人员 → 400；注册填写的姓名/身份证必须与
+    人员档案一致；匹配通过后才写入 person_id，禁止仅凭姓名“认领”档案。
     """
     invitation = RegistrationInvitation.objects.filter(
         token_hash=crypto.hash_token(data["registrationToken"])
@@ -117,10 +117,16 @@ def register(data: dict) -> Account:
         raise ApiError(STATE_CONFLICT, "注册凭证已被使用")
     if invitation.expires_at <= timezone.now():
         raise ApiError(STATE_CONFLICT, "注册凭证已过期")
+    if not invitation.person_id:
+        raise ApiError(
+            INVALID_ARGUMENT,
+            "注册邀请未绑定人员档案，请联系管理员重新签发",
+            [{"field": "registrationToken", "reason": "邀请未绑定人员"}],
+        )
 
     if Account.objects.filter(username=data["username"]).exists():
         raise ApiError(DUPLICATE_RESOURCE, "登录账号已存在", [{"field": "username", "reason": "已被占用"}])
-    if invitation.person_id and Account.objects.filter(person_id=invitation.person_id).exists():
+    if Account.objects.filter(person_id=invitation.person_id).exists():
         raise ApiError(
             DUPLICATE_RESOURCE,
             "该人员已绑定其他账号",
@@ -128,19 +134,32 @@ def register(data: dict) -> Account:
         )
     # 邀请激活建立绑定前重新校验：签发后人员可能被软删（解绑/重绑同理，走服务端重验）
     _ensure_person_bindable(invitation.person_id)
+    person = _get_bound_person(invitation.person_id)
+    if person.full_name.strip() != data["realName"].strip():
+        raise ApiError(
+            INVALID_ARGUMENT,
+            "姓名与人员档案不一致",
+            [{"field": "realName", "reason": "与邀请绑定档案不符"}],
+        )
+    if person.id_card_hash != crypto.lookup_hash(data["idNumber"]):
+        raise ApiError(
+            INVALID_ARGUMENT,
+            "身份证号与人员档案不一致",
+            [{"field": "idNumber", "reason": "与邀请绑定档案不符"}],
+        )
+    _ensure_person_kind(person, invitation.kind)
 
     with transaction.atomic():
         account = Account.objects.create(
             id=new_account_id(),
             username=data["username"],
-            display_name=data["realName"],
+            display_name=person.full_name,
             roles=[invitation.kind],
             organization=invitation.organization,
-            person_id=invitation.person_id or "",
+            person_id=str(person.pk),
             enabled=True,
             password=make_password(data["password"]),
         )
-        # 身份证/手机号加密留存，等成员4 的人员接口完成绑定时再落到主档
         RegistrationInvitation.objects.filter(pk=invitation.pk).update(used_at=timezone.now())
     return account
 
@@ -200,21 +219,28 @@ def create_invitation(actor: Account, data: dict) -> dict[str, Any]:
             [{"field": "orgId", "reason": "不存在或已删除"}],
         )
     ensure_org_in_scope(actor, org.pk)
-    person = None
-    person_id = data.get("personId") or ""
-    if person_id:
-        from apps.persons.models import Person
+    person_id = (data.get("personId") or "").strip()
+    if not person_id:
+        # 请求语法合法、缺的是业务必填项：按 422 业务校验失败返回，
+        # 与驳回缺 reason 等场景保持同一套错误码契约。
+        raise ApiError(
+            BUSINESS_VALIDATION_FAILED,
+            "邀请必须绑定人员档案",
+            [{"field": "personId", "reason": "请先在人员管理中建档"}],
+        )
+    from apps.persons.models import Person
 
-        try:
-            person = Person.objects.filter(pk=person_id, is_deleted=False).first()
-        except (TypeError, ValueError):
-            person = None
-        if person is None:
-            raise ApiError(
-                INVALID_ARGUMENT,
-                "人员档案不存在",
-                [{"field": "personId", "reason": "请先在人员管理中建档"}],
-            )
+    try:
+        person = Person.objects.filter(pk=person_id, is_deleted=False).first()
+    except (TypeError, ValueError):
+        person = None
+    if person is None:
+        raise ApiError(
+            INVALID_ARGUMENT,
+            "人员档案不存在",
+            [{"field": "personId", "reason": "请先在人员管理中建档"}],
+        )
+    _ensure_person_kind(person, kind)
     _ensure_invitation_org(org, person)
     if person is not None:
         # 一个人员只能绑定一个账号，也不能同时持有两张可用邀请
@@ -421,6 +447,7 @@ def _issue_one_invitation(
         person = _match_person_by_id_number(
             _row_text(row.get("idNumber")), _row_text(row.get("realName"))
         )
+    _ensure_person_kind(person, kind)
 
     # 不得跨数据范围发放：非全局管理员只能给子树内学校的人员发账号
     school_codes = visible_school_codes(actor)
@@ -575,12 +602,16 @@ def invitation_batch_csv(result: dict) -> tuple[bytes, str]:
 # ---------------------------------------------------------------- 账号
 
 def scoped_accounts(actor: Account):
+    # select_related：账号列表输出 orgName（2026-11-03 复测问题 3），
+    # 避免当前页逐行回查组织造成 N+1。
     if is_global_admin(actor):
-        return Account.objects.all()
+        return Account.objects.select_related("organization")
     scope = org_scope_ids(actor)
     if not scope:
-        return Account.objects.none()
-    return Account.objects.filter(organization_id__in=scope)
+        return Account.objects.none().select_related("organization")
+    return Account.objects.filter(organization_id__in=scope).select_related(
+        "organization"
+    )
 
 
 def list_accounts(actor: Account, filters: dict):
@@ -598,7 +629,16 @@ def list_accounts(actor: Account, filters: dict):
     enabled = filters.get("enabled")
     if enabled is not None:
         queryset = queryset.filter(enabled=enabled)
-    return queryset.order_by("-created_at", "id")
+    queryset = queryset.order_by("-created_at", "id")
+    if filters.get("unbound"):
+        # 改造说明 §4.3：只统计运动员/教练账号，person_id 为空即未绑定。
+        # JSONField contains 在 SQLite 测试库不支持，转内存过滤保证双库一致。
+        return [
+            account
+            for account in queryset.filter(person_id="")
+            if {"ATHLETE", "COACH"} & set(account.roles or ())
+        ]
+    return queryset
 
 
 ROLE_ORG_TYPES: dict[str, set[str]] = {
@@ -608,6 +648,54 @@ ROLE_ORG_TYPES: dict[str, set[str]] = {
     "CITY": {"CITY"},
     "PROVINCE_REVIEWER": {"PROVINCE"},
 }
+
+
+def _get_bound_person(person_id: str):
+    """按邀请绑定的 person_id 取人员档案；不存在/已软删统一 400。"""
+    try:
+        pk = int(str(person_id))
+    except (TypeError, ValueError):
+        pk = 0
+    person = Person.objects.filter(pk=pk, is_deleted=False).first() if pk > 0 else None
+    if person is None:
+        raise ApiError(
+            INVALID_ARGUMENT,
+            "邀请绑定的人员档案不存在或已删除",
+            [{"field": "personId", "reason": "请重新签发邀请"}],
+        )
+    return person
+
+
+def _ensure_person_kind(person, kind: str, field: str = "personId") -> None:
+    """邀请/账号身份必须与人员档案一致（改造说明 §4.1）。
+
+    身份事实源优先取扩展档案行（方案C），同时兼容只有 person_category
+    的历史/导入数据，避免存量档案因缺少扩展行而无法发邀请。
+    """
+    from apps.persons.models import AthleteProfile, CoachProfile
+
+    if kind == "ATHLETE":
+        matched = (
+            person.person_category == "ATHLETE"
+            or AthleteProfile.objects.filter(person=person).exists()
+        )
+        if not matched:
+            raise ApiError(
+                INVALID_ARGUMENT,
+                "该人员不具备运动员身份",
+                [{"field": field, "reason": "档案类别与邀请身份不一致"}],
+            )
+    if kind == "COACH":
+        matched = (
+            person.person_category == "COACH"
+            or CoachProfile.objects.filter(person=person).exists()
+        )
+        if not matched:
+            raise ApiError(
+                INVALID_ARGUMENT,
+                "该人员不具备教练员身份",
+                [{"field": field, "reason": "档案类别与邀请身份不一致"}],
+            )
 
 
 def _ensure_person_bindable(person_id: str) -> None:
@@ -954,22 +1042,36 @@ def update_organization(actor: Account, org_id: str, data: dict) -> Organization
     _validate_org_parent(data["orgType"], parent, current_id=org_id)
 
     enabled = bool(data.get("enabled", True))
-    if organization.enabled and not enabled:
-        if Organization.objects.filter(parent_id=org_id).exists():
-            raise ApiError(
-                STATE_CONFLICT,
-                "存在启用中的下级组织，不能停用",
-                [{"field": "enabled", "reason": "请先迁移或停用下级组织"}],
-            )
+    state_changed = organization.enabled != enabled
+    with transaction.atomic():
+        organization = _apply_org_fields(
+            organization,
+            parent=parent,
+            name=data["name"],
+            org_type=data["orgType"],
+            code=organization.code,
+            enabled=enabled,
+        )
+        # 父级启停级联整棵子树：例如停用学校时，同步停用它下面的球队组织
+        # 节点；重新启用时一并恢复。避免出现“父级已停用、子级仍启用”的
+        # 矛盾状态，也省去逐个手动停用下级。
+        if state_changed:
+            _sync_descendants_enabled(organization, enabled)
+    return organization
 
-    return _apply_org_fields(
-        organization,
-        parent=parent,
-        name=data["name"],
-        org_type=data["orgType"],
-        code=organization.code,
-        enabled=enabled,
-    )
+
+def _sync_descendants_enabled(root: Organization, enabled: bool) -> None:
+    """把 root 的整棵下级子树同步到 enabled 状态（逐条递增版本）。"""
+    frontier = [root.pk]
+    while frontier:
+        children = list(Organization.objects.filter(parent_id__in=frontier))
+        frontier = []
+        for child in children:
+            if child.enabled != enabled:
+                child.enabled = enabled
+                bump(child)
+                child.save(update_fields=["enabled", "version", "updated_at"])
+            frontier.append(child.pk)
 
 
 def delete_organization(actor: Account, org_id: str, version: Optional[int]) -> Organization:

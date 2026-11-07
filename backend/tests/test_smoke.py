@@ -416,8 +416,40 @@ class ApiSmokeTests(TestCase):
             self.assertIn("api:matchList", me["permissions"])
             self.assertIn("api:eventList", me["permissions"])
 
+    def test_athlete_coach_can_read_matches_and_teams(self):
+        """2026-11-01 用户裁定：运动员/教练个人页可直接读比赛与球队档案，
+        不再被迫只走 /public/* 接口；写操作仍然拒绝。"""
+        for username in ("athlete", "coach"):
+            token = self.login(username)
+            for path in ("/matches", "/teams", "/statistics/goals?eventId=evt_demo"):
+                response = self.get(path, token)
+                self.assertEqual(
+                    response.status_code,
+                    200,
+                    f"{username} 读取 {path} 被拒：{response.content}",
+                )
+            me = body(self.get("/me", token))["data"]
+            self.assertIn("api:matchList", me["permissions"])
+            self.assertIn("api:teamGet", me["permissions"])
+
+            created = self.post(
+                "/matches",
+                {
+                    "eventId": "evt_demo",
+                    "groupId": "grp_male_u15",
+                    "homeTeamId": "team_demo_a",
+                    "awayTeamId": "team_demo_b",
+                    # 用合法 body：schema 校验先于权限判定，非法 body 会先返回 400
+                    "kickoffAt": "2026-06-01T10:00:00+08:00",
+                    "status": "SCHEDULED",
+                },
+                token,
+            )
+            self.assertEqual(created.status_code, 403, created.content)
+
     def test_match_and_event_writes_still_denied_for_school_city_team(self):
-        for username in ("city", "team", "university"):
+        # 学校/球队无赛事写权限 → 权限点 403
+        for username in ("team", "university"):
             token = self.login(username)
             deleted = self.client.delete(
                 f"{BASE}/events/evt_demo?version=0",
@@ -425,6 +457,14 @@ class ApiSmokeTests(TestCase):
             )
             self.assertEqual(deleted.status_code, 403, deleted.content)
             self.assertEqual(body(deleted)["code"], "FORBIDDEN")
+        # 市州在 event 写权限点内（eventCreate 登记 ADMIN/PROVINCE/CITY），
+        # 权限通过后落到资源不存在 → 404，而非越权 403
+        city = self.login("city")
+        deleted = self.client.delete(
+            f"{BASE}/events/evt_demo?version=0",
+            HTTP_AUTHORIZATION=f"Bearer {city}",
+        )
+        self.assertEqual(deleted.status_code, 404, deleted.content)
 
     # ---------------------------------------------------------------- 账号绑定约定
     def test_account_role_must_match_org_type(self):
@@ -676,8 +716,15 @@ class ApiSmokeTests(TestCase):
             content_type="application/json",
             HTTP_AUTHORIZATION=f"Bearer {token}",
         )
-        self.assertEqual(disable.status_code, 409, disable.content)
-        self.assertEqual(body(disable)["code"], "STATE_CONFLICT")
+        # 业务口径（2026-10 调整）：停用父级不再 409，而是级联停用整棵子树；
+        # 启用父级同样级联恢复（见 accounts.OrganizationBehaviorTests）。
+        self.assertEqual(disable.status_code, 200, disable.content)
+        school_after = self.client.get(
+            f"{BASE}/organizations/{school['id']}",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+        self.assertEqual(school_after.status_code, 200, school_after.content)
+        self.assertFalse(body(school_after)["data"]["enabled"])
 
     def test_code_is_immutable_on_update(self):
         token = self.login()

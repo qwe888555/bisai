@@ -52,7 +52,16 @@ from apps.common.errors import (
     STATE_CONFLICT,
     ApiError,
 )
-from apps.common.permissions import ADMIN, TEAM, UNIVERSITY, assert_not_self_review
+from apps.common.permissions import (
+    ADMIN,
+    ATHLETE,
+    CITY,
+    COACH,
+    PROVINCE_REVIEWER,
+    TEAM,
+    UNIVERSITY,
+    assert_not_self_review,
+)
 from apps.common.scopes import scope_org_codes
 from apps.materials.models import (
     MaterialAuditLog,
@@ -66,24 +75,28 @@ from apps.teams.models import Team
 
 
 def _material_scope(account) -> tuple:
-    """材料数据范围（2026-10-28 D1/D5 批准）：返回 (school_codes, team_ids)。
+    """材料数据范围：返回 (school_codes, team_ids, person_id)。
 
-    - 全局 ADMIN（无组织绑定）→ (None, None) 全库。D1：数据范围能力保留
-      （系统管理/异常处理），普通材料审核权限已从 materialReview 移除，
+    - 全局 ADMIN（无组织绑定）→ (None, None, None) 全库。D1：数据范围能力
+      保留（系统管理/异常处理），普通材料审核权限已从 materialReview 移除，
       不因范围推导审核权；材料域挂组织 ADMIN 维持全库（对齐子树三态列为
       B 类建议，未获批准不实施）；
-    - UNIVERSITY → (codes, None)：所属组织子树编码（本校，A′ 编码映射）；
+    - UNIVERSITY → (codes, None, None)：所属组织子树编码（本校，A′ 编码映射）；
       无有效组织范围（无绑定/绑定已软删）→ 默认拒绝，不退化为全库；
-    - TEAM → (None, ids)：仅本队 TEAM 材料（一·补四：球队端提交/维护/补充
-      本队材料；审核权限不开放）。绑定依据 accounts.Account.team_ids
+    - TEAM → (None, ids, None)：仅本队 TEAM 材料（一·补四：球队端提交/维护/
+      补充本队材料；审核权限不开放）。绑定依据 accounts.Account.team_ids
       （ADMIN 账号管理写入，attachments 域已作权威归属校验先例），集合
       语义校验服务端归属、不信任客户端传参；空绑定 → 拒绝；PERSON 材料
       对球队端一律不可见；
-    - 其余角色（CITY/PROVINCE_REVIEWER/ATHLETE/COACH）保持拒绝。
+    - ATHLETE / COACH → (None, None, person_id)：仅本人 PERSON 材料
+      （材料页自服务，account.person_id 服务端签发）；未绑定人员档案 → 拒绝；
+    - CITY / PROVINCE_REVIEWER → (codes, None, None)：所属组织子树内学校
+      归属的材料（市州看本市、省级看全省，A′ 编码映射）；无有效组织范围
+      → 默认拒绝。
     """
     roles = getattr(account, "roles", ()) or ()
     if ADMIN in roles:
-        return None, None
+        return None, None, None
     if UNIVERSITY in roles:
         codes = scope_org_codes(account)
         if not codes:
@@ -91,7 +104,7 @@ def _material_scope(account) -> tuple:
                 DATA_SCOPE_DENIED,
                 "当前账号无有效组织范围，禁止访问材料数据",
             )
-        return codes, None
+        return codes, None, None
     if TEAM in roles:
         raw = getattr(account, "team_ids", None) or []
         ids = sorted({int(t) for t in raw if str(t).lstrip("-").isdigit()})
@@ -100,23 +113,47 @@ def _material_scope(account) -> tuple:
                 DATA_SCOPE_DENIED,
                 "当前球队账号未绑定任何球队，禁止访问材料数据",
             )
-        return None, ids
+        return None, ids, None
+    if ATHLETE in roles or COACH in roles:
+        raw = str(getattr(account, "person_id", "") or "").strip()
+        if not raw.isdigit():
+            raise ApiError(
+                DATA_SCOPE_DENIED,
+                "当前账号未绑定人员档案，禁止访问材料数据",
+            )
+        return None, None, int(raw)
+    if CITY in roles or PROVINCE_REVIEWER in roles:
+        codes = scope_org_codes(account)
+        if not codes:
+            raise ApiError(
+                DATA_SCOPE_DENIED,
+                "当前账号无有效组织范围，禁止访问材料数据",
+            )
+        return codes, None, None
     raise ApiError(
         DATA_SCOPE_DENIED,
-        "材料数据范围仅对管理员、学校与球队账号开放",
+        "材料数据范围仅对管理员、学校、球队及市州/省级账号开放",
     )
 
 
 def _ensure_owner_in_scope(owner, scope: tuple) -> None:
     """材料归属对象（Person/Team）必须在账号范围内（单对象/写链共用）。
 
-    scope=(None, None)（全局 ADMIN）直接放行；TEAM 范围：归属必须是 Team
-    且主键在本队集合内（PERSON 材料对球队端不可见）；学校范围 deny-by-
-    default：归属对象无学校归属（Person/Team.school 可空）即无法证明在
-    授权范围内 → 403（同 A′ 写链显式拒绝口径，不静默放行）。
+    scope=(None, None, None)（全局 ADMIN）直接放行；TEAM 范围：归属必须是
+    Team 且主键在本队集合内（PERSON 材料对球队端不可见）；ATHLETE/COACH
+    范围：归属必须是本人；学校/市州/省级范围 deny-by-default：归属对象无
+    学校归属（Person/Team.school 可空）即无法证明在授权范围内 → 403（同
+    A′ 写链显式拒绝口径，不静默放行）。
     """
-    codes, team_ids = scope
-    if codes is None and team_ids is None:
+    codes, team_ids, person_id = scope
+    if codes is None and team_ids is None and person_id is None:
+        return
+    if person_id is not None:
+        if not isinstance(owner, Person) or owner.pk != person_id:
+            raise ApiError(
+                DATA_SCOPE_DENIED,
+                "目标材料不在当前账号的本人范围内",
+            )
         return
     if team_ids is not None:
         if not isinstance(owner, Team) or owner.pk not in set(team_ids):
@@ -134,10 +171,14 @@ def _ensure_owner_in_scope(owner, scope: tuple) -> None:
 
 
 def _apply_scope(queryset, kind: str, scope: tuple):
-    """列表查询按范围过滤：学校编码（codes）或本队集合（team_ids）。"""
-    codes, team_ids = scope
-    if codes is None and team_ids is None:
+    """列表查询按范围过滤：学校编码 / 本队集合 / 本人。"""
+    codes, team_ids, person_id = scope
+    if codes is None and team_ids is None and person_id is None:
         return queryset
+    if person_id is not None:
+        if kind != "PERSON":  # 运动员/教练自服务仅可见本人人员材料
+            return queryset.none()
+        return queryset.filter(person_id=person_id)
     if team_ids is not None:
         if kind != "TEAM":  # 人员材料对球队端不可见（一·补四）
             return queryset.none()
@@ -211,24 +252,57 @@ def _resolve_owner(owner_type: str, owner_id: str):
     return owner
 
 
+def _is_enrollment_attachment_type(code: str) -> bool:
+    """报名附件类型（enrollments.MATERIAL_TYPES）不属于通用材料类型。"""
+    from apps.enrollments.models import MATERIAL_TYPES
+
+    return code in {item[0] for item in MATERIAL_TYPES}
+
+
 def _resolve_material_type(code: str, owner_type: str) -> MaterialType:
     """类型必须存在于 material_type 表且启用且归属匹配（空表 → 400 明确报错）。
 
     2026-10-29 问题⑥裁定：类型不存在/停用/归属不匹配属于请求引用了
     无效的类型字典项（配置/参数错误），语义为 400 INVALID_ARGUMENT，
     不再使用 409 STATE_CONFLICT（409 保留给真实资源状态冲突）。
+
+    2026-11-04 复测：STAMPED_FORM/STUDENT_STATUS 是报名附件类型，团队/人员
+    材料页不提供，直接调用 POST /materials 时才暴露；此前统一报“字典尚未
+    初始化”，与真实原因不符。现区分三种情况并带 materialType 字段级明细：
+    报名附件类型误用 / 字典确实为空 / 字典非空但 code 不存在。
     """
     mtype = MaterialType.objects.filter(code=code).first()
     if mtype is None:
+        if _is_enrollment_attachment_type(code):
+            raise ApiError(
+                INVALID_ARGUMENT,
+                f"材料类型 {code} 属于报名附件类型，不能作为人员/球队材料上传",
+                [{"field": "materialType", "reason": "请通过报名附件接口上传"}],
+            )
+        if not MaterialType.objects.exists():
+            raise ApiError(
+                INVALID_ARGUMENT,
+                "材料类型字典尚未初始化，请先初始化 material_type 字典",
+                [{"field": "materialType", "reason": "材料类型字典为空"}],
+            )
         raise ApiError(
             INVALID_ARGUMENT,
-            f"材料类型 {code} 不存在：类型字典尚未初始化，暂无法受理材料创建",
+            f"材料类型 {code} 不存在",
+            [{"field": "materialType", "reason": "类型字典中没有该 code"}],
         )
     if not mtype.is_active:
-        raise ApiError(INVALID_ARGUMENT, f"材料类型 {code} 已停用")
+        raise ApiError(
+            INVALID_ARGUMENT,
+            f"材料类型 {code} 已停用",
+            [{"field": "materialType", "reason": "类型已停用"}],
+        )
     # main 653f04f 保留：applies_to 支持 PERSON,TEAM 逗号分隔双归属
     if owner_type not in [p.strip() for p in mtype.applies_to.split(",") if p.strip()]:
-        raise ApiError(INVALID_ARGUMENT, f"材料类型 {code} 不适用于 {owner_type} 归属")
+        raise ApiError(
+            INVALID_ARGUMENT,
+            f"材料类型 {code} 不适用于 {owner_type} 归属",
+            [{"field": "materialType", "reason": f"仅适用于 {mtype.applies_to}"}],
+        )
     return mtype
 
 
@@ -618,11 +692,18 @@ def material_review(material_id: str, payload: dict, account) -> tuple:
             )
         # 防自审：纳入 material.create / material.update；
         # material.remove 不纳入（软删后材料不可审核）。
+        # 2026-11-02 管理端联调：全局 ADMIN 允许「无创建/修改审计记录」的
+        # 演示/种子材料通过（seed 脚本直写数据库，不经 materialCreate，
+        # 按缺证据阻断会使管理端「通过/驳回」按钮对种子材料恒 403）；
+        # 若审计记录中存在当前账号的创建/修改，仍按自审阻断。学校端维持
+        # 缺证据阻断口径不变。
+        roles = getattr(account, "roles", ()) or ()
         assert_not_self_review(
             account,
             "Material",
             f"{kind}:{material.pk}",
             ("material.create", "material.update"),
+            allow_missing_evidence=ADMIN in roles,
         )
         decision = payload["decision"]
         reason = (payload.get("reason") or "").strip()

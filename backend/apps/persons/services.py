@@ -20,11 +20,13 @@ from typing import Optional
 from django.core.exceptions import ObjectDoesNotExist
 from django.db import transaction
 from django.db.models import Count, Exists, OuterRef, Q, QuerySet, Subquery
+from django.db.models.functions import Coalesce
 from django.utils import timezone
 
 from apps.common import crypto, enums
 from apps.common.enums import RegionLevel
 from apps.common.errors import (
+    BUSINESS_VALIDATION_FAILED,
     DATA_SCOPE_DENIED,
     DUPLICATE_RESOURCE,
     FORBIDDEN,
@@ -415,10 +417,17 @@ def people_queryset() -> QuerySet:
     """人员主档基础查询：排除软删；学校、扩展档案、现役球队名一次取齐。
 
     team_name 取现役（CURRENT）球队名（team_member 单向流转，历史关系不计）。
+    coach 没有 TeamMember 行，2026-11-01 起回落到现役教练关系 TeamCoach，
+    否则 /me/profile 对教练恒为空（前端只能自己用 /me/teams 兜底）。
     """
-    current_team_name = TeamMember.objects.filter(
-        person=OuterRef("pk"), status=enums.RelationStatus.CURRENT
-    ).values("team__name")[:1]
+    current_team_name = Coalesce(
+        TeamMember.objects.filter(
+            person=OuterRef("pk"), status=enums.RelationStatus.CURRENT
+        ).values("team__name")[:1],
+        TeamCoach.objects.filter(
+            person=OuterRef("pk"), status=enums.RelationStatus.CURRENT
+        ).values("team__name")[:1],
+    )
     return (
         Person.objects.filter(is_deleted=False)
         .select_related("school")
@@ -477,8 +486,11 @@ def apply_person_scope(queryset: QuerySet, account) -> QuerySet:
       各自独立按 CURRENT 过滤），不经学校归属反推，不因组织子树扩展到
       其他球队（多队授权未立项）。
 
-    - CITY / PROVINCE_REVIEWER：403 DATA_SCOPE_DENIED（市级/省级人员
-      范围留待独立评审，契约文案不区分角色）。
+    - CITY / PROVINCE_REVIEWER（2026-11-04 开放）：绑定节点必须存在且
+      org_type 匹配（CITY→"CITY"、PROVINCE_REVIEWER→"PROVINCE"），否则
+      403；可见其组织子树中全部学校类节点（SCHOOL/UNIVERSITY）code 对应
+      的人员。市州看本市、省级看全省；无 school 归属人员不可见
+      （deny-by-default，与学校端口径一致）。
 
     角色门禁必须在 scope_org_codes 之前：该 helper 不校验角色，若颠倒
     顺序，UNIVERSITY 等有组织绑定的账号会被其非空子树编码误放行。
@@ -499,10 +511,12 @@ def apply_person_scope(queryset: QuerySet, account) -> QuerySet:
             )
         return queryset.filter(school__code__in=codes)
 
-    if "UNIVERSITY" not in roles and "TEAM" not in roles:
+    if not (
+        {"UNIVERSITY", "TEAM", "CITY", "PROVINCE_REVIEWER"} & roles
+    ):
         raise ApiError(
             DATA_SCOPE_DENIED,
-            "市级/省级人员数据范围尚未开放，当前仅管理员及学校/球队端可查询",
+            "当前角色无人员数据范围，仅管理员及学校/球队/市州/省级端可查询",
         )
 
     from apps.accounts.models import Organization
@@ -533,6 +547,26 @@ def apply_person_scope(queryset: QuerySet, account) -> QuerySet:
                 DATA_SCOPE_DENIED,
                 "当前账号无有效组织范围，禁止访问人员数据",
             )
+        return queryset.filter(school__code__in=school_codes)
+
+    # CITY / PROVINCE_REVIEWER 分支：组织子树内学校类节点 code（市州看本市、
+    # 省级看全省）；节点类型必须与角色匹配，防止跨级绑定放大范围。
+    if "CITY" in roles or "PROVINCE_REVIEWER" in roles:
+        expected_types = set()
+        if "CITY" in roles:
+            expected_types.add("CITY")
+        if "PROVINCE_REVIEWER" in roles:
+            expected_types.add("PROVINCE")
+        if org.org_type not in expected_types:
+            raise ApiError(
+                DATA_SCOPE_DENIED,
+                "市州/省级账号绑定组织类型不匹配，禁止访问人员数据",
+            )
+        school_codes = list(
+            Organization.objects.filter(pk__in=org_scope_ids(account))
+            .filter(org_type__in=("SCHOOL", "UNIVERSITY"))
+            .values_list("code", flat=True)
+        )
         return queryset.filter(school__code__in=school_codes)
 
     # TEAM 分支：仅绑定节点自身（org.code == team_no），不取子树
@@ -569,25 +603,35 @@ def verify_person_owner(account, owner_id) -> None:
     - 账号绑定本人档案（account.person_id 服务端签发，与 /me/profile 同源）
       → 放行（本人材料上传/查看，对应 materialList/Create 含 ATHLETE/COACH
       的自服务场景）；
-    - 其余一律 DATA_SCOPE_DENIED——本市/本校/本队范围依赖 A′ 映射，未交付
-      前不得放行，不发明组织层级授权。
+    - CITY / PROVINCE_REVIEWER：人员学校归属在账号组织子树学校编码内
+      → 放行（与 apply_person_scope 同口径；用于市州/省级查看材料文件）；
+    - 其余一律 DATA_SCOPE_DENIED。
     """
     from apps.common.permissions import ADMIN
+    from apps.common.scopes import visible_school_codes
 
     raw = str(owner_id or "").strip()
     if not raw:
         raise ApiError(DATA_SCOPE_DENIED, "文件归属对象未确定，暂无法校验归属")
-    if not Person.objects.filter(
-        pk=parse_path_id(raw, "ownerId"), is_deleted=False
-    ).exists():
+    person = (
+        Person.objects.filter(pk=parse_path_id(raw, "ownerId"), is_deleted=False)
+        .select_related("school")
+        .first()
+    )
+    if person is None:
         raise ApiError(NOT_FOUND, "归属人员不存在或已删除")
-    if ADMIN in (getattr(account, "roles", ()) or ()):
+    roles = set(getattr(account, "roles", ()) or ())
+    if ADMIN in roles:
         return
     if str(getattr(account, "person_id", "") or "") == raw:
         return
+    if "CITY" in roles or "PROVINCE_REVIEWER" in roles:
+        codes = visible_school_codes(account)
+        if codes and person.school is not None and person.school.code in codes:
+            return
     raise ApiError(
         DATA_SCOPE_DENIED,
-        "人员数据范围待组织映射方案确认后开放，当前仅管理员与本人可访问",
+        "人员数据范围与当前账号不匹配，禁止访问该人员文件",
     )
 
 
@@ -665,16 +709,22 @@ def coach_duties_map(person_ids: list) -> dict:
     }
 
 
-def search_people(keyword: str, account) -> list:
+def search_people(keyword: str, account, review_status: str = "APPROVED") -> list:
     """POST /people/search：{keyword} 按姓名包含匹配，返回数组（非分页）。
+
+    默认仅返回 APPROVED（2026-11-03 复测问题 1）：该接口服务于报名添加
+    运动员、球队教练添加、公示/刊物人员选择等下游选择器，草稿与驳回档案
+    不应被选入业务；需要其他状态时由调用方显式指定 reviewStatus。
 
     mock 的 slice(0, 20) 截断沿用作无分页检索的保护上限（C 类沿用项，
     如需调整待确认）。mock 按 maskedIdNumber 匹配为演示逻辑，不照搬。
     """
+    _check_enum(review_status, tuple(enums.AuditStatus.values), "reviewStatus")
     queryset = apply_person_scope(people_queryset(), account)
     term = (keyword or "").strip()
     if term:
         queryset = queryset.filter(full_name__icontains=term)
+    queryset = queryset.filter(audit_status=review_status)
     return list(queryset.order_by("-id")[:20])
 
 
@@ -1327,6 +1377,51 @@ def update_own_person(person_id: str, payload: dict):
     return people_queryset().filter(pk=person.pk).first()
 
 
+def submit_person(person_id: str, version: int, account):
+    """POST /people/{id}/submit：学校把本校 DRAFT/REJECTED 档案提交复核。
+
+    建档权限下沉后（改造说明 §2.1/§6），学校录入的档案必须有一个服务端
+    入口转为 PENDING，否则审核接口永远只能处理 PENDING，学校档案无法闭环。
+    - 数据范围复用 apply_person_scope（学校只看本校，管理员按授权子树）；
+    - 状态机：DRAFT/REJECTED → PENDING；PENDING 幂等成功；APPROVED → 409；
+    - 行锁 + 乐观锁：与 review_person 串行，避免并发重复提交。
+    """
+    with transaction.atomic():
+        person = (
+            apply_person_scope(people_queryset(), account)
+            .select_for_update()
+            .filter(pk=parse_path_id(person_id))
+            .first()
+        )
+        if person is None:
+            raise ApiError(NOT_FOUND)
+        ensure_version(person, version)
+        current = person.audit_status
+        if current == enums.AuditStatus.APPROVED:
+            raise ApiError(STATE_CONFLICT, "档案已审核通过，无需提交")
+        if current == enums.AuditStatus.PENDING:
+            return people_queryset().filter(pk=person.pk).first()
+        person.audit_status = enums.AuditStatus.PENDING
+        person.save()
+        _log_change(
+            person,
+            enums.ChangeType.UPDATE,
+            [
+                {
+                    "field": "audit_status",
+                    "old": str(current),
+                    "new": enums.AuditStatus.PENDING.value,
+                }
+            ],
+            reason=(
+                "驳回后重新提交"
+                if current == enums.AuditStatus.REJECTED
+                else "学校提交审核"
+            ),
+        )
+    return people_queryset().filter(pk=person.pk).first()
+
+
 def confirm_own_person(person_id: str, version: int, account):
     """POST /me/profile-confirmation：本人确认档案，提交进入复核。
 
@@ -1518,6 +1613,67 @@ def _assert_not_self_review(person, account) -> None:
         raise ApiError(FORBIDDEN, "不得审核自己创建或提交的人员档案")
 
 
+def _review_evidence(person_ids) -> dict:
+    """批量取创建/最近提交操作者（2026-11-03 复测问题 4 的 canReview 依据）。
+
+    与 _assert_not_self_review 同一证据口径（person.create + person.self_confirm，
+    仅 SUCCESS），但按人员 ID 批量查询，避免列表逐行 N+1；返回
+    {person_id: {"creator": (时间, 账号ID), "submitter": (时间, 账号ID)}}。
+    """
+    ids = [str(pk) for pk in person_ids]
+    if not ids:
+        return {}
+    entries = AuditLog.objects.filter(
+        object_type="Person",
+        object_id__in=ids,
+        outcome="SUCCESS",
+    ).filter(Q(action="person.create") | Q(action="person.self_confirm"))
+    evidence: dict[str, dict] = {}
+    for object_id, action, operator_id, created_at in entries.values_list(
+        "object_id", "action", "operator_account_id", "created_at"
+    ):
+        slot = "creator" if action == "person.create" else "submitter"
+        item = evidence.setdefault(object_id, {})
+        previous = item.get(slot)
+        if previous is None or created_at > previous[0]:
+            item[slot] = (created_at, operator_id or "")
+    return evidence
+
+
+def can_review_map(rows, account) -> dict:
+    """按行计算 canReview：有审核权限 + PENDING + 非本人创建/提交。
+
+    权限口径与 review_person 的 require("personReview") 一致（仅以角色判断，
+    不复制数据范围裁决）；数据范围由调用方查询链保证。缺审计日志时与
+    审核接口同口径放行（无证据可判），不因缺日志误隐藏按钮。
+    """
+    from apps.common.permissions import operation_roles
+
+    rows = list(rows)
+    result = {row.pk: False for row in rows}
+    account_id = getattr(account, "pk", "") or ""
+    if not account_id:
+        return result
+    if not set(getattr(account, "roles", ()) or ()) & set(
+        operation_roles("personReview")
+    ):
+        return result
+    evidence = _review_evidence([row.pk for row in rows])
+    for row in rows:
+        if row.audit_status != enums.AuditStatus.PENDING:
+            continue
+        item = evidence.get(str(row.pk), {})
+        creator_id = item.get("creator", (None, ""))[1]
+        submitter_id = item.get("submitter", (None, ""))[1]
+        if account_id not in (creator_id, submitter_id):
+            result[row.pk] = True
+    return result
+
+
+def can_review_person(person, account) -> bool:
+    return can_review_map([person], account).get(person.pk, False)
+
+
 def review_person(person_id: str, payload: dict, account):
     """POST /people/{id}/review（P0-2，2026-10-28）：学校端档案审核。
 
@@ -1580,7 +1736,7 @@ def review_person(person_id: str, payload: dict, account):
         reason = (payload.get("reason") or "").strip()
         if decision == "REJECT" and not reason:
             raise ApiError(
-                INVALID_ARGUMENT,
+                BUSINESS_VALIDATION_FAILED,
                 "驳回档案必须填写审核意见",
                 [{"field": "reason", "reason": "REJECT 时必填"}],
             )
@@ -1655,6 +1811,230 @@ def list_own_teams(person_id: str) -> list[dict]:
         .order_by("created_at", "id")
     )
     return [_team_brief_out(row) for row in rows]
+
+
+def list_own_team_affiliations(person_id: str) -> list[dict]:
+    """GET /me/team-affiliations：本人球队归属记录（含现役与历史）。
+
+    契约（前端 zuqiu types.ts:MyAffiliation + mock adapter.ts:339）：分页信封，
+    元素字段 id/personId/teamId/teamName/relation/startDate/endDate/current/
+    verifyStatus/version。数据源=正式关系表 TeamMember + TeamCoach：
+    - relation：球员关系固定「运动员」，教练关系按 CoachDuty 中文标签；
+    - verifyStatus 固定 VERIFIED（正式关系本身就是核验结果；自报归属的
+      UNVERIFIED/REJECTED 需申请表，B5 未采用，故无历史数据可回放）；
+    - EXITED 历史关系按 left_at 收尾，current=false 供前端区分「已结束」；
+    - 排序：现役在前，其次按加入日期倒序。
+    """
+    pid = int(person_id)
+    rows: list[dict] = []
+    members = (
+        TeamMember.objects.filter(person_id=pid, team__is_deleted=False)
+        .select_related("team")
+        .order_by("-joined_at", "-id")
+    )
+    for item in members:
+        rows.append(
+            _affiliation_out(
+                key=f"tm_{item.pk}",
+                person_id=pid,
+                team=item.team,
+                relation="运动员",
+                joined_at=item.joined_at,
+                left_at=item.left_at,
+                current=item.status == enums.RelationStatus.CURRENT,
+                updated_at=item.updated_at,
+            )
+        )
+    coaches = (
+        TeamCoach.objects.filter(person_id=pid, team__is_deleted=False)
+        .select_related("team")
+        .order_by("-joined_at", "-id")
+    )
+    for item in coaches:
+        rows.append(
+            _affiliation_out(
+                key=f"tc_{item.pk}",
+                person_id=pid,
+                team=item.team,
+                relation=_COACH_DUTY_LABELS.get(item.duty, "教练"),
+                joined_at=item.joined_at,
+                left_at=item.left_at,
+                current=item.status == enums.RelationStatus.CURRENT,
+                updated_at=item.updated_at,
+            )
+        )
+    # 现役在前，其次按加入日期倒序（最新的关系排上面）
+    rows.sort(key=lambda row: (row["current"], row["startDate"] or ""), reverse=True)
+    return rows
+
+
+def list_own_competitions(person_id: str) -> list[dict]:
+    """GET /me/competitions：本人参赛赛事汇总（场次 / 进球 / 红黄牌）。
+
+    契约（2026-11-02 P0-4）：运动员此前只有 /me/profile 与 /me/teams，个人页的
+    「参赛数据」无接口可读（/enrollments 对 ATHLETE 未注册权限点，403）；公开赛果
+    又只按球队名称匹配，重名/改名会漏匹配。本接口按 athlete_id 精确聚合，直接给出
+    本人赛事、场次、累计进球与红黄牌，前端不再逐场回查。
+
+    口径：
+    - 参赛依据 = 本人名册条目（RosterItem.athlete_id == Person 主键字符串，
+      剔除 EXCLUDED），按 (eventId, teamId) 汇总，同一人跨队/跨赛事各占一行；
+    - 场次 = 该队在该赛事下 status=FINISHED 的比赛数（取消/未开赛不计）；
+    - 进球 = event_type=GOAL 且 scorer_athlete_id 为本人（含乌龙，按录入口径计）；
+      红黄牌 = event_type=PENALTY 且 penalty_type=YELLOW_CARD/RED_CARD、
+      athlete_id 为本人；
+    - 事件只在本人所属球队的已完成比赛内统计，不串到其他场次；
+    - 赛事/球队名称取主档，查不到回退 ID，不因主档缺失丢行。
+    """
+    from apps.enrollments.models import QUALIFICATION_EXCLUDED, RosterItem
+
+    athlete_id = str(int(person_id))
+    entries: dict[tuple[str, str], set[str]] = {}
+    roster = (
+        RosterItem.objects.filter(
+            athlete_id=athlete_id, enrollment__deleted_at__isnull=True
+        )
+        .exclude(qualification_status=QUALIFICATION_EXCLUDED)
+        .select_related("enrollment")
+    )
+    for item in roster:
+        enrollment = item.enrollment
+        entries.setdefault((enrollment.event_id, enrollment.team_id), set()).add(
+            enrollment.group_id
+        )
+    if not entries:
+        return []
+
+    from apps.events.models import Event, Match, MatchEvent
+
+    # 逐 (赛事, 球队) 取已完成比赛，避免"我队在 A 赛事 + 我队在 B 赛事"被串算
+    condition = Q()
+    for event_id, team_id in entries:
+        condition |= Q(event_id=event_id, home_team_id=team_id) | Q(
+            event_id=event_id, away_team_id=team_id
+        )
+    match_key: dict[str, tuple[str, str]] = {}
+    for match in Match.objects.filter(condition, status="FINISHED"):
+        for team_id in (match.home_team_id, match.away_team_id):
+            key = (match.event_id, team_id)
+            if key in entries:
+                match_key[str(match.pk)] = key
+                break
+
+    def _per_match(queryset) -> dict[str, int]:
+        return {
+            str(row["match_id"]): int(row["total"])
+            for row in queryset.values("match_id").annotate(total=Count("id"))
+        }
+
+    match_ids = list(match_key)
+    goals = _per_match(
+        MatchEvent.objects.filter(
+            match_id__in=match_ids, event_type="GOAL", scorer_athlete_id=athlete_id
+        )
+    )
+    yellow = _per_match(
+        MatchEvent.objects.filter(
+            match_id__in=match_ids,
+            event_type="PENALTY",
+            penalty_type="YELLOW_CARD",
+            athlete_id=athlete_id,
+        )
+    )
+    red = _per_match(
+        MatchEvent.objects.filter(
+            match_id__in=match_ids,
+            event_type="PENALTY",
+            penalty_type="RED_CARD",
+            athlete_id=athlete_id,
+        )
+    )
+
+    stats: dict[tuple[str, str], dict] = {
+        key: {
+            "eventId": key[0],
+            "teamId": key[1],
+            "groupIds": group_ids,
+            "appearances": 0,
+            "goals": 0,
+            "yellowCards": 0,
+            "redCards": 0,
+        }
+        for key, group_ids in entries.items()
+    }
+    for match_id, key in match_key.items():
+        row = stats[key]
+        row["appearances"] += 1
+        row["goals"] += goals.get(match_id, 0)
+        row["yellowCards"] += yellow.get(match_id, 0)
+        row["redCards"] += red.get(match_id, 0)
+
+    event_names = dict(
+        Event.objects.filter(
+            pk__in={key[0] for key in stats}
+        ).values_list("pk", "name")
+    )
+    # enrollment.team_id 是球队主键的字符串形式，Team 主键为整型，需转数值再查
+    team_ids = {key[1] for key in stats}
+    numeric_ids = {int(team_id) for team_id in team_ids if str(team_id).isdigit()}
+    team_names = dict(
+        Team.objects.filter(pk__in=numeric_ids).values_list("pk", "name")
+    ) if numeric_ids else {}
+
+    result: list[dict] = []
+    for (event_id, team_id), row in stats.items():
+        numeric_team_id = int(team_id) if str(team_id).isdigit() else None
+        result.append(
+            {
+                "eventId": event_id,
+                "eventName": event_names.get(event_id) or event_id,
+                "teamId": team_id,
+                "teamName": team_names.get(numeric_team_id) or team_id,
+                "groupIds": sorted(row["groupIds"]),
+                "appearances": row["appearances"],
+                "goals": row["goals"],
+                "yellowCards": row["yellowCards"],
+                "redCards": row["redCards"],
+            }
+        )
+    result.sort(key=lambda item: (item["eventId"], item["teamId"]))
+    return result
+
+
+_COACH_DUTY_LABELS = {
+    "HEAD_COACH": "主教练",
+    "ASSISTANT_COACH": "助理教练",
+    "GOALKEEPER_COACH": "守门员教练",
+    "FITNESS_COACH": "体能教练",
+    "MANAGER": "领队",
+    "OTHER": "教练",
+}
+
+
+def _affiliation_out(
+    *,
+    key: str,
+    person_id: int,
+    team,
+    relation: str,
+    joined_at,
+    left_at,
+    current: bool,
+    updated_at,
+) -> dict:
+    return {
+        "id": key,
+        "personId": str(person_id),
+        "teamId": str(team.pk),
+        "teamName": team.name,
+        "relation": relation,
+        # 空值统一给 ""（信封内不出现 null；前端 types.ts 的 startDate?/endDate? 直接可用）
+        "startDate": joined_at.isoformat() if joined_at else "",
+        "endDate": left_at.isoformat() if left_at else "",
+        "current": bool(current),
+        "verifyStatus": "VERIFIED",
+        "version": int(updated_at.timestamp() * 1_000_000) if updated_at else 0,
+    }
 
 
 def _team_brief_out(team) -> dict:
@@ -1736,29 +2116,129 @@ def delete_person(person_id: str, request_version, account) -> None:
 
 # ---------------------------------------------------------------- 遴选档案聚合（§6.8，批次 D-1）
 
-def _reject_undeployed_event_filters(payload: dict) -> None:
-    """eventId/groupId 筛选行为待决策（D-A）：契约仅定义参数、未规定过滤规则，
-    报名/比赛读模型未落地（冻结 22 表无此域）。非空一律 400 明确拒绝，
-    不默认空集、不虚构过滤语义。"""
-    for name in ("eventId", "groupId"):
-        if (payload.get(name) or "").strip():
-            raise ApiError(
-                INVALID_ARGUMENT,
-                f"{name} 筛选依赖报名/比赛读模型，尚未开放（待决策项 D-A）",
-                field_errors([(name, "暂不支持")]),
-            )
+def _dossier_entry_queryset(person_id, event_id: Optional[str] = None):
+    """运动员的报名单：默认全部状态（档案展示履历），eventId 可收窄。"""
+    from apps.enrollments.models import Enrollment
+
+    queryset = Enrollment.objects.filter(
+        players__athlete_id=str(person_id)
+    ).distinct()
+    if event_id:
+        queryset = queryset.filter(event_id=str(event_id))
+    return queryset.order_by("-created_at", "-id")
+
+
+def _dossier_enrollments(person_id, event_id: Optional[str] = None) -> list[dict]:
+    """报名记录：复用 enrollments.to_summary，补充 groupType 供前端跳转评分。"""
+    from apps.enrollments.services import to_summary
+    from apps.events.models import EventGroup
+
+    rows = list(_dossier_entry_queryset(person_id, event_id))
+    groups = {
+        str(group.id): group
+        for group in EventGroup.objects.filter(
+            id__in={row.group_id for row in rows}
+        )
+    }
+    result = []
+    for row in rows:
+        data = to_summary(row)
+        group = groups.get(str(row.group_id))
+        data["groupType"] = group.category if group else None
+        data["groupTypeLabel"] = group.get_category_display() if group else ""
+        result.append(data)
+    return result
+
+
+def _dossier_team_ids(person_id, event_id: Optional[str] = None) -> list[str]:
+    """档案涉及球队：报名名单球队优先，没有报名时退回现役球队关系。"""
+    team_ids = set(
+        _dossier_entry_queryset(person_id, event_id).values_list(
+            "team_id", flat=True
+        )
+    )
+    if not team_ids:
+        team_ids = set(
+            TeamMember.objects.filter(
+                person_id=person_id,
+                status=enums.RelationStatus.CURRENT,
+            ).values_list("team_id", flat=True)
+        )
+    return [str(team_id) for team_id in team_ids]
+
+
+def _dossier_matches(person_id, event_id: Optional[str] = None) -> list[dict]:
+    """球队近期比赛：报名球队（或现役球队）参加的比赛，按开球时间倒序取 10 场。"""
+    from apps.events.models import Match
+    from apps.events.schemas import match_out
+
+    team_ids = _dossier_team_ids(person_id, event_id)
+    if not team_ids:
+        return []
+    queryset = Match.objects.filter(
+        Q(home_team_id__in=team_ids) | Q(away_team_id__in=team_ids)
+    )
+    if event_id:
+        queryset = queryset.filter(event_id=str(event_id))
+    return [
+        match_out(match)
+        for match in queryset.order_by("-kickoff_at", "-id")[:10]
+    ]
+
+
+def _dossier_scores(person_id, event_id: Optional[str] = None) -> list[dict]:
+    """遴选评分记录：candidate_id 与人员主键同源（主程序适配器已归一化）。
+
+    selection 应用未安装时静默返回空数组，保证人员域可独立测试。
+    """
+    try:
+        from selection.enums import GroupType, RoundType
+        from selection.models import Score
+    except ImportError:  # pragma: no cover - 主程序恒安装 selection
+        return []
+
+    queryset = Score.objects.select_related("template").filter(
+        candidate_id=str(person_id)
+    )
+    if event_id:
+        queryset = queryset.filter(event_id=str(event_id))
+    round_order = {RoundType.INITIAL: 0, RoundType.FINAL: 1}
+    scores = sorted(
+        queryset,
+        key=lambda score: (
+            round_order.get(score.score_round, 9),
+            -score.updated_at.timestamp(),
+        ),
+    )
+    return [
+        {
+            "id": score.pk,
+            "eventId": score.event_id,
+            "groupType": score.group_type,
+            "groupTypeLabel": GroupType.label(score.group_type),
+            "round": score.score_round,
+            "roundLabel": RoundType.label(score.score_round),
+            "templateId": str(score.template_id),
+            "templateName": score.template.name if score.template_id else "",
+            "totalScore": float(score.total_score),
+            "version": int(score.version or 0),
+            "updatedAt": score.updated_at,
+        }
+        for score in scores
+    ]
 
 
 def dossier_search_queryset(payload: dict, account) -> QuerySet:
     """POST /selection-dossiers/search 查询构建（§6.8 L1736-1756 + §7 DossierSearch）。
 
-    复用：people_queryset（软删排除+档案行注解）、apply_person_scope（一期仅
-    ADMIN，D5 口径）、list_people 的 -id 排序先例、create_person 的
+    复用：people_queryset（软删排除+档案行注解）、apply_person_scope
+    （全局 ADMIN 全库 / 省级账号全省 / 市州账号本市）、list_people 的 -id
+    排序先例、create_person 的
     lookup_hash 受控检索链路；teamId=现役 TeamMember 关系（CURRENT 口径同
-    /me/teams）。检索资格：文档 L4708"仅运动员遴选档案受控检索，不允许借用
+    /me/teams）；eventId/groupId=已通过报名名单（与遴选候选人口径一致）。
+    检索资格：文档 L4708"仅运动员遴选档案受控检索，不允许借用
     教练员或其他人员过滤字段扩大数据范围"→ 强制 athlete_profile_exists=True。
     """
-    _reject_undeployed_event_filters(payload)
     queryset = apply_person_scope(people_queryset(), account).filter(
         athlete_profile_exists=True
     )
@@ -1776,10 +2256,29 @@ def dossier_search_queryset(payload: dict, account) -> QuerySet:
                 status=enums.RelationStatus.CURRENT,
             ).values("person_id")
         )
+    event_id = (payload.get("eventId") or "").strip()
+    group_id = (payload.get("groupId") or "").strip()
+    if event_id or group_id:
+        from apps.enrollments.models import STATUS_APPROVED, RosterItem
+
+        roster = RosterItem.objects.filter(
+            enrollment__status=STATUS_APPROVED,
+            enrollment__deleted_at__isnull=True,
+        )
+        if event_id:
+            roster = roster.filter(enrollment__event_id=event_id)
+        if group_id:
+            roster = roster.filter(enrollment__group_id=group_id)
+        queryset = queryset.filter(pk__in=roster.values("athlete_id"))
     return queryset.order_by("-id")
 
 
-def dossier_out(person, account) -> dict:
+def dossier_out(
+    person,
+    account,
+    event_id: Optional[str] = None,
+    include_aggregates: bool = True,
+) -> dict:
     """Person(+注解列) → CandidateDossier（§7 L4692-4704）。
 
     - athlete：person_out（脱敏同源，idNumber 永不回显）；
@@ -1788,8 +2287,11 @@ def dossier_out(person, account) -> dict:
     - materials：materials.services.material_list(PERSON, ownerId)（批次 C
       未软删查询）+ materials.schemas.material_out（零第二套序列化）；逐行
       调用与 /me/teams 同款（pageSize≤100 已限，批量优化待数据量增长）；
-    - enrollments/matchRecords：报名/比赛读模型未落地，契约字段可选
-      （§7 L4700-4701 必填=否）→ 空数组=无读模型数据，非伪造记录；
+    - enrollments：报名记录（全部状态，含事件/组别/球队/审核状态/组别类型）；
+    - matchRecords：报名球队或现役球队的近期比赛（最多 10 场）；
+    - scores：该运动员的初选/复选评分记录（selection 应用同库时）；
+    - eventId：只收窄报名/比赛/评分，不影响档案本身；
+    - include_aggregates=False 供检索列表复用，避免逐行聚合造成 N+1；
     - id：person 主键字符串（无独立档案表，待决策项 D-B）；
     - version：person_version 微秒派生（B4 同款，待决策项 D-C）。
     """
@@ -1808,8 +2310,21 @@ def dossier_out(person, account) -> dict:
         "athlete": person_out(person),
         "teams": list_own_teams(person.pk),
         "materials": materials,
-        "enrollments": [],
-        "matchRecords": [],
+        "enrollments": (
+            _dossier_enrollments(person.pk, event_id)
+            if include_aggregates
+            else []
+        ),
+        "matchRecords": (
+            _dossier_matches(person.pk, event_id)
+            if include_aggregates
+            else []
+        ),
+        "scores": (
+            _dossier_scores(person.pk, event_id)
+            if include_aggregates
+            else []
+        ),
         "version": person_version(person),
         "createdAt": person.created_at,
         "updatedAt": person.updated_at,
@@ -1820,14 +2335,9 @@ def dossier_get(athlete_id: str, event_id: Optional[str], account) -> dict:
     """GET /selection-dossiers/{athleteId}（§6.8 L1758-1773）。
 
     非运动员（无 AthleteProfile 行）/软删/不存在 → 404（"仅运动员遴选档案"
-    资格口径同 dossier_search）；eventId 非空 → 400（D-A 待决策）。
+    资格口径同 dossier_search）；eventId 只收窄报名/比赛/评分，不用来
+    限制定位档案本人。
     """
-    if (event_id or "").strip():
-        raise ApiError(
-            INVALID_ARGUMENT,
-            "eventId 筛选依赖报名读模型，尚未开放（待决策项 D-A）",
-            field_errors([("eventId", "暂不支持")]),
-        )
     person = (
         apply_person_scope(people_queryset(), account)
         .filter(pk=parse_path_id(athlete_id), athlete_profile_exists=True)
@@ -1835,4 +2345,4 @@ def dossier_get(athlete_id: str, event_id: Optional[str], account) -> dict:
     )
     if person is None:
         raise ApiError(NOT_FOUND, "遴选档案不存在")
-    return dossier_out(person, account)
+    return dossier_out(person, account, event_id)

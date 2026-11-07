@@ -50,8 +50,12 @@ _auth = JWTAuth()
 
 # 权限点登记：导入期完成，漏登记 require() 会直接报错。
 # 角色按 2026-10-28 统一业务规则 + D1/D5 决策登记：
-# - materialReview 仅 UNIVERSITY（学校端审核；D1：ADMIN 不拥有普通材料
-#   审核权限，数据范围能力不推导审核权；CITY/PROVINCE_REVIEWER 只审报名）；
+# - materialReview = UNIVERSITY（学校端审核）+ ADMIN（2026-11-02 管理端全量
+#   联调回归：接口契约 docs §materialReview 与实现注记均列 ADMIN，且人员管理/
+#   参赛队伍两个管理端页面的「通过/驳回」按钮实际调用该接口；此前仅登记
+#   UNIVERSITY 导致管理员点按钮必然 403。数据范围仍由 _material_scope 收口，
+#   全局 ADMIN 全库、挂组织 ADMIN 同现有口径）；
+# - CITY/PROVINCE_REVIEWER 只审报名，不进 materialReview；
 # - TEAM 有材料维护范围（本队 TEAM 材料，见 services._material_scope），
 #   但不进 materialReview（维护权限≠审核权限，一·补四）；
 # - ATHLETE/COACH 为本人材料预留；数据范围见 services._material_scope。
@@ -67,7 +71,7 @@ register_operation(
 register_operation(
     "materialCreate", (ADMIN, UNIVERSITY, TEAM, PROVINCE_REVIEWER, ATHLETE, COACH, CITY)
 )
-register_operation("materialReview", (UNIVERSITY,))
+register_operation("materialReview", (ADMIN, UNIVERSITY))
 register_operation(
     "materialDelete", (ADMIN, UNIVERSITY, TEAM, PROVINCE_REVIEWER, ATHLETE, COACH, CITY)
 )

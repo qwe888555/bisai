@@ -1,8 +1,8 @@
 """球队档案管理接口（django-ninja）：/teams*（T4-03 批次 A + 批次 B 成员）。
 
-前端契约：zuqiu teamApi（src/api/index.ts L135-157）——list/get/create/update
-+ members 域 5 接口（批次 B）+ memberGet 详情（批次 D-2，文档契约明确）；
-remove（DELETE）暂不开放（关联检查依赖报名/比赛域，契约清单在案）；
+前端契约：zuqiu teamApi（src/api/index.ts L135-157）——list/get/create/update/
+remove + members 域 5 接口（批次 B）+ memberGet 详情（批次 D-2，文档契约明确）；
+remove（DELETE）于 2026-11-02 补齐交付（软删 + 报名/比赛关联 409 保护）；
 coaches 域 3 接口已交付（批次 C，2026-10-29）；teamMatches 聚合入口已交付
 （2026-10-29，查询委托 events 读服务）。
 
@@ -36,7 +36,9 @@ from apps.common.middleware import audit_state
 from apps.common.pagination import paginate
 from apps.common.permissions import (
     ADMIN,
+    ATHLETE,
     CITY,
+    COACH,
     PROVINCE_REVIEWER,
     TEAM,
     UNIVERSITY,
@@ -55,10 +57,16 @@ _auth = JWTAuth()
 # 角色集逐条对齐契约文档（docs/后端接口文档.md 各接口“角色：”行）：
 # 10 个接口均为 TEAM / UNIVERSITY / CITY / PROVINCE_REVIEWER / ADMIN。
 _TEAM_ROLES = (ADMIN, UNIVERSITY, TEAM, CITY, PROVINCE_REVIEWER)
-register_operation("teamList", _TEAM_ROLES)
-register_operation("teamGet", _TEAM_ROLES)
+# 球队只读（2026-11-01 用户裁定）：运动员/教练个人页可直接查球队档案与赛程，
+# 写操作仍限定在原角色集。
+_TEAM_READ_ROLES = _TEAM_ROLES + (ATHLETE, COACH)
+register_operation("teamList", _TEAM_READ_ROLES)
+register_operation("teamGet", _TEAM_READ_ROLES)
 register_operation("teamCreate", _TEAM_ROLES)
 register_operation("teamUpdate", _TEAM_ROLES)
+# 2026-11-02 管理端全量联调：前端 TeamsView 删除按钮调用 DELETE /teams/{id}，
+# 契约 §teamDelete 已定义（角色同写操作）；此前未交付导致按钮必然 404。
+register_operation("teamDelete", _TEAM_ROLES)
 # 成员域：读=管理端花名册 + 球队端名单页；写=名单页 + 省市管理端，
 # 数据范围统一由 services.visible_teams 判定。
 register_operation("memberList", _TEAM_ROLES)
@@ -71,10 +79,13 @@ register_operation("memberDelete", _TEAM_ROLES)
 # teamCoachDelete，角色行与成员域一致。
 register_operation("teamCoachList", _TEAM_ROLES)
 register_operation("teamCoachCreate", _TEAM_ROLES)
+# 候选教练搜索（2026-11-04 缺陷修复）：前端添加弹窗原用通用 /people/search，
+# TEAM 账号只可见本队现役运动员 → 教练候选恒为空；补球队域候选接口。
+register_operation("teamCoachSearch", _TEAM_ROLES)
 register_operation("teamCoachDelete", _TEAM_ROLES)
 # 球队赛程聚合入口（契约 api:teamMatches，2026-10-29 交付）：路由归球队域，
 # 查询委托 events 比赛读服务（docs/后端接口文档.md teamMatches 契约）。
-register_operation("teamMatches", _TEAM_ROLES)
+register_operation("teamMatches", _TEAM_READ_ROLES)
 
 
 @router.get("/teams", auth=_auth, response=EnvelopeOut, summary="球队档案列表")
@@ -83,10 +94,17 @@ def team_list(
     keyword: Optional[str] = None,
     category: Optional[str] = None,
     status: Optional[str] = None,
+    cityOrgId: Optional[str] = None,
 ):
     account = require("teamList")
     queryset = services.list_teams(
-        {"keyword": keyword, "category": category, "status": status}, account
+        {
+            "keyword": keyword,
+            "category": category,
+            "status": status,
+            "cityOrgId": cityOrgId,
+        },
+        account,
     )
     return paginate(request, queryset, mapper=s.team_out)
 
@@ -126,6 +144,28 @@ def team_update(request, team_id: str, body: s.TeamUpdateBody):
         summary=f"更新球队 {team.name}",
     )
     return ok(s.team_out(team))
+
+
+@router.delete("/teams/{team_id}", auth=_auth, response=EnvelopeOut, summary="删除球队档案")
+def team_delete(
+    request, team_id: str, version: Optional[int] = Query(None, ge=0)
+):
+    account = require("teamDelete")
+    if version is None:
+        raise ApiError(
+            INVALID_ARGUMENT,
+            "缺少 version",
+            field_errors([("version", "该操作必须提交乐观锁版本")]),
+        )
+    team = services.delete_team(team_id, version, account)
+    audit_state(
+        request,
+        "team.delete",
+        object_type="Team",
+        object_id=str(team.pk),
+        summary=f"删除球队 {team.name}({team.team_no})",
+    )
+    return action_result(True, str(team.pk))
 
 
 # ---------------------------------------------------------------- 球队成员（批次 B）
@@ -267,6 +307,21 @@ def team_coach_create(request, team_id: str, body: s.CoachAddBody):
     return ok(s.coach_out(coach))
 
 
+@router.post(
+    "/teams/{team_id}/coaches/search",
+    auth=_auth,
+    response=EnvelopeOut,
+    summary="候选教练搜索",
+)
+def team_coach_search(request, team_id: str, body: s.CoachSearchBody):
+    account = require("teamCoachSearch")
+    candidates = services.coach_search(team_id, body.keyword, account)
+    return ok(candidates)
+
+
+# 注意：POST /coaches/search 必须注册在 DELETE /coaches/{coach_id} 之前——
+# Django URL 按注册序匹配，字面量 search 若排在转换器之后，该 POST 会先命中
+# 详情路由并按方法不匹配返回 405（与 members/search 同一坑，2026-11-04 复现）。
 @router.delete(
     "/teams/{team_id}/coaches/{coach_id}",
     auth=_auth,

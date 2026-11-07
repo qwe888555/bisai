@@ -309,6 +309,9 @@ def import_players(actor, enrollment_id: str, version: int, mode: str, uploaded)
 
         raise ApiError(NOT_FOUND)
     scope.ensure_enrollment_access(actor, enrollment)
+    # 名单/附件/导入属于报名单写操作：仅创建者（学校端）或本队（球队端）可执行。
+    # R5 中的 CITY/PROVINCE/ADMIN/MATCH_RECORDER 仅保留读取能力。
+    scope.ensure_enrollment_creator(actor, enrollment)
     if enrollment.status not in EDITABLE_STATUSES:
         raise ApiError(STATE_CONFLICT, "仅可编辑状态允许导入")
     check_version(enrollment, version)
@@ -414,6 +417,9 @@ def import_photos(actor, enrollment_id: str, version: int, uploaded) -> dict:
 
         raise ApiError(NOT_FOUND)
     scope.ensure_enrollment_access(actor, enrollment)
+    # 名单/附件/导入属于报名单写操作：仅创建者（学校端）或本队（球队端）可执行。
+    # R5 中的 CITY/PROVINCE/ADMIN/MATCH_RECORDER 仅保留读取能力。
+    scope.ensure_enrollment_creator(actor, enrollment)
     if enrollment.status not in EDITABLE_STATUSES:
         raise ApiError(STATE_CONFLICT, "仅可编辑状态允许导入照片")
     check_version(enrollment, version)
