@@ -183,7 +183,12 @@ def material_review(request, material_id: str, body: s.MaterialReviewBody):
 
 
 @router.delete("/materials/{material_id}", auth=_auth, response=EnvelopeOut, summary="删除材料")
-def material_remove(request, material_id: str, version: Optional[int] = Query(None, ge=0)):
+def material_remove(
+    request,
+    material_id: str,
+    version: Optional[int] = Query(None, ge=0),
+    ownerType: Optional[str] = Query(None),
+):
     account = require("materialDelete")
     if version is None:
         raise ApiError(
@@ -191,7 +196,13 @@ def material_remove(request, material_id: str, version: Optional[int] = Query(No
             "删除材料必须提交乐观锁版本",
             field_errors([("version", "该操作必须提交乐观锁版本")]),
         )
-    services.material_remove(material_id, version, account)
+    if ownerType not in (None, "", "PERSON", "TEAM"):
+        raise ApiError(
+            INVALID_ARGUMENT,
+            "ownerType 仅支持 PERSON/TEAM",
+            field_errors([("ownerType", "不在枚举范围内")]),
+        )
+    services.material_remove(material_id, version, account, ownerType or None)
     audit_state(
         request,
         "material.remove",

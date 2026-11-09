@@ -37,15 +37,19 @@ class MaterialCreateBody(StrictSchema):
 class MaterialReviewBody(StrictSchema):
     """审核（POST /materials/{id}/review）：decision APPROVE/REJECT → APPROVED/REJECTED。
 
-    前端 body 仅 {decision, reason?, version}（PeopleManageView/TeamsView）；
-    多态归属由服务层双表解析（仅未软删行）：仅一表命中沿用；两表同 id 均为
-    有效行时返回 409 STATE_CONFLICT（归属不明确，不静默择一，联调注记：建议
-    前端后续补充 ownerType 传参消除歧义）。
+    前端 body 为 {decision, reason?, version, ownerType?}（PeopleManageView/
+    TeamsView 自 2026-11-09 起补传 ownerType）；多态归属由服务层解析（仅
+    未软删行）：传 ownerType 时按指定归属单表定位，不传时沿用双表解析——
+    两表同 id 均为有效行且未指定归属 → 409 STATE_CONFLICT（归属不明确，
+    不静默择一）。
     """
 
     decision: Literal["APPROVE", "REJECT"]
     reason: Optional[str] = Field(None, max_length=200, description="REJECT 时必填（前端强制）")
     version: int = Field(ge=0)
+    ownerType: Optional[Literal["PERSON", "TEAM"]] = Field(
+        None, description="材料归属类型；传值时消除两表同 id 歧义"
+    )
 
 
 class MaterialUpdateBody(StrictSchema):

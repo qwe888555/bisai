@@ -850,6 +850,69 @@ class MaterialApiTests(TestCase):
         self.assertFalse(tm.is_deleted)
         self.assertIsNone(tm.deleted_at)
 
+    def test_review_with_owner_type_person_resolves_collision(self):
+        """L11：两表同 id 时 review 传 ownerType=PERSON → 仅审核人员材料。"""
+        pm, tm = self._make_dual_id_materials()
+        resp = self._post(
+            f"{BASE}/300/review",
+            {"decision": "APPROVE", "version": self._mver(pm), "ownerType": "PERSON"},
+            token=self.uni_reviewer_token,
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["data"]["ownerType"], "PERSON")
+        self.assertEqual(resp.json()["data"]["reviewStatus"], "APPROVED")
+        pm.refresh_from_db()
+        tm.refresh_from_db()
+        self.assertEqual(pm.status, enums.MaterialStatus.APPROVED)
+        self.assertEqual(tm.status, enums.MaterialStatus.PENDING)
+        self.assertTrue(
+            MaterialAuditLog.objects.filter(
+                material_id=300, material_kind="PERSON", to_status="APPROVED"
+            ).exists()
+        )
+        self.assertFalse(
+            MaterialAuditLog.objects.filter(material_id=300, material_kind="TEAM").exists()
+        )
+
+    def test_review_with_owner_type_team_resolves_collision(self):
+        """L11：两表同 id 时 review 传 ownerType=TEAM → 仅审核球队材料。"""
+        pm, tm = self._make_dual_id_materials()
+        resp = self._post(
+            f"{BASE}/300/review",
+            {"decision": "APPROVE", "version": self._mver(tm), "ownerType": "TEAM"},
+            token=self.uni_reviewer_token,
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["data"]["ownerType"], "TEAM")
+        self.assertEqual(resp.json()["data"]["reviewStatus"], "APPROVED")
+        pm.refresh_from_db()
+        tm.refresh_from_db()
+        self.assertEqual(pm.status, enums.MaterialStatus.PENDING)
+        self.assertEqual(tm.status, enums.MaterialStatus.APPROVED)
+
+    def test_review_owner_type_not_found_returns_404(self):
+        """L11：指定归属表中无该 id → 404，不回退另一表（不误改错误对象）。"""
+        self._make_dual_id_materials()
+        resp = self._post(
+            f"{BASE}/301/review",
+            {"decision": "APPROVE", "version": 1, "ownerType": "PERSON"},
+            token=self.uni_reviewer_token,
+        )
+        self.assertEqual(resp.status_code, 404)
+
+    def test_remove_with_owner_type_resolves_collision(self):
+        """L11：两表同 id 时 DELETE 传 ownerType=TEAM → 仅软删球队材料。"""
+        pm, tm = self._make_dual_id_materials()
+        resp = self.client.delete(
+            f"{BASE}/300?version={self._mver(tm)}&ownerType=TEAM",
+            **self._auth(self.admin_token),
+        )
+        self.assertEqual(resp.status_code, 200)
+        pm.refresh_from_db()
+        tm.refresh_from_db()
+        self.assertFalse(pm.is_deleted)
+        self.assertTrue(tm.is_deleted)
+
     def test_same_id_person_soft_deleted_resolves_valid_team(self):
         """同 id 人员材料已软删、球队材料有效 → 解析为球队材料并审核成功。
 

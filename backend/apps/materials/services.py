@@ -661,7 +661,9 @@ def material_review(material_id: str, payload: dict, account) -> tuple:
 
     # 多态解析 + 数据范围在事务外完成（不写库）；事务内重新加锁读取，
     # 避免在未加锁的对象上做状态判断。
-    material, kind = _get_material_any(parse_path_id(material_id, "materialId"))
+    material, kind = _get_material_any(
+        parse_path_id(material_id, "materialId"), payload.get("ownerType")
+    )
     _ensure_owner_in_scope(
         material.person if kind == "PERSON" else material.team, scope
     )
@@ -739,15 +741,20 @@ def material_review(material_id: str, payload: dict, account) -> tuple:
 
 # ---------------------------------------------------------------- 软删
 
-def material_remove(material_id: str, version: int, account) -> None:
+def material_remove(
+    material_id: str, version: int, account, owner_type: str | None = None
+) -> None:
     """软删（is_deleted+deleted_at），不物理删除；不限制当前审核状态。
 
-    前端仅传 ?version=，多态由 _get_material_any 双表解析。
+    前端传 ?version=（可带 ownerType=PERSON/TEAM 消除两表同 id 歧义）；
+    未带 ownerType 时由 _get_material_any 双表解析。
     """
     scope = _material_scope(account)
     from apps.persons.services import ensure_version, parse_path_id
 
-    material, _kind = _get_material_any(parse_path_id(material_id, "materialId"))
+    material, _kind = _get_material_any(
+        parse_path_id(material_id, "materialId"), owner_type
+    )
     _ensure_owner_in_scope(
         material.person if _kind == "PERSON" else material.team, scope
     )
@@ -939,15 +946,26 @@ def _get_material(kind: str, material_id: int):
     return material
 
 
-def _get_material_any(material_id: int) -> tuple:
-    """前端 review/remove 仅传 id 不传归属类型 → 双表解析多态。
+def _get_material_any(material_id: int, owner_type: str | None = None) -> tuple:
+    """按 id 解析材料归属（review/remove/get 共用）。
 
-    两表主键独立自增存在同 id 可能：分别查询两表（仅未软删行，与列表同一
-    过滤规则）并识别命中数量——仅一表命中沿用该行；两表同时命中属非预期
-    数据关系，归属类型不明确 → 409 STATE_CONFLICT（不静默择一，防止误更新/
-    误删错误对象）；两表均未命中 404。
-    联调待办 L11：建议前端 review/remove 补传 ownerType 消除歧义。
+    - 传 owner_type（PERSON/TEAM）时只查对应单表：两表主键独立自增可出现
+      同 id，联调待办 L11 的消除歧义方案——按前端已知归属精确定位，不再
+      因另一表存在同 id 行而 409；指定归属不存在 → 404（不泄露另一表）。
+    - 不传时沿用双表解析：仅一表命中沿用该行；两表同时命中属非预期数据
+      关系，归属不明确 → 409 STATE_CONFLICT（不静默择一，防止误更新/误删
+      错误对象）；两表均未命中 404。
     """
+    if owner_type in ("PERSON", "TEAM"):
+        row = (
+            _active_queryset(owner_type)
+            .select_related("person" if owner_type == "PERSON" else "team", "type")
+            .filter(pk=material_id)
+            .first()
+        )
+        if row is None:
+            raise ApiError(NOT_FOUND, "材料不存在或已删除")
+        return row, owner_type
     person = (
         _active_queryset("PERSON")
         .select_related("person", "type")
