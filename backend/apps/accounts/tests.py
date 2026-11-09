@@ -206,8 +206,24 @@ class AuthFlowTests(AccountScopeTestBase):
         self.assertIn("api:accountList", data["permissions"])
         self.assertIn("api:organizationList", data["permissions"])
         menu_keys = {m["key"] for m in data["menus"]}
-        self.assertIn("account", menu_keys)
-        self.assertIn("organization", menu_keys)
+        self.assertIn("accounts", menu_keys)
+        self.assertIn("organizations", menu_keys)
+        # 2026-11-09：菜单与前端 config/menus.ts 对齐，路径统一为 /console/*。
+        self.assertTrue(all(m["path"].startswith("/console/") for m in data["menus"]))
+        self.assertIn("dashboard", menu_keys)
+        self.assertIn("review", menu_keys)
+
+    def test_me_city_menu_matches_enrollment_scope(self):
+        """菜单按角色过滤：市州可见报名/统计/人员审核，不应出现赛事统计与组织维护。"""
+        data = self._get(f"{BASE}/me", token=self._login("scope-city")).json()["data"]
+        keys = {m["key"] for m in data["menus"]}
+        self.assertIn("enrollments", keys)
+        self.assertIn("enrollment-stats", keys)
+        self.assertIn("accounts", keys)
+        # 2026-11-09：人员档案审核上移到市州/省级，市州需要「人员管理」入口。
+        self.assertIn("people", keys)
+        self.assertNotIn("tournament-stats", keys)
+        self.assertNotIn("organizations", keys)
 
     def test_me_athlete_has_no_org(self):
         resp = self._get(f"{BASE}/me", token=self._login("scope-outsider"))

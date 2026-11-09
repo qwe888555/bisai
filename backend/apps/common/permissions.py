@@ -66,46 +66,259 @@ IDEMPOTENT_OPERATIONS: frozenset[str] = frozenset(
 
 # ---------------------------------------------------------------- 菜单
 
+# 菜单键、路径与角色必须与前端 zuqiu/src/config/menus.ts 保持一致：
+# 前端目前用本地 config 渲染侧边栏，不消费 /me.menus，但第三方客户端会读取
+# 该字段，两套数据不一致会让外部端拿到错误入口。改任一菜单时同步本表。
+# 路径统一为控制台 /console/*；permission 取该页面的代表性权限点。
 MENUS: list[dict] = [
+    # 总览
     {
-        "key": "account",
-        "title": "账号管理",
-        "path": "/admin/accounts",
-        "permission": "api:accountList",
+        "key": "dashboard",
+        "title": "工作台",
+        "path": "/console/dashboard",
+        "permission": "api:currentUser",
+        "roles": list(ALL_ROLES),
+    },
+    # 报名管理
+    {
+        "key": "enrollments",
+        "title": "报名单",
+        "path": "/console/enrollments",
+        "permission": "api:enrollmentList",
+        # 与路由白名单一致：市州初审、省级终审、管理员也需查看报名清单。
+        "roles": [TEAM, UNIVERSITY, CITY, PROVINCE_REVIEWER, ADMIN],
+    },
+    {
+        "key": "enrollment-stats",
+        "title": "报名统计",
+        "path": "/console/enrollment-stats",
+        "permission": "api:enrollmentStats",
+        "roles": [CITY, PROVINCE_REVIEWER, ADMIN],
+    },
+    {
+        "key": "review",
+        "title": "审核工作台",
+        "path": "/console/review",
+        "permission": "api:reviewEnrollment",
+        "roles": [CITY, PROVINCE_REVIEWER, ADMIN],
+    },
+    # 赛事与比赛
+    {
+        "key": "matches",
+        "title": "比赛管理",
+        "path": "/console/matches",
+        "permission": "api:matchList",
+        "roles": [ADMIN, PROVINCE_REVIEWER, MATCH_RECORDER, TEAM, UNIVERSITY, CITY],
+    },
+    {
+        "key": "events",
+        "title": "赛事与组别",
+        "path": "/console/events",
+        "permission": "api:eventList",
+        "roles": [ADMIN, PROVINCE_REVIEWER, CITY],
+    },
+    {
+        "key": "tournament-stats",
+        "title": "赛事统计",
+        "path": "/console/tournament-stats",
+        "permission": "api:standingList",
+        "roles": [PROVINCE_REVIEWER, ADMIN],
+    },
+    # 赛务核验
+    {
+        "key": "identity",
+        "title": "身份核验",
+        "path": "/console/identity",
+        "permission": "api:identityList",
+        "roles": [ADMIN, PROVINCE_REVIEWER, MATCH_RECORDER],
+    },
+    # 学校管理
+    {
+        "key": "school-teams",
+        "title": "本校球队",
+        "path": "/console/school/teams",
+        "permission": "api:teamList",
+        "roles": [UNIVERSITY],
+    },
+    # 球队管理
+    {
+        "key": "teams-overview",
+        "title": "参赛队伍",
+        "path": "/console/teams-overview",
+        "permission": "api:teamList",
         "roles": [ADMIN, PROVINCE_REVIEWER],
     },
     {
-        "key": "organization",
-        "title": "组织管理",
-        "path": "/admin/organizations",
+        "key": "team-profile",
+        "title": "球队资料",
+        "path": "/console/team/profile",
+        "permission": "api:teamGet",
+        "roles": [TEAM, UNIVERSITY],
+    },
+    {
+        "key": "team-members",
+        "title": "球员名单",
+        "path": "/console/team/members",
+        "permission": "api:memberList",
+        "roles": [TEAM, UNIVERSITY],
+    },
+    {
+        "key": "team-coaches",
+        "title": "教练团队",
+        "path": "/console/team/coaches",
+        "permission": "api:teamCoachList",
+        "roles": [TEAM, UNIVERSITY],
+    },
+    # 个人中心
+    {
+        "key": "profile",
+        "title": "个人资料",
+        "path": "/console/profile",
+        "permission": "api:myProfileGet",
+        "roles": [ATHLETE, COACH],
+    },
+    {
+        "key": "materials",
+        "title": "履历材料",
+        "path": "/console/materials",
+        "permission": "api:materialList",
+        "roles": [ATHLETE, COACH],
+    },
+    {
+        "key": "my-teams",
+        "title": "我的球队",
+        "path": "/console/my-teams",
+        "permission": "api:myTeams",
+        "roles": [ATHLETE, COACH],
+    },
+    {
+        "key": "my-publications",
+        "title": "我的公示",
+        "path": "/console/my-publications",
+        "permission": "api:selectionPublicityMine",
+        "roles": [ATHLETE, COACH],
+    },
+    {
+        "key": "my-competition",
+        "title": "我的赛事数据",
+        "path": "/console/my-competition",
+        "permission": "api:myCompetitions",
+        "roles": [ATHLETE, COACH],
+    },
+    # 遴选管理
+    {
+        "key": "dossiers",
+        "title": "球员遴选档案",
+        "path": "/console/selection/dossiers",
+        "permission": "api:dossierSearch",
+        "roles": [ADMIN],
+    },
+    {
+        "key": "rules",
+        "title": "评分模板",
+        "path": "/console/selection/rules",
+        "permission": "api:selectionRuleList",
+        "roles": [ADMIN],
+    },
+    {
+        "key": "scoring",
+        "title": "评分录入",
+        "path": "/console/selection/scoring",
+        "permission": "api:selectionScoreList",
+        "roles": [ADMIN],
+    },
+    {
+        "key": "summary",
+        "title": "评分汇总",
+        "path": "/console/selection/summary",
+        "permission": "api:selectionSummary",
+        "roles": [ADMIN],
+    },
+    {
+        "key": "results",
+        "title": "最佳球员遴选结果",
+        "path": "/console/selection/results",
+        "permission": "api:selectionResults",
+        "roles": [ADMIN],
+    },
+    # 门户运营
+    {
+        "key": "contents",
+        "title": "内容管理",
+        "path": "/console/cms/contents",
+        "permission": "api:contentList",
+        "roles": [ADMIN, PROVINCE_REVIEWER],
+    },
+    {
+        "key": "resources",
+        "title": "门户资源",
+        "path": "/console/cms/resources",
+        "permission": "api:portalResourceList",
+        "roles": [ADMIN, PROVINCE_REVIEWER],
+    },
+    {
+        "key": "publications",
+        "title": "公示管理",
+        "path": "/console/publications",
+        "permission": "api:publicationList",
+        "roles": [ADMIN, PROVINCE_REVIEWER],
+    },
+    # 系统管理
+    {
+        "key": "people",
+        "title": "人员管理",
+        "path": "/console/admin/people",
+        "permission": "api:personList",
+        # 学校端建档/维护/提交，市州与省级审核（2026-11-09 职责分离）。
+        "roles": [ADMIN, UNIVERSITY, CITY, PROVINCE_REVIEWER],
+    },
+    {
+        "key": "subjects",
+        "title": "参赛主体",
+        "path": "/console/admin/subjects",
         "permission": "api:organizationList",
         "roles": [ADMIN],
     },
     {
-        "key": "dictionary",
-        "title": "字典管理",
-        "path": "/admin/dictionary-items",
+        "key": "accounts",
+        "title": "参赛账号",
+        "path": "/console/admin/accounts",
+        "permission": "api:accountList",
+        "roles": [ADMIN, PROVINCE_REVIEWER, CITY, UNIVERSITY],
+    },
+    {
+        "key": "permissions",
+        "title": "权限矩阵",
+        "path": "/console/admin/permissions",
+        "permission": "api:accountList",
+        "roles": [ADMIN],
+    },
+    {
+        "key": "organizations",
+        "title": "组织结构",
+        "path": "/console/admin/organizations",
+        "permission": "api:organizationList",
+        "roles": [ADMIN],
+    },
+    {
+        "key": "dictionaries",
+        "title": "数据字典",
+        "path": "/console/admin/dictionaries",
         "permission": "api:dictionaryList",
         "roles": [ADMIN],
     },
     {
-        "key": "audit",
-        "title": "审计日志",
-        "path": "/admin/audit-logs",
+        "key": "logs",
+        "title": "操作日志",
+        "path": "/console/admin/logs",
         "permission": "api:auditList",
         "roles": [ADMIN, PROVINCE_REVIEWER],
     },
+    # 消息中心
     {
-        "key": "identity",
-        "title": "身份核验",
-        "path": "/identity-checks",
-        "permission": "api:identityList",
-        "roles": [MATCH_RECORDER, ADMIN, PROVINCE_REVIEWER],
-    },
-    {
-        "key": "message",
-        "title": "消息中心",
-        "path": "/me/messages",
+        "key": "messages",
+        "title": "我的消息",
+        "path": "/console/messages",
         "permission": "api:messageList",
         "roles": list(ALL_ROLES),
     },

@@ -953,6 +953,27 @@ class TeamMemberApiTests(TestCase):
             ("ADMIN", "UNIVERSITY", "TEAM", "CITY", "PROVINCE_REVIEWER"),
         )
 
+    def test_write_permissions_converged(self):
+        """2026-11-09：CITY/PROVINCE_REVIEWER 无前端维护入口，写权限收敛；
+        读权限保留用于审核查看。"""
+        from apps.common.permissions import operation_roles
+
+        write_roles = ("ADMIN", "UNIVERSITY", "TEAM")
+        for operation in (
+            "teamCreate",
+            "teamUpdate",
+            "teamDelete",
+            "memberCreate",
+            "memberUpdate",
+            "memberDelete",
+            "teamCoachCreate",
+            "teamCoachDelete",
+        ):
+            self.assertEqual(operation_roles(operation), write_roles, operation)
+        for operation in ("teamList", "teamGet", "memberList", "memberGet"):
+            self.assertIn("CITY", operation_roles(operation), operation)
+            self.assertIn("PROVINCE_REVIEWER", operation_roles(operation), operation)
+
     def test_member_get_forbidden_for_athlete_role(self):
         """ATHLETE 未登记 memberGet → 403 FORBIDDEN（角色拒绝先于范围）。"""
         resp = self._get(

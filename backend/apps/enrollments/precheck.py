@@ -144,8 +144,8 @@ def run_precheck(enrollment) -> dict[str, Any]:
                 _issue(
                     "QUALIFICATION_PENDING",
                     WARNING,
-                    f"人员档案未通过学校审核（当前状态 {state['auditStatus']}），"
-                    "提交后须完成学校端审核方可最终通过",
+                    f"人员档案未通过市州/省级审核（当前状态 {state['auditStatus']}），"
+                    "提交后须完成市州/省级审核方可最终通过",
                     field="auditStatus",
                     athleteId=item.athlete_id,
                 )
@@ -526,7 +526,7 @@ def double_track_issues(enrollment) -> list[dict]:
                 _issue(
                     "PLAYER_LIMIT",
                     ERROR,
-                    f"人员档案未通过学校审核（当前状态 {state['auditStatus']}），不能最终通过",
+                    f"人员档案未通过市州/省级审核（当前状态 {state['auditStatus']}），不能最终通过",
                     field="auditStatus",
                     athleteId=item.athlete_id,
                 )

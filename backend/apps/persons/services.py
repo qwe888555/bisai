@@ -1675,20 +1675,17 @@ def can_review_person(person, account) -> bool:
 
 
 def review_person(person_id: str, payload: dict, account):
-    """POST /people/{id}/review（P0-2，2026-10-28）：学校端档案审核。
+    """POST /people/{id}/review（P0-2，2026-10-28；2026-11-09 职责分离调整）。
 
-    业务依据（2026-10-28 统一规则 + D1 口径）：
-    - 权限点 personReview=UNIVERSITY（学校端是人员资格与履历的最终审核方；
-      ADMIN 不因数据范围获得审核权；CITY/PROVINCE_REVIEWER 只审报名；
-      TEAM 维护权限≠审核权限）——由 API 层 require() 强制，本函数只裁决
-      数据范围；
-    - 数据范围：UNIVERSITY 所属组织子树（scope_org_codes ↔ Person.school.code
-      编码映射，同材料域 D1/D5 已验证口径）；无有效组织范围（无绑定/绑定
-      已软删）默认拒绝不退化全库；范围外档案不可见（404，不泄露存在性，
-      同 get_person A′ 口径）。不复用 apply_person_scope（该函数当前仅放行
-      ADMIN，属既有 persons 查询接口 A′ 一批口径；对 UNIVERSITY 开放
-      personList/personGet/personSearch 影响既有接口面，列为待决事项，
-      不随本接口一并放开）；
+    业务依据：
+    - 权限点 personReview=ADMIN/CITY/PROVINCE_REVIEWER（2026-11-09 起学校端
+      只建档、维护并提交，不再审核本校档案，避免"既上传又审核"）；TEAM
+      维护权限≠审核权限——由 API 层 require() 强制，本函数只裁决数据范围；
+    - 数据范围：账号所属组织子树（scope_org_codes ↔ Person.school.code
+      编码映射，同材料域 D1/D5 已验证口径）。全局管理员（无组织绑定）返回
+      None → 全库；市州看本市、省级看全省；无有效组织范围（绑定已软删等）
+      返回 [] → 403，不退化全库；范围外档案不可见（404，不泄露存在性，
+      同 get_person A′ 口径）；
     - 状态机：仅 PENDING → APPROVED/REJECTED；DRAFT（尚未提交复核，走
       profileConfirm）/APPROVED（重复审核）/REJECTED（重新提交链路 B3
       待业务确认，保守拒绝）→ 409 STATE_CONFLICT；
@@ -1702,7 +1699,8 @@ def review_person(person_id: str, payload: dict, account):
     from apps.common.scopes import scope_org_codes
 
     codes = scope_org_codes(account)
-    if not codes:
+    # scope_org_codes 三态：None=全局管理员全库；[]=无有效范围，拒绝。
+    if codes == []:
         raise ApiError(
             DATA_SCOPE_DENIED,
             "当前账号无有效组织范围，禁止审核人员档案",
@@ -1711,12 +1709,12 @@ def review_person(person_id: str, payload: dict, account):
     # 全部在同一事务内执行，select_for_update 锁定待审核人员行，防止并发
     # 创建/修改与审核之间的 TOCTOU 竞态。
     with transaction.atomic():
-        person = (
-            people_queryset()
-            .select_for_update()
-            .filter(pk=parse_path_id(person_id), school__code__in=codes)
-            .first()
+        queryset = people_queryset().select_for_update().filter(
+            pk=parse_path_id(person_id)
         )
+        if codes is not None:
+            queryset = queryset.filter(school__code__in=codes)
+        person = queryset.first()
         if person is None:
             raise ApiError(NOT_FOUND)
         ensure_version(person, payload["version"])

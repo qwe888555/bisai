@@ -1180,16 +1180,17 @@ class PeopleApiTests(TestCase):
         )
 
     def test_person_payloads_expose_can_review(self):
-        """2026-11-03 复测问题 4：ADMIN 无审核权限，列表/详情均不可审。"""
+        """2026-11-03 复测问题 4 + 2026-11-09 职责分离：canReview 随
+        personReview 权限点与档案状态变化——管理员可审 PENDING、不可审 APPROVED。"""
         resp = self._get(PEOPLE, token=self.admin_token)
         self.assertEqual(resp.status_code, 200)
-        self.assertTrue(
-            all(item["canReview"] is False for item in resp.json()["data"]["items"])
-        )
+        by_id = {item["id"]: item["canReview"] for item in resp.json()["data"]["items"]}
+        self.assertIs(by_id[str(self.coach.pk)], True)
+        self.assertIs(by_id[str(self.athlete.pk)], False)
 
         resp = self._get(f"{PEOPLE}/{self.coach.pk}", token=self.admin_token)
         self.assertEqual(resp.status_code, 200)
-        self.assertIs(resp.json()["data"]["canReview"], False)
+        self.assertIs(resp.json()["data"]["canReview"], True)
 
         resp = self._post(
             PEOPLE + "/search",
@@ -1197,7 +1198,7 @@ class PeopleApiTests(TestCase):
             token=self.admin_token,
         )
         self.assertEqual(resp.status_code, 200)
-        self.assertIs(resp.json()["data"][0]["canReview"], False)
+        self.assertIs(resp.json()["data"][0]["canReview"], True)
 
     # ------------------------------------------------------------ 详情
 
@@ -2867,13 +2868,14 @@ class PersonThirdBatchScopeTests(TestCase):
 
 
 class PersonReviewTests(TestCase):
-    """P0-2（2026-10-28）：学校端档案审核 POST /people/{id}/review。
+    """POST /people/{id}/review：人员档案审核（2026-11-09 职责分离调整）。
 
-    口径（统一业务规则 + D1 对齐）：
-    - 权限点 personReview 仅 UNIVERSITY（ADMIN 不因数据范围获得审核权，
-      CITY/PROVINCE_REVIEWER 只审报名，TEAM 维护≠审核）；
-    - 数据范围：UNIVERSITY 所属组织子树（Person.school.code 编码映射，
-      同材料域 D1/D5 口径），范围外 404 不泄露存在性；无有效组织范围 403；
+    口径：
+    - 权限点 personReview=ADMIN/CITY/PROVINCE_REVIEWER：学校端负责建档、
+      维护与提交，不再审核本校档案（避免"既上传又审核"）；TEAM 维护≠审核；
+    - 数据范围：账号所属组织子树（Person.school.code 编码映射，同材料域
+      D1/D5 口径）；市州看本市、省级看全省、全局管理员全库；范围外 404
+      不泄露存在性；无有效组织范围（幽灵绑定）403；
     - 状态机：仅 PENDING → APPROVED/REJECTED，其余 409；REJECT 必填 reason；
     - 留痕：PersonChangeLog(change_type=AUDIT) 记 audit_status old/new 与
       审核意见；changed_by 恒空（D4 待批）。
@@ -2902,12 +2904,14 @@ class PersonReviewTests(TestCase):
         cls.uni_dead = make_account("rv-uni-dead", ["UNIVERSITY"], org_id="ORG-RDEAD")
         cls.admin = make_account("rv-admin", ["ADMIN"])
         cls.city_acct = make_account("rv-city", ["CITY"], org_id="ORG-RCT")
+        cls.city_dead = make_account("rv-city-dead", ["CITY"], org_id="ORG-RDEAD")
         cls.prov_acct = make_account("rv-prov", ["PROVINCE_REVIEWER"], org_id="ORG-RPS")
         cls.team_acct = make_account("rv-team", ["TEAM"], org_id="ORG-RSA")
         cls.uni_a_token = issue_access_token(cls.uni_a)[0]
         cls.uni_dead_token = issue_access_token(cls.uni_dead)[0]
         cls.admin_token = issue_access_token(cls.admin)[0]
         cls.city_token = issue_access_token(cls.city_acct)[0]
+        cls.city_dead_token = issue_access_token(cls.city_dead)[0]
         cls.prov_token = issue_access_token(cls.prov_acct)[0]
         cls.team_token = issue_access_token(cls.team_acct)[0]
 
@@ -3003,37 +3007,48 @@ class PersonReviewTests(TestCase):
 
     # ------------------------------------------------------------ 权限点
 
-    def test_review_permission_roles_only_university(self):
+    def test_review_permission_roles_city_province_admin(self):
         from apps.common.permissions import operation_roles
 
-        # D1 口径：普通审核权限仅学校端（对齐 materialReview）。
-        self.assertEqual(operation_roles("personReview"), ("UNIVERSITY",))
+        # 2026-11-09 职责分离：学校端只建档/提交，审核上移到市州/省级/管理员。
+        self.assertEqual(
+            operation_roles("personReview"),
+            ("ADMIN", "CITY", "PROVINCE_REVIEWER"),
+        )
 
     def test_can_review_map_pending_self_and_status(self):
         """2026-11-03 复测问题 4：canReview 与审核接口同口径。"""
         from apps.persons import services
 
         result = services.can_review_map(
-            [self.p_pending_a, self.p_draft_a, self.p_approved_a], self.uni_a
+            [self.p_pending_a, self.p_draft_a, self.p_approved_a], self.city_acct
         )
         self.assertIs(result[self.p_pending_a.pk], True)
         self.assertIs(result[self.p_draft_a.pk], False)
         self.assertIs(result[self.p_approved_a.pk], False)
-        # ADMIN 无 personReview 权限点，即使 PENDING 也不可审
-        admin_result = services.can_review_map([self.p_pending_a], self.admin)
-        self.assertIs(admin_result[self.p_pending_a.pk], False)
-        # 本人创建（最近一条 person.create 操作者为 uni_a）→ 不可审
+        # 学校端无 personReview 权限点，即使 PENDING 也不可审
+        uni_result = services.can_review_map([self.p_pending_a], self.uni_a)
+        self.assertIs(uni_result[self.p_pending_a.pk], False)
+        # 省级有权限点（数据范围另由查询链裁决）→ 可审
+        self.assertIs(
+            services.can_review_person(self.p_pending_a, self.prov_acct), True
+        )
+        # 管理员虽有权限点，但夹具创建审计记在 admin 名下 → 防自审不可审
+        self.assertIs(
+            services.can_review_person(self.p_pending_a, self.admin), False
+        )
+        # 本人创建（最近一条 person.create 操作者为市州账号）→ 不可审
         AuditLog.objects.create(
             id=f"log-self-review-{self.p_pending_a.pk}",
             log_type="OPERATION",
-            operator_account_id=str(self.uni_a.pk),
+            operator_account_id=str(self.city_acct.pk),
             action="person.create",
             object_type="Person",
             object_id=str(self.p_pending_a.pk),
             outcome="SUCCESS",
         )
         self.assertIs(
-            services.can_review_person(self.p_pending_a, self.uni_a), False
+            services.can_review_person(self.p_pending_a, self.city_acct), False
         )
 
     # ------------------------------------------------------------ 学校提交复核（§6）
@@ -3131,15 +3146,10 @@ class PersonReviewTests(TestCase):
         self.p_draft_a.refresh_from_db()
         self.assertEqual(self.p_draft_a.audit_status, enums.AuditStatus.DRAFT)
 
-    def test_review_denied_for_non_university_roles(self):
-        """ADMIN/CITY/PROVINCE_REVIEWER/TEAM 调审核 → 权限点 403 FORBIDDEN，
-        先于数据范围判定；档案状态与审核留痕零变更。"""
-        for token in (
-            self.admin_token,
-            self.city_token,
-            self.prov_token,
-            self.team_token,
-        ):
+    def test_review_denied_for_school_and_team_roles(self):
+        """UNIVERSITY/TEAM 调审核 → 权限点 403 FORBIDDEN，先于数据范围判定；
+        档案状态与审核留痕零变更（学校端不再自审）。"""
+        for token in (self.uni_a_token, self.team_token):
             resp = self._post(
                 f"{PEOPLE}/{self.p_pending_a.pk}/review",
                 self._body(self.p_pending_a),
@@ -3151,13 +3161,13 @@ class PersonReviewTests(TestCase):
         self.assertEqual(self.p_pending_a.audit_status, enums.AuditStatus.PENDING)
         self.assertFalse(self._audit_log(self.p_pending_a).exists())
 
-    # ------------------------------------------------------------ 审核正向（本校）
+    # ------------------------------------------------------------ 审核正向（本市）
 
-    def test_review_own_school_person_approved(self):
+    def test_review_city_person_approved(self):
         resp = self._post(
             f"{PEOPLE}/{self.p_pending_a.pk}/review",
             self._body(self.p_pending_a),
-            token=self.uni_a_token,
+            token=self.city_token,
         )
         self.assertEqual(resp.status_code, 200, resp.content)
         self.p_pending_a.refresh_from_db()
@@ -3182,7 +3192,7 @@ class PersonReviewTests(TestCase):
         resp = self._post(
             f"{PEOPLE}/{self.p_pending_a.pk}/review",
             self._body(self.p_pending_a, decision="REJECT"),
-            token=self.uni_a_token,
+            token=self.city_token,
         )
         self.assertEqual(resp.status_code, 422)
         self.assertEqual(resp.json()["code"], "BUSINESS_VALIDATION_FAILED")
@@ -3196,7 +3206,7 @@ class PersonReviewTests(TestCase):
             self._body(
                 self.p_pending_a, decision="REJECT", reason="资格证明材料不全"
             ),
-            token=self.uni_a_token,
+            token=self.city_token,
         )
         self.assertEqual(resp.status_code, 200)
         self.p_pending_a.refresh_from_db()
@@ -3212,7 +3222,7 @@ class PersonReviewTests(TestCase):
             (self.p_approved_a, "APPROVED"),
         ):
             resp = self._post(
-                f"{PEOPLE}/{person.pk}/review", self._body(person), token=self.uni_a_token
+                f"{PEOPLE}/{person.pk}/review", self._body(person), token=self.city_token
             )
             self.assertEqual(resp.status_code, 409)
             self.assertEqual(resp.json()["code"], "STATE_CONFLICT")
@@ -3223,35 +3233,61 @@ class PersonReviewTests(TestCase):
         resp = self._post(
             f"{PEOPLE}/{self.p_pending_a.pk}/review",
             self._body(self.p_pending_a, version=1),
-            token=self.uni_a_token,
+            token=self.city_token,
         )
         self.assertEqual(resp.status_code, 409)
         self.assertEqual(resp.json()["code"], "VERSION_CONFLICT")
         self.p_pending_a.refresh_from_db()
         self.assertEqual(self.p_pending_a.audit_status, enums.AuditStatus.PENDING)
 
-    def test_review_other_school_person_404(self):
-        """范围外（他校）档案 404：不泄露存在性，状态与留痕零变更。"""
+    def test_review_out_of_city_scope_404(self):
+        """市州范围外（他市学校）档案 404：不泄露存在性，状态与留痕零变更。"""
         resp = self._post(
             f"{PEOPLE}/{self.p_pending_b.pk}/review",
             self._body(self.p_pending_b),
-            token=self.uni_a_token,
+            token=self.city_token,
         )
         self.assertEqual(resp.status_code, 404)
         self.p_pending_b.refresh_from_db()
         self.assertEqual(self.p_pending_b.audit_status, enums.AuditStatus.PENDING)
         self.assertFalse(self._audit_log(self.p_pending_b).exists())
 
-    def test_review_university_ghost_binding_denied(self):
+    def test_review_province_can_review_out_of_city_school(self):
+        """省级范围覆盖全省：市州范围外（他市学校）档案省级可审。"""
+        resp = self._post(
+            f"{PEOPLE}/{self.p_pending_b.pk}/review",
+            self._body(self.p_pending_b),
+            token=self.prov_token,
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.p_pending_b.refresh_from_db()
+        self.assertEqual(self.p_pending_b.audit_status, enums.AuditStatus.APPROVED)
+
+    def test_review_ghost_binding_denied(self):
         """无有效组织范围（绑定已软删）→ 403 DATA_SCOPE_DENIED，不退化全库。"""
         resp = self._post(
             f"{PEOPLE}/{self.p_pending_a.pk}/review",
             self._body(self.p_pending_a),
-            token=self.uni_dead_token,
+            token=self.city_dead_token,
         )
         self.assertEqual(resp.status_code, 403)
         self.assertEqual(resp.json()["code"], "DATA_SCOPE_DENIED")
         self.assertFalse(self._audit_log(self.p_pending_a).exists())
+
+    def test_review_global_admin_can_review(self):
+        """全局管理员（无组织绑定）→ 全库范围，可审任意学校档案。"""
+        # 夹具创建审计默认记在 admin 名下；改记学校账号，避免触发防自审。
+        AuditLog.objects.filter(
+            object_type="Person", object_id=str(self.p_pending_b.pk)
+        ).update(operator_account_id=str(self.uni_a.pk))
+        resp = self._post(
+            f"{PEOPLE}/{self.p_pending_b.pk}/review",
+            self._body(self.p_pending_b),
+            token=self.admin_token,
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.p_pending_b.refresh_from_db()
+        self.assertEqual(self.p_pending_b.audit_status, enums.AuditStatus.APPROVED)
 
     # ------------------------------------------------------------ P1-5 防自审
     # （2026-10-31 裁定 B 口径移植）：证据=person.create（创建人）+
@@ -3276,12 +3312,12 @@ class PersonReviewTests(TestCase):
 
     def test_self_review_blocked_when_creator_is_reviewer(self):
         """同账号 person.create 后由该账号审核 → 403，状态/留痕零变更。"""
-        self._set_creator_audit(self.p_pending_a, "person.create", self.uni_a.pk)
+        self._set_creator_audit(self.p_pending_a, "person.create", self.city_acct.pk)
         before = self._audit_log(self.p_pending_a).count()
         resp = self._post(
             f"{PEOPLE}/{self.p_pending_a.pk}/review",
             self._body(self.p_pending_a),
-            token=self.uni_a_token,
+            token=self.city_token,
         )
         self.assertEqual(resp.status_code, 403)
         self.assertEqual(resp.json()["code"], "FORBIDDEN")
@@ -3292,11 +3328,11 @@ class PersonReviewTests(TestCase):
     def test_self_review_allowed_when_updater_is_reviewer(self):
         """person.update 不构成自审证据（B 口径）：他人 create + 审核人本人
         update 过该档案 → 审核 200 放行。"""
-        self._set_creator_audit(self.p_pending_a, "person.update", self.uni_a.pk)
+        self._set_creator_audit(self.p_pending_a, "person.update", self.city_acct.pk)
         resp = self._post(
             f"{PEOPLE}/{self.p_pending_a.pk}/review",
             self._body(self.p_pending_a),
-            token=self.uni_a_token,
+            token=self.city_token,
         )
         self.assertEqual(resp.status_code, 200)
         self.p_pending_a.refresh_from_db()
@@ -3305,11 +3341,11 @@ class PersonReviewTests(TestCase):
     def test_self_review_allowed_when_self_updater_is_reviewer(self):
         """person.self_update 不构成自审证据（B 口径）：审核人本人
         self_update 过该档案 → 审核 200 放行。"""
-        self._set_creator_audit(self.p_pending_a, "person.self_update", self.uni_a.pk)
+        self._set_creator_audit(self.p_pending_a, "person.self_update", self.city_acct.pk)
         resp = self._post(
             f"{PEOPLE}/{self.p_pending_a.pk}/review",
             self._body(self.p_pending_a),
-            token=self.uni_a_token,
+            token=self.city_token,
         )
         self.assertEqual(resp.status_code, 200)
         self.p_pending_a.refresh_from_db()
@@ -3321,7 +3357,7 @@ class PersonReviewTests(TestCase):
         AuditLog.objects.create(
             id=f"log-p-confirm-{self.p_pending_a.pk}",
             log_type="OPERATION",
-            operator_account_id=str(self.uni_a.pk),
+            operator_account_id=str(self.city_acct.pk),
             action="person.self_confirm",
             object_type="Person",
             object_id=str(self.p_pending_a.pk),
@@ -3330,7 +3366,7 @@ class PersonReviewTests(TestCase):
         resp = self._post(
             f"{PEOPLE}/{self.p_pending_a.pk}/review",
             self._body(self.p_pending_a),
-            token=self.uni_a_token,
+            token=self.city_token,
         )
         self.assertEqual(resp.status_code, 403)
         self.assertEqual(resp.json()["code"], "FORBIDDEN")
@@ -3346,19 +3382,19 @@ class PersonReviewTests(TestCase):
         resp = self._post(
             f"{PEOPLE}/{self.p_pending_a.pk}/review",
             self._body(self.p_pending_a),
-            token=self.uni_a_token,
+            token=self.city_token,
         )
         self.assertEqual(resp.status_code, 200)
         self.p_pending_a.refresh_from_db()
         self.assertEqual(self.p_pending_a.audit_status, enums.AuditStatus.APPROVED)
 
     def test_self_review_uses_latest_submitter_only(self):
-        """多次提交取最近一次：早期 uni_a self_confirm + 最新 admin
-        self_confirm → uni_a 审核 200 放行（早期提交不构成证据）。"""
+        """多次提交取最近一次：早期 city self_confirm + 最新 admin
+        self_confirm → city 审核 200 放行（早期提交不构成证据）。"""
         AuditLog.objects.create(
             id=f"log-p-confirm-early-{self.p_pending_a.pk}",
             log_type="OPERATION",
-            operator_account_id=str(self.uni_a.pk),
+            operator_account_id=str(self.city_acct.pk),
             action="person.self_confirm",
             object_type="Person",
             object_id=str(self.p_pending_a.pk),
@@ -3380,14 +3416,15 @@ class PersonReviewTests(TestCase):
         resp = self._post(
             f"{PEOPLE}/{self.p_pending_a.pk}/review",
             self._body(self.p_pending_a),
-            token=self.uni_a_token,
+            token=self.city_token,
         )
         self.assertEqual(resp.status_code, 200)
         self.p_pending_a.refresh_from_db()
         self.assertEqual(self.p_pending_a.audit_status, enums.AuditStatus.APPROVED)
 
     def test_self_review_blocked_for_multi_role_account(self):
-        """同账号拥有 ADMIN+UNIVERSITY 双角色，自己创建后自己审核 → 403。"""
+        """同账号拥有 ADMIN+UNIVERSITY 双角色，自己创建后自己审核 → 403
+        （ADMIN 有审核权，但防自审仍然生效）。"""
         multi = Account.objects.create(
             id=new_account_id(),
             username="p-review-multi",
@@ -5031,7 +5068,7 @@ class P0UnifiedFlowTests(TestCase):
 
     @classmethod
     def setUpTestData(cls):
-        def make_account(username, roles, person=None):
+        def make_account(username, roles, person=None, org_id="ORG-P0S"):
             return Account.objects.create(
                 id=new_account_id(),
                 username=username,
@@ -5039,14 +5076,17 @@ class P0UnifiedFlowTests(TestCase):
                 roles=roles,
                 password=make_password("p0-pass-123"),
                 enabled=True,
-                organization_id="ORG-P0S",
+                organization_id=org_id,
                 person_id=str(person.pk) if person else "",
             )
 
         cls.admin = make_account("p0-admin", ["ADMIN"])
         cls.uni = make_account("p0-uni", ["UNIVERSITY"])
+        # 2026-11-09 职责分离：学校只提交，审核由市州端完成。
+        cls.reviewer = make_account("p0-city", ["CITY"], org_id="ORG-P0C")
         cls.admin_token = issue_access_token(cls.admin)[0]
         cls.uni_token = issue_access_token(cls.uni)[0]
+        cls.reviewer_token = issue_access_token(cls.reviewer)[0]
 
         region = Region.objects.create(name="P0省", code="960000", level=1)
         city = Region.objects.create(name="P0市", code="960100", level=2, parent=region)
@@ -5054,8 +5094,12 @@ class P0UnifiedFlowTests(TestCase):
             name="P0测试校", code="SCH-960100-001", school_type="PRIMARY", region=city
         )
         Organization.objects.create(
+            id="ORG-P0C", code="C-960100", name="P0市组织",
+            org_type="CITY", parent_id=None,
+        )
+        Organization.objects.create(
             id="ORG-P0S", code="SCH-960100-001", name="P0测试校组织",
-            org_type="SCHOOL", parent_id=None,
+            org_type="SCHOOL", parent_id="ORG-P0C",
         )
         cls.school = school
 
@@ -5173,12 +5217,12 @@ class P0UnifiedFlowTests(TestCase):
             [{"field": "audit_status", "old": "REJECTED", "new": "PENDING"}],
         )
 
-        # 再审核：学校端 APPROVE 通过 → APPROVED，AUDIT 留痕新增（共 2 条）
+        # 再审核：市州端 APPROVE 通过 → APPROVED，AUDIT 留痕新增（共 2 条）
         resp = self.client.post(
             f"{PEOPLE}/{self.p_rejected.pk}/review",
             {"decision": "APPROVE", "version": self._person_version(self.p_rejected)},
             content_type="application/json",
-            **self._auth(self.uni_token),
+            **self._auth(self.reviewer_token),
         )
         self.assertEqual(resp.status_code, 200, resp.content)
         self.p_rejected.refresh_from_db()
@@ -5253,13 +5297,13 @@ class P0UnifiedFlowTests(TestCase):
         self.p_rejected.refresh_from_db()
         self.assertEqual(self.p_rejected.audit_status, enums.AuditStatus.PENDING)
 
-        # 学校端再次驳回（AUDIT 记录新增，成为"最近一次驳回"）
+        # 市州端再次驳回（AUDIT 记录新增，成为"最近一次驳回"）
         resp = self.client.post(
             f"{PEOPLE}/{self.p_rejected.pk}/review",
             {"decision": "REJECT", "reason": "仍不符合要求",
              "version": person_version(self.p_rejected)},
             content_type="application/json",
-            **self._auth(self.uni_token),
+            **self._auth(self.reviewer_token),
         )
         self.assertEqual(resp.status_code, 200, resp.content)
         self.p_rejected.refresh_from_db()

@@ -54,35 +54,37 @@ router = Router(tags=["teams"])
 _auth = JWTAuth()
 
 # 权限点登记：导入期完成，漏登记 require() 会直接报错。
-# 角色集逐条对齐契约文档（docs/后端接口文档.md 各接口“角色：”行）：
-# 10 个接口均为 TEAM / UNIVERSITY / CITY / PROVINCE_REVIEWER / ADMIN。
+# 角色集以 docs/后端接口文档.md 为基础，写操作另按 2026-11-09 收敛口径
+# 收窄为 ADMIN / UNIVERSITY / TEAM（见 _TEAM_WRITE_ROLES）。
 _TEAM_ROLES = (ADMIN, UNIVERSITY, TEAM, CITY, PROVINCE_REVIEWER)
-# 球队只读（2026-11-01 用户裁定）：运动员/教练个人页可直接查球队档案与赛程，
-# 写操作仍限定在原角色集。
+# 球队只读（2026-11-01 用户裁定）：运动员/教练个人页可直接查球队档案与赛程。
 _TEAM_READ_ROLES = _TEAM_ROLES + (ATHLETE, COACH)
+# 写操作收敛（2026-11-09）：前端只有管理员、学校端与球队端提供球队/成员/教练
+# 维护入口（TeamsView、TeamProfileView、TeamMembersView、TeamCoachesView）。
+# CITY/PROVINCE_REVIEWER 保留读权限用于审核查看，不再授予写权限。
+_TEAM_WRITE_ROLES = (ADMIN, UNIVERSITY, TEAM)
 register_operation("teamList", _TEAM_READ_ROLES)
 register_operation("teamGet", _TEAM_READ_ROLES)
-register_operation("teamCreate", _TEAM_ROLES)
-register_operation("teamUpdate", _TEAM_ROLES)
+register_operation("teamCreate", _TEAM_WRITE_ROLES)
+register_operation("teamUpdate", _TEAM_WRITE_ROLES)
 # 2026-11-02 管理端全量联调：前端 TeamsView 删除按钮调用 DELETE /teams/{id}，
 # 契约 §teamDelete 已定义（角色同写操作）；此前未交付导致按钮必然 404。
-register_operation("teamDelete", _TEAM_ROLES)
-# 成员域：读=管理端花名册 + 球队端名单页；写=名单页 + 省市管理端，
+register_operation("teamDelete", _TEAM_WRITE_ROLES)
+# 成员域：读=管理端花名册 + 球队端名单页；写=名单页。
 # 数据范围统一由 services.visible_teams 判定。
 register_operation("memberList", _TEAM_ROLES)
 register_operation("memberGet", _TEAM_ROLES)
 register_operation("memberSearch", _TEAM_ROLES)
-register_operation("memberCreate", _TEAM_ROLES)
-register_operation("memberUpdate", _TEAM_ROLES)
-register_operation("memberDelete", _TEAM_ROLES)
-# 教练域（批次 C，2026-10-29 交付）：契约 api:teamCoachList/teamCoachCreate/
-# teamCoachDelete，角色行与成员域一致。
+register_operation("memberCreate", _TEAM_WRITE_ROLES)
+register_operation("memberUpdate", _TEAM_WRITE_ROLES)
+register_operation("memberDelete", _TEAM_WRITE_ROLES)
+# 教练域（批次 C，2026-10-29 交付）：写操作随球队写权限收敛。
 register_operation("teamCoachList", _TEAM_ROLES)
-register_operation("teamCoachCreate", _TEAM_ROLES)
+register_operation("teamCoachCreate", _TEAM_WRITE_ROLES)
 # 候选教练搜索（2026-11-04 缺陷修复）：前端添加弹窗原用通用 /people/search，
 # TEAM 账号只可见本队现役运动员 → 教练候选恒为空；补球队域候选接口。
 register_operation("teamCoachSearch", _TEAM_ROLES)
-register_operation("teamCoachDelete", _TEAM_ROLES)
+register_operation("teamCoachDelete", _TEAM_WRITE_ROLES)
 # 球队赛程聚合入口（契约 api:teamMatches，2026-10-29 交付）：路由归球队域，
 # 查询委托 events 比赛读服务（docs/后端接口文档.md teamMatches 契约）。
 register_operation("teamMatches", _TEAM_READ_ROLES)

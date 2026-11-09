@@ -402,10 +402,11 @@ def dict_item_disable(request, dict_item_id: str):
 # 契约对齐 zuqiu 前端 personApi（src/api/index.ts L118-125）；写链（create/update/
 # remove）依赖 B1/B4 等待确认项，未实施。
 
-# 前端实际调用方角色：PeopleManageView(ADMIN) / EnrollmentDetailView(UNIVERSITY) /
-# TeamCoachesView、TeamMembersView(TEAM)；CITY / PROVINCE_REVIEWER 按文档审核
-# 场景预留。ATHLETE/COACH/MATCH_RECORDER 前端无调用且范围规则未定义，不登记。
-# 非管理员的数据范围过滤集中在 services.apply_person_scope（方案A′ 待确认）。
+# 前端实际调用方角色：PeopleManageView(ADMIN/UNIVERSITY/CITY/PROVINCE_REVIEWER) /
+# EnrollmentDetailView(UNIVERSITY/CITY/PROVINCE_REVIEWER/ADMIN) /
+# TeamCoachesView、TeamMembersView(TEAM)。ATHLETE/COACH/MATCH_RECORDER 前端无
+# 调用且范围规则未定义，不登记。
+# 非管理员的数据范围过滤集中在 services.apply_person_scope（A′ 口径）。
 _PERSON_QUERY_ROLES = (ADMIN, UNIVERSITY, CITY, PROVINCE_REVIEWER, TEAM)
 
 register_operation("personList", _PERSON_QUERY_ROLES)
@@ -561,12 +562,13 @@ def people_get(request, person_id: str):
     return ok(data)
 
 
-# P0-2（2026-10-28）：学校端档案审核。学校端是人员资格与履历的最终审核方
-# （统一业务规则），权限点口径对齐 D1：仅 UNIVERSITY，ADMIN 不因数据范围
-# 获得审核权，CITY/PROVINCE_REVIEWER 只审报名，TEAM 维护权限≠审核权限。
-# 数据范围在服务层按本校组织子树过滤（同材料域 D1/D5 口径）；
-# 留痕复用 PersonChangeLog（change_type=AUDIT），不新增模型/迁移。
-register_operation("personReview", (UNIVERSITY,))
+# 人员档案审核（2026-11-09 职责分离调整）：学校端负责建档、维护与提交，
+# 不再审核本校档案——避免"既上传又审核"的自审自批。审核权上移到市州/省级
+# 审核端，管理员作为兜底；TEAM 维护权限≠审核权限。数据范围仍按账号所属
+# 组织子树过滤（市州看本市、省级看全省、全局管理员全库），学校端调用
+# 审核接口一律 403 FORBIDDEN。留痕复用 PersonChangeLog（change_type=AUDIT），
+# 不新增模型/迁移。
+register_operation("personReview", (ADMIN, CITY, PROVINCE_REVIEWER))
 
 
 @router.post(

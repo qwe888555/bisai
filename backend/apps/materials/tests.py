@@ -1189,17 +1189,19 @@ class MaterialApiTests(TestCase):
     def test_update_permission_registered(self):
         from apps.common.permissions import operation_roles
 
+        # 2026-11-09 收敛：CITY/PROVINCE_REVIEWER 保留读取（materialGet/List/
+        # History），写权限只给前端确有维护入口的角色。
         self.assertEqual(
             operation_roles("materialUpdate"),
-            (
-                "ADMIN",
-                "UNIVERSITY",
-                "TEAM",
-                "PROVINCE_REVIEWER",
-                "ATHLETE",
-                "COACH",
-                "CITY",
-            ),
+            ("ADMIN", "UNIVERSITY", "TEAM", "ATHLETE", "COACH"),
+        )
+        self.assertEqual(
+            operation_roles("materialCreate"),
+            ("ADMIN", "UNIVERSITY", "TEAM", "ATHLETE", "COACH"),
+        )
+        self.assertEqual(
+            operation_roles("materialDelete"),
+            ("ADMIN", "UNIVERSITY", "TEAM", "ATHLETE", "COACH"),
         )
 
     def test_update_university_scope_denied(self):
@@ -1726,6 +1728,23 @@ class MaterialUniversityScopeTests(TestCase):
         # ADMIN+UNIVERSITY；CITY/PROVINCE_REVIEWER 仍只审报名，不在审核点
         # （见 test_city_review_permission_denied）。
         self.assertEqual(operation_roles("materialReview"), ("ADMIN", "UNIVERSITY"))
+
+    def test_city_create_permission_denied(self):
+        """CITY 只读材料用于审核查看，写权限已收敛（2026-11-09）→ 403。"""
+        resp = self._post(
+            BASE,
+            {
+                "ownerType": "PERSON",
+                "ownerId": str(self.p_a.pk),
+                "materialType": "MSC_AWARD",
+                "title": "市州写权限回归",
+                "fileName": "award.pdf",
+                "fileIds": [self.file_free_a.pk],
+            },
+            token=self.city_token,
+        )
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json()["code"], "FORBIDDEN")
 
     def test_city_review_permission_denied(self):
         """CITY 无材料审核权限（统一规则：只审报名）→ 权限点 403 FORBIDDEN，

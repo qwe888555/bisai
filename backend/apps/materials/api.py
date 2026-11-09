@@ -55,30 +55,31 @@ _auth = JWTAuth()
 #   参赛队伍两个管理端页面的「通过/驳回」按钮实际调用该接口；此前仅登记
 #   UNIVERSITY 导致管理员点按钮必然 403。数据范围仍由 _material_scope 收口，
 #   全局 ADMIN 全库、挂组织 ADMIN 同现有口径）；
-# - CITY/PROVINCE_REVIEWER 只审报名，不进 materialReview；
+# - CITY/PROVINCE_REVIEWER 只审报名，不进 materialReview；保留列表/详情/历史
+#   读取用于审核查看，但不再授予 create/update/delete（前端没有对应维护入口，
+#   2026-11-09 收敛写权限）；
 # - TEAM 有材料维护范围（本队 TEAM 材料，见 services._material_scope），
 #   但不进 materialReview（维护权限≠审核权限，一·补四）；
 # - ATHLETE/COACH 为本人材料预留；数据范围见 services._material_scope。
-register_operation(
-    "materialList", (ADMIN, UNIVERSITY, TEAM, PROVINCE_REVIEWER, ATHLETE, COACH, CITY)
+_MATERIAL_READ_ROLES = (
+    ADMIN,
+    UNIVERSITY,
+    TEAM,
+    PROVINCE_REVIEWER,
+    ATHLETE,
+    COACH,
+    CITY,
 )
-register_operation(
-    "materialGet", (ADMIN, UNIVERSITY, TEAM, PROVINCE_REVIEWER, ATHLETE, COACH, CITY)
-)
-register_operation(
-    "materialUpdate", (ADMIN, UNIVERSITY, TEAM, PROVINCE_REVIEWER, ATHLETE, COACH, CITY)
-)
-register_operation(
-    "materialCreate", (ADMIN, UNIVERSITY, TEAM, PROVINCE_REVIEWER, ATHLETE, COACH, CITY)
-)
+# 有材料维护入口的角色：人员管理/球队资料/球队材料面板/个人履历材料。
+_MATERIAL_WRITE_ROLES = (ADMIN, UNIVERSITY, TEAM, ATHLETE, COACH)
+register_operation("materialList", _MATERIAL_READ_ROLES)
+register_operation("materialGet", _MATERIAL_READ_ROLES)
+register_operation("materialUpdate", _MATERIAL_WRITE_ROLES)
+register_operation("materialCreate", _MATERIAL_WRITE_ROLES)
 register_operation("materialReview", (ADMIN, UNIVERSITY))
-register_operation(
-    "materialDelete", (ADMIN, UNIVERSITY, TEAM, PROVINCE_REVIEWER, ATHLETE, COACH, CITY)
-)
+register_operation("materialDelete", _MATERIAL_WRITE_ROLES)
 # 审核历史（P1-9 原定任务）：读取类操作，角色集同 materialGet；数据范围同单对象读。
-register_operation(
-    "materialHistory", (ADMIN, UNIVERSITY, TEAM, PROVINCE_REVIEWER, ATHLETE, COACH, CITY)
-)
+register_operation("materialHistory", _MATERIAL_READ_ROLES)
 
 
 @router.get("/materials", auth=_auth, response=EnvelopeOut, summary="材料列表")
