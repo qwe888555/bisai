@@ -12,6 +12,13 @@
 
 用法（backend/ 目录下）：
     PYTHONUTF8=1 PYTHONIOENCODING=utf-8 python scripts/seed_portal_media.py
+    PYTHONUTF8=1 PYTHONIOENCODING=utf-8 python scripts/seed_portal_media.py --offline
+
+``--offline``：跳过 Pexels / Unsplash 下载，直接用本地渐变封面。
+服务器无外网或下载很慢时用它，避免每张图等 20 秒超时。
+
+跑完会把配图的 fileId 回填到 ``Content.cover_file_id`` —— 门户资讯页
+（``public/contents``）取的是这个字段，只挂到 PortalResource 不够。
 
 脚本幂等：只更新缺失字段，可重复执行。
 """
@@ -96,6 +103,8 @@ PARTNER_SPECS = [
 
 COVER_PREFIX = "demo-cover-"
 LOGO_PREFIX = "demo-partner-"
+# --offline：不访问外网，直接用渐变占位封面
+OFFLINE = "--offline" in sys.argv
 
 
 # ---------------------------------------------------------------- 图片处理
@@ -138,6 +147,8 @@ def _gradient(size: tuple[int, int], colors) -> "object":
 
 def _fetch_photo(source: str, photo_id: str) -> bytes | None:
     """读取缓存的示例照片，没有则从 Pexels / Unsplash 公共 CDN 下载。"""
+    if OFFLINE:
+        return None
     cached = CACHE_DIR / f"{source}-{photo_id}.jpg"
     if cached.exists():
         return cached.read_bytes()
@@ -340,10 +351,15 @@ def seed_news_images() -> int:
 
 
 def seed_content_covers() -> int:
-    """为每条已发布内容补一条「新闻配图」，让管理端条目与赛事资讯一一对应。"""
+    """为每条已发布内容补齐「新闻配图」，让管理端条目与赛事资讯一一对应。
+
+    幂等判据改成「是否已挂上图片」：已有配图条目但 image_file_id 为空时复用该条目补图，
+    不重复 create，避免多次执行堆出多条空图资源。
+    """
     covered = set(
         PortalResource.objects.filter(resource_type="NEWS_LINK_IMAGE")
         .exclude(target_content_id="")
+        .exclude(image_file_id="")
         .values_list("target_content_id", flat=True)
     )
     contents = (
@@ -359,15 +375,25 @@ def seed_content_covers() -> int:
         ((76, 40, 14), (184, 104, 36)),
     ]
     for index, content in enumerate(contents):
-        resource = PortalResource.objects.create(
-            id=new_id("pres"),
-            resource_type="NEWS_LINK_IMAGE",
-            title=content.title[:150],
-            description=(content.summary or "")[:300],
-            target_content_id=content.pk,
-            sort_order=20 + index,
-            enabled=True,
+        resource = (
+            PortalResource.objects.filter(
+                resource_type="NEWS_LINK_IMAGE", target_content_id=content.pk
+            ).first()
         )
+        created_here = resource is None
+        if resource is None:
+            resource = PortalResource.objects.create(
+                id=new_id("pres"),
+                resource_type="NEWS_LINK_IMAGE",
+                title=content.title[:150],
+                description=(content.summary or "")[:300],
+                target_content_id=content.pk,
+                sort_order=20 + index,
+                enabled=True,
+            )
+        elif not resource.title:
+            resource.title = content.title[:150]
+            resource.save(update_fields=["title", "updated_at"])
         source, photo_id = PHOTO_POOL[index % len(PHOTO_POOL)]
         photo = _fetch_photo(source, photo_id)
         data = name = content_type = ""
@@ -384,8 +410,35 @@ def seed_content_covers() -> int:
             content_type = "image/png"
         _attach_image(resource, name, data, content_type)
         created += 1
-        print(f"  + 新闻配图「{content.title[:24]}」已创建并关联内容")
+        print(
+            f"  + 新闻配图「{content.title[:24]}」"
+            f"{'已创建' if created_here else '已补齐缺图'}并关联内容"
+        )
     return created
+
+
+def sync_content_covers() -> int:
+    """把新闻配图的 fileId 回填到 ``Content.cover_file_id``。
+
+    门户资讯列表（``public/contents``）取的是 ``Content.cover_file_id``，
+    只把图挂到 PortalResource 是不够的，必须回填这一列否则封面仍为空。
+    """
+    synced = 0
+    resources = (
+        PortalResource.objects.filter(resource_type="NEWS_LINK_IMAGE")
+        .exclude(target_content_id="")
+        .exclude(image_file_id="")
+    )
+    for resource in resources:
+        content = Content.objects.filter(pk=resource.target_content_id).first()
+        if content is None or content.cover_file_id == resource.image_file_id:
+            continue
+        content.cover_file_id = resource.image_file_id
+        content.revision = int(content.revision or 1) + 1
+        content.save()
+        synced += 1
+        print(f"  + 内容「{content.title[:24]}」封面已回填")
+    return synced
 
 
 def seed_partners() -> tuple[int, int]:
@@ -421,6 +474,8 @@ def seed_partners() -> tuple[int, int]:
 
 
 def main() -> None:
+    if OFFLINE:
+        print("（--offline：跳过在线图片下载，使用渐变占位封面）")
     print("轮播资源")
     updated = seed_carousel()
     print("新闻配图")
@@ -429,15 +484,22 @@ def main() -> None:
     print("合作伙伴")
     partner_created, partner_updated = seed_partners()
     updated += partner_updated
+    print("内容封面回填")
+    updated += sync_content_covers()
     created = news_created + partner_created
 
     cache.clear()
+    total_news = Content.objects.filter(content_type="NEWS").count()
+    with_cover = (
+        Content.objects.filter(content_type="NEWS").exclude(cover_file_id="").count()
+    )
     print(f"完成：新增 {created} 条，更新 {updated} 条")
     print(
         f"轮播/新闻配图 "
         f"{PortalResource.objects.filter(resource_type__in=['CAROUSEL', 'NEWS_LINK_IMAGE']).count()} 条，"
         f"合作伙伴 {PortalResource.objects.filter(resource_type='PARTNER').count()} 条"
     )
+    print(f"新闻封面：{with_cover}/{total_news} 条已挂图")
 
 
 if __name__ == "__main__":
