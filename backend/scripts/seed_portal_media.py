@@ -64,9 +64,9 @@ CAROUSEL_SPECS = [
 # 关联内容决定这张图展示在哪条赛事资讯上，管理端修改后立即同步到门户。
 NEWS_IMAGE_SPECS = [
     ("赛事资讯", "赛场内外的最新动态，赛程、战报与球队故事集中呈现。",
-     "274422", ((18, 64, 52), (44, 140, 100)), "决赛集锦：示例第一中学 2:1 示例第二中学"),
+     "270085", ((18, 64, 52), (44, 140, 100)), "决赛集锦：示例第一中学 2:1 示例第二中学"),
     ("四川省青少年校园足球联赛", "2026 赛季全省中小学足球联赛主视觉。",
-     "270085", ((15, 52, 96), (36, 108, 168)), "2026年四川省青少年校园足球联赛报名启动"),
+     "274422", ((15, 52, 96), (36, 108, 168)), "2026年四川省青少年校园足球联赛报名启动"),
     ("小组赛精彩收官", "小组赛阶段收官，各组出线名额尘埃落定。",
      "918798", ((46, 30, 88), (108, 74, 168)), "四川省青少年校园足球联赛小组赛精彩收官"),
     ("校园足球特色学校", "全省校园足球特色学校巡礼，展示基层足球育人成果。",
@@ -80,7 +80,6 @@ PHOTO_POOL = [
     ("unsplash", "1526232761682-d26e03ac148e"),
     ("unsplash", "1551958219-acbc608c6377"),
     ("unsplash", "1560272564-c83b66b1ad12"),
-    ("unsplash", "1593341646782-e0b495cff86d"),
     ("unsplash", "1543326727-cf6c39e8f84c"),
     ("unsplash", "1518604666860-9ed391f76460"),
     ("unsplash", "1574629810360-7efbbe195018"),
@@ -105,6 +104,15 @@ COVER_PREFIX = "demo-cover-"
 LOGO_PREFIX = "demo-partner-"
 # --offline：不访问外网，直接用渐变占位封面
 OFFLINE = "--offline" in sys.argv
+# --refresh：用真实照片重新生成脚本产出的封面（只覆盖 demo-cover- 开头的文件，
+# 管理端人工上传的图片不会被改动）；不加则保持原「只补缺失」的幂等行为。
+REFRESH = "--refresh" in sys.argv
+# --cache-only：只用 data/demo_assets/ 里已下载好的照片，绝不联网。
+# 服务器无外网时用它，避免每张图等 20 秒超时。
+CACHE_ONLY = "--cache-only" in sys.argv
+# 已验证的足球实拍备选池（本地缓存 data/demo_assets/pexels-<id>.jpg）。
+# PHOTO_POOL 的图片取不到时用它兜底，保证离线环境也能拿到真实照片而不是渐变图。
+PEXELS_FALLBACKS = ["274422", "918798", "114296", "270085"]
 
 
 # ---------------------------------------------------------------- 图片处理
@@ -155,6 +163,8 @@ def _fetch_photo(source: str, photo_id: str) -> bytes | None:
     legacy = CACHE_DIR / f"px-{photo_id}.jpg" if source == "pexels" else None
     if legacy is not None and legacy.exists():
         return legacy.read_bytes()
+    if CACHE_ONLY:
+        return None
     if source == "unsplash":
         url = f"https://images.unsplash.com/photo-{photo_id}?w=1600&q=80&fm=jpg"
     else:
@@ -311,6 +321,24 @@ def seed_news_images() -> int:
             resource_type="NEWS_LINK_IMAGE", title=title
         ).first()
         if resource is None:
+            # 资源标题与管理端内容标题不一致时，按目标内容反查；仍没有就补建一条，
+            # 保证这几张「主推资讯」一定能拿到专属照片，而不是被通用图池覆盖。
+            pre_target = Content.objects.filter(title=target_title).first()
+            if pre_target is not None:
+                resource = PortalResource.objects.filter(
+                    resource_type="NEWS_LINK_IMAGE", target_content_id=pre_target.pk
+                ).first()
+                if resource is None:
+                    resource = PortalResource.objects.create(
+                        id=new_id("pres"),
+                        resource_type="NEWS_LINK_IMAGE",
+                        title=title[:150],
+                        description=description[:300],
+                        target_content_id=pre_target.pk,
+                        sort_order=20 + index,
+                        enabled=True,
+                    )
+        if resource is None:
             print(f"  ! 未找到新闻配图「{title}」，跳过")
             continue
 
@@ -328,8 +356,14 @@ def seed_news_images() -> int:
             updated += 1
             print(f"  + 新闻配图「{title}」关联内容「{target_title}」")
 
-        if _existing_name(resource).startswith(COVER_PREFIX):
+        existing = _existing_name(resource)
+        if existing and not existing.startswith(COVER_PREFIX):
+            print(f"  = 新闻配图「{title}」已有自定义图片，跳过（不覆盖人工上传）")
             continue
+        if existing and not REFRESH:
+            continue
+        if REFRESH and existing.lower().endswith(".jpg"):
+            continue  # 已经是实拍照片，--refresh 只负责把渐变图换成照片
         photo = _fetch_photo("pexels", photo_id)
         if photo:
             try:
@@ -353,20 +387,11 @@ def seed_news_images() -> int:
 def seed_content_covers() -> int:
     """为每条已发布内容补齐「新闻配图」，让管理端条目与赛事资讯一一对应。
 
-    幂等判据改成「是否已挂上图片」：已有配图条目但 image_file_id 为空时复用该条目补图，
-    不重复 create，避免多次执行堆出多条空图资源。
+    幂等判据：「是否已挂上图片」。已有配图但 image_file_id 为空时复用该条目补图，
+    不重复 create；``--refresh`` 时重新生成脚本自己产的封面（demo-cover- 开头），
+    管理端人工上传的图片一律不动。
     """
-    covered = set(
-        PortalResource.objects.filter(resource_type="NEWS_LINK_IMAGE")
-        .exclude(target_content_id="")
-        .exclude(image_file_id="")
-        .values_list("target_content_id", flat=True)
-    )
-    contents = (
-        Content.objects.filter(status="PUBLISHED")
-        .exclude(pk__in=covered)
-        .order_by("-published_at")
-    )
+    contents = Content.objects.filter(status="PUBLISHED").order_by("-published_at")
     created = 0
     fallback_colors = [
         ((18, 64, 52), (44, 140, 100)),
@@ -394,8 +419,20 @@ def seed_content_covers() -> int:
         elif not resource.title:
             resource.title = content.title[:150]
             resource.save(update_fields=["title", "updated_at"])
+
+        existing = _existing_name(resource)
+        if existing and not existing.startswith(COVER_PREFIX):
+            continue  # 人工上传的图片，保持不动
+        if existing and not REFRESH:
+            continue  # 已有脚本产出封面且未要求刷新
+        if REFRESH and existing.lower().endswith(".jpg"):
+            continue  # 已经是实拍照片，--refresh 只负责把渐变图换成照片
+
         source, photo_id = PHOTO_POOL[index % len(PHOTO_POOL)]
         photo = _fetch_photo(source, photo_id)
+        if photo is None:
+            # 后备：用已验证的足球实拍图，避免离线环境退回渐变占位
+            photo = _fetch_photo("pexels", PEXELS_FALLBACKS[index % len(PEXELS_FALLBACKS)])
         data = name = content_type = ""
         if photo:
             try:
@@ -412,7 +449,7 @@ def seed_content_covers() -> int:
         created += 1
         print(
             f"  + 新闻配图「{content.title[:24]}」"
-            f"{'已创建' if created_here else '已补齐缺图'}并关联内容"
+            f"{'已创建' if created_here else '已更换封面'}并关联内容"
         )
     return created
 
@@ -475,7 +512,9 @@ def seed_partners() -> tuple[int, int]:
 
 def main() -> None:
     if OFFLINE:
-        print("（--offline：跳过在线图片下载，使用渐变占位封面）")
+        print("（--offline：跳过在线图片下载，使用本地缓存/渐变占位封面）")
+    if REFRESH:
+        print("（--refresh：用真实照片重新生成脚本产出的封面，人工上传的图片不动）")
     print("轮播资源")
     updated = seed_carousel()
     print("新闻配图")
