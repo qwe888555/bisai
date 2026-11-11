@@ -44,7 +44,8 @@ class IdentityCheckCreate(StrictSchema):
     enrollmentId: str = Field(..., min_length=1, max_length=64)
     athleteId: str = Field(..., min_length=1, max_length=64)
     capturedPhotoFileId: str = Field(..., min_length=1, max_length=64)
-    mode: Literal["FACE_COMPARE", "MANUAL"]
+    # 自动人脸比对已下线，只接受 MANUAL；默认值兼容不带该字段的旧客户端。
+    mode: str = Field("MANUAL", max_length=20)
 
 
 class IdentityManualReview(StrictSchema):
@@ -135,7 +136,6 @@ def identity_list(
     enrollmentId: Optional[str] = None,
     athleteId: Optional[str] = None,
     manualStatus: Optional[str] = None,
-    machineStatus: Optional[str] = None,
 ):
     actor = require("identityList")
     queryset = services.list_checks(
@@ -144,7 +144,6 @@ def identity_list(
             "enrollmentId": enrollmentId,
             "athleteId": athleteId,
             "manualStatus": manualStatus,
-            "machineStatus": machineStatus,
         }
     )
     return paginate(request, queryset, mapper=_identity_out)

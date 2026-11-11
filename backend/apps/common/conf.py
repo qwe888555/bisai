@@ -36,12 +36,6 @@ MINIO_SECRET_KEY: str = getattr(_s, "MINIO_SECRET_KEY", "")
 MINIO_BUCKET: str = getattr(_s, "MINIO_BUCKET", "football")
 MINIO_SECURE: bool = getattr(_s, "MINIO_SECURE", False)
 
-# ------------------------------------------------------------------ 人脸核验
-FACE_MODE: str = getattr(_s, "FACE_MODE", "MANUAL")
-FACE_API_BASE: str = getattr(_s, "FACE_API_BASE", "")
-FACE_API_KEY: str = getattr(_s, "FACE_API_KEY", "")
-FACE_THRESHOLD: float = getattr(_s, "FACE_THRESHOLD", 0.75)
-
 # ------------------------------------------------------------------ 政策问答
 AI_ENABLED: bool = getattr(_s, "AI_ENABLED", False)
 AI_BASE_URL: str = getattr(_s, "AI_BASE_URL", "")
