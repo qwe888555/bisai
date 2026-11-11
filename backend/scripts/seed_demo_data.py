@@ -910,11 +910,11 @@ def seed_identity_checks(
     enrollments: dict[str, Enrollment],
     photo_ids: dict[tuple[str, str], str],
 ) -> None:
-    """身份核验：机器结果与人工结果分开（契约 4.5）。"""
+    """身份核验：只演示现场人工核验（自动人脸比对已下线）。"""
     created = 0
 
-    def add(match_id: str, enrollment: Enrollment, player: dict, *, mode, machine_status,
-            machine_verified, manual_status, reviewer="", reviewed_at=None, reason=""):
+    def add(match_id: str, enrollment: Enrollment, player: dict, *, manual_status,
+            reviewer="", reviewed_at=None, reason=""):
         nonlocal created
         IdentityCheck.objects.update_or_create(
             id=f"idc_demo_{match_id}_{player['person'].pk}",
@@ -923,9 +923,9 @@ def seed_identity_checks(
                 "enrollment_id": enrollment.pk,
                 "athlete_id": str(player["person"].pk),
                 "captured_photo_file_id": photo_ids.get((match_id, str(player["person"].pk)), ""),
-                "mode": mode,
-                "machine_status": machine_status,
-                "machine_verified": machine_verified,
+                "mode": "MANUAL",
+                "machine_status": "NOT_RUN",
+                "machine_verified": False,
                 "manual_status": manual_status,
                 "manual_reason": reason,
                 "reviewer_account_id": reviewer,
@@ -935,34 +935,28 @@ def seed_identity_checks(
         created += 1
 
     reviewed = _aware(2026, 10, 27, 20, 30)
-    # 已结束比赛：机器比对 + 人工确认
+    # 已结束比赛：人工确认
     m = "mat_demo_gu12_r1"
-    for i, player in enumerate(contexts[2]["squads"]["gu12"]["players"][:4]):
+    for player in contexts[2]["squads"]["gu12"]["players"][:4]:
         add(
             m,
             enrollments["girls_u12"],
             player,
-            mode="FACE_COMPARE",
-            machine_status="MATCH",
-            machine_verified=True,
             manual_status="CONFIRMED",
             reviewer="acc_recorder",
             reviewed_at=reviewed,
         )
+    # 已结束比赛：一条待人工核验
     m = "mat_demo_u15_r1"
     for i, player in enumerate(contexts[0]["squads"]["u15"]["players"][:4]):
-        mismatch = i == 3
+        pending = i == 3
         add(
             m,
             enrollments["boys_u15"],
             player,
-            mode="FACE_COMPARE",
-            machine_status="MISMATCH" if mismatch else "MATCH",
-            machine_verified=not mismatch,
-            manual_status="PENDING" if mismatch else "CONFIRMED",
+            manual_status="PENDING" if pending else "CONFIRMED",
             reviewer="acc_recorder",
-            reviewed_at=None if mismatch else reviewed,
-            reason="机器比对不一致，待人工复核" if mismatch else "",
+            reviewed_at=None if pending else reviewed,
         )
     # 进行中比赛：一条人工驳回
     m = "mat_demo_gu12_r2"
@@ -972,24 +966,18 @@ def seed_identity_checks(
             m,
             enrollments["girls_u12"],
             player,
-            mode="FACE_COMPARE",
-            machine_status="MATCH",
-            machine_verified=True,
             manual_status="REJECTED" if rejected else "CONFIRMED",
             reviewer="acc_recorder",
             reviewed_at=reviewed,
             reason="非本人出场，取消本场成绩" if rejected else "",
         )
-    # 未开始比赛：未跑核验
+    # 未开始比赛：未核验
     m = "mat_demo_u15_r3"
     for player in contexts[0]["squads"]["u15"]["players"][:2]:
         add(
             m,
             enrollments["boys_u15"],
             player,
-            mode="FACE_COMPARE",
-            machine_status="NOT_RUN",
-            machine_verified=False,
             manual_status="NOT_REVIEWED",
         )
     _STATS["identity_checks"] = IdentityCheck.objects.filter(id__startswith="idc_demo_").count()

@@ -47,14 +47,6 @@ def env_int(key: str, default: int) -> int:
         return default
 
 
-def env_float(key: str, default: float) -> float:
-    raw = os.environ.get(key)
-    try:
-        return float(raw) if raw not in (None, "") else default
-    except ValueError:
-        return default
-
-
 def env_list(key: str, default: str = "") -> list[str]:
     return [item.strip() for item in env(key, default).split(",") if item.strip()]
 
@@ -214,12 +206,6 @@ MINIO_ACCESS_KEY = env("MINIO_ACCESS_KEY", "minioadmin")
 MINIO_SECRET_KEY = env("MINIO_SECRET_KEY", "minioadmin")
 MINIO_BUCKET = env("MINIO_BUCKET", "football")
 MINIO_SECURE = env_bool("MINIO_SECURE", False)
-
-# 人脸核验：MANUAL = 现场拍照 + 人工确认（默认降级）；FACE_COMPARE = 接第三方比对
-FACE_MODE = env("FACE_MODE", "MANUAL")
-FACE_API_BASE = env("FACE_API_BASE", "")
-FACE_API_KEY = env("FACE_API_KEY", "")
-FACE_THRESHOLD = env_float("FACE_THRESHOLD", 0.75)
 
 # 政策问答（项目唯一 AI，可一键关闭）
 AI_ENABLED = env_bool("AI_ENABLED", False)
