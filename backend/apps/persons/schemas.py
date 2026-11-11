@@ -249,7 +249,7 @@ class PersonCreate(StrictSchema):
     idNumber: Optional[str] = Field(
         None, min_length=18, max_length=18, pattern=r"^\d{17}[\dXx]$"
     )
-    phone: Optional[str] = Field(None, min_length=11, max_length=11, pattern=r"^1\d{10}$")
+    phone: Optional[str] = Field(None, min_length=11, max_length=11, pattern=r"^1[3-9]\d{9}$")
     gender: Optional[str] = Field(None, max_length=20)
     birthDate: Optional[date] = None
     schoolOrgId: Optional[str] = Field(None, min_length=1, max_length=64)
@@ -278,7 +278,7 @@ class PersonUpdate(StrictSchema):
     birthDate: Optional[date] = None
     schoolOrgId: Optional[str] = Field(None, min_length=1, max_length=64)
     avatarFileId: Optional[str] = Field(None, min_length=1, max_length=64)
-    phone: Optional[str] = Field(None, min_length=11, max_length=11, pattern=r"^1\d{10}$")
+    phone: Optional[str] = Field(None, min_length=11, max_length=11, pattern=r"^1[3-9]\d{9}$")
     education: Optional[str] = Field(None, max_length=100)
     coachCategory: Optional[str] = Field(None, max_length=64)
     changeReason: Optional[str] = Field(None, max_length=200)

@@ -41,7 +41,7 @@ class RegisterRequest(StrictSchema):
     password: str = Field(min_length=8, max_length=128)
     realName: str = Field(min_length=1, max_length=100)
     idNumber: str = Field(pattern=r"^\d{17}[\dXx]$")
-    phone: str = Field(default="", pattern=r"^1\d{10}$")
+    phone: str = Field(default="", pattern=r"^1[3-9]\d{9}$")
 
 
 class ChangePassword(StrictSchema):

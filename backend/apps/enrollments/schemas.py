@@ -11,7 +11,7 @@ from ninja import Field
 
 from apps.common.schemas import StrictSchema
 
-Phone = Field(..., pattern=r"^1\d{10}$", max_length=11)
+Phone = Field(..., pattern=r"^1[3-9]\d{9}$", max_length=11)
 
 
 class EnrollmentCreateIn(StrictSchema):

@@ -217,7 +217,7 @@ def _build_payload(actor, values: list[str], fallback_org_id: str):
         raise ApiError(INVALID_ARGUMENT, "身份证号格式或校验位不正确")
     if not phone:
         raise ApiError(INVALID_ARGUMENT, "手机号必填")
-    if not re.fullmatch(r"1\d{10}", phone):
+    if not re.fullmatch(r"1[3-9]\d{9}", phone):
         raise ApiError(INVALID_ARGUMENT, "手机号格式不正确")
     kind = _KIND_MAP.get(kind_text.strip().upper())
     if kind is None:
