@@ -216,6 +216,13 @@ AI_TIMEOUT_SECONDS = env_int("AI_TIMEOUT_SECONDS", 15)
 AI_MAX_QUESTION_CHARS = env_int("AI_MAX_QUESTION_CHARS", 1000)
 AI_RATE_LIMIT_PER_HOUR = env_int("AI_RATE_LIMIT_PER_HOUR", 20)
 
+# 人脸比对（独立 face 容器；默认 MANUAL，保持现场人工核验口径）
+# FACE_MODE=FACE_COMPARE 时，/identity-checks 才会调 face 服务做机器 1:1 比对
+FACE_MODE = env("FACE_MODE", "MANUAL").strip().upper()
+FACE_API_BASE = env("FACE_API_BASE", "http://127.0.0.1:8500")
+FACE_THRESHOLD = float(env("FACE_THRESHOLD", "0.30") or 0.30)
+FACE_TIMEOUT_SECONDS = env_int("FACE_TIMEOUT_SECONDS", 15)
+
 LOGGING = {
     "version": 1,
     "disable_existing_loggers": False,

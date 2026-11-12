@@ -150,6 +150,20 @@ class ApiSmokeTests(TestCase):
 
     # ---------------------------------------------------------------- 幂等
     def test_identity_idempotency_replay_and_conflict(self):
+        # create_check 现在校验名单归属，先造真实报名单与名单条目
+        from apps.enrollments.models import Enrollment, RosterItem
+
+        enrollment = Enrollment.objects.create(
+            id="enr_1",
+            event_id="evt_demo",
+            group_id="grp_1",
+            team_id="team_1",
+            subject_type="SCHOOL_TEAM",
+            status="APPROVED",
+            contact_name="联系人",
+        )
+        RosterItem.objects.create(id="rst_1", enrollment=enrollment, athlete_id="ath_1")
+
         token = self.login()
         photo_id = self.upload_capture_photo("match_demo_1", token)
         payload = {

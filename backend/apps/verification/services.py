@@ -1,7 +1,10 @@
 """身份核验业务逻辑。
 
-平台只提供现场人工核验：创建记录时 mode 固定为 MANUAL、
-machineStatus 固定为 NOT_RUN，不再调用任何第三方人脸比对服务。
+两种模式：
+- MANUAL（默认）：现场拍照 + 人工确认，machine_status=NOT_RUN，不调任何识别服务。
+- FACE_COMPARE（需配置 FACE_MODE=FACE_COMPARE 且 face 容器可用）：调独立
+  face 服务做 1:1 机器比对，落 machine_status / machine_verified / machine_distance。
+
 人工确认只改变 manualStatus，**不虚构机器识别结果**。
 """
 
@@ -11,6 +14,7 @@ from typing import Any
 
 from django.utils import timezone
 
+from apps.common import conf
 from apps.common.errors import (
     INVALID_ARGUMENT,
     NOT_FOUND,
@@ -46,12 +50,75 @@ def _verify_capture_photo(photo_file_id: str, match_id: str) -> None:
         )
 
 
+def _verify_roster(enrollment_id: str, athlete_id: str, match_id: str) -> None:
+    """球员必须在该报名单内，且报名单与比赛属于同一赛事（契约 4.5）。"""
+    from apps.enrollments.models import Enrollment, RosterItem
+
+    enrollment = Enrollment.objects.filter(pk=enrollment_id).first()
+    if enrollment is None:
+        raise ApiError(
+            INVALID_ARGUMENT,
+            "报名单不存在",
+            [{"field": "enrollmentId", "reason": "不存在"}],
+        )
+    item = RosterItem.objects.filter(
+        enrollment_id=enrollment_id, athlete_id=str(athlete_id)
+    ).first()
+    if item is None:
+        raise ApiError(
+            INVALID_ARGUMENT,
+            "该球员不在此报名单内",
+            [{"field": "athleteId", "reason": "名单不匹配"}],
+        )
+
+    from apps.events.models import Match
+
+    match = Match.objects.filter(pk=match_id).first()
+    if match is not None and str(match.event_id) != str(enrollment.event_id):
+        raise ApiError(
+            INVALID_ARGUMENT,
+            "报名单与比赛不属于同一赛事",
+            [{"field": "enrollmentId", "reason": "赛事不匹配"}],
+        )
+
+
 def create_check(account, data: dict[str, Any]) -> IdentityCheck:
-    # 自动人脸比对已下线，只接受现场人工核验。
-    if data.get("mode", "MANUAL") != "MANUAL":
-        raise ApiError(INVALID_ARGUMENT, "平台仅支持现场人工核验，mode 必须为 MANUAL")
+    mode = data.get("mode", "MANUAL")
+    if mode not in ("MANUAL", "FACE_COMPARE"):
+        raise ApiError(
+            INVALID_ARGUMENT, "mode 取值不合法，仅支持 MANUAL / FACE_COMPARE"
+        )
 
     _verify_capture_photo(data["capturedPhotoFileId"], data["matchId"])
+    _verify_roster(data["enrollmentId"], data["athleteId"], data["matchId"])
+
+    if mode == "FACE_COMPARE":
+        if conf.FACE_MODE != "FACE_COMPARE":
+            raise ApiError(
+                INVALID_ARGUMENT,
+                "平台仅支持现场人工核验，mode 必须为 MANUAL",
+            )
+        from . import face_client
+
+        reference_photo_file_id = face_client.resolve_reference_photo_file_id(
+            data["enrollmentId"], data["athleteId"]
+        )
+        outcome = face_client.compare(
+            data["capturedPhotoFileId"], reference_photo_file_id
+        )
+        return IdentityCheck.objects.create(
+            id=new_identity_id(),
+            match_id=data["matchId"],
+            enrollment_id=data["enrollmentId"],
+            athlete_id=data["athleteId"],
+            captured_photo_file_id=data["capturedPhotoFileId"],
+            mode="FACE_COMPARE",
+            machine_status=outcome["machine_status"],
+            machine_verified=outcome["machine_verified"],
+            machine_distance=outcome["machine_distance"],
+            machine_reason=outcome["machine_reason"],
+            manual_status="NOT_REVIEWED",
+        )
 
     return IdentityCheck.objects.create(
         id=new_identity_id(),
@@ -62,6 +129,7 @@ def create_check(account, data: dict[str, Any]) -> IdentityCheck:
         mode="MANUAL",
         machine_status="NOT_RUN",
         machine_verified=False,
+        machine_distance=None,
         manual_status="NOT_REVIEWED",
     )
 
@@ -100,7 +168,7 @@ def manual_review(account, check_id: str, data: dict[str, Any]) -> IdentityCheck
     check.manual_reason = data["reason"][:1000]
     check.reviewer_account_id = account.pk
     check.reviewed_at = timezone.now()
-    # 注意：绝不修改 machine_status / machine_verified
+    # 注意：绝不修改 machine_status / machine_verified / machine_distance
     bump(check)
     check.save()
     return check

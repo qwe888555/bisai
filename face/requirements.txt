@@ -1,0 +1,5 @@
+# 人脸比对独立服务依赖（ONNX 后端，不引入 tensorflow/torch）。
+# 完整可复现锁见 requirements-lock.txt（由 python:3.11 环境 pip freeze 生成）。
+deepface==0.0.104
+fastapi==0.115.6
+uvicorn[standard]==0.34.0

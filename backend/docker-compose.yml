@@ -1,6 +1,7 @@
-# 一键起本地依赖：MySQL + Redis + MinIO + 后端
+# 一键起本地依赖：MySQL + Redis + MinIO + 后端 + 人脸比对
 # 用法：docker compose up -d db redis minio   （只起依赖，后端本地 runserver 开发）
-#       docker compose up -d                   （整套容器化）
+#       docker compose up -d face            （只起人脸比对服务）
+#       docker compose up -d                 （整套容器化）
 version: "3.9"
 
 services:
@@ -51,6 +52,15 @@ services:
       timeout: 5s
       retries: 10
 
+  face:
+    # 独立人脸比对服务，权重烤进镜像，离线可用
+    build:
+      context: ../face
+    image: football-face:latest
+    ports:
+      - "8500:8500"
+    restart: unless-stopped
+
   web:
     build: .
     command: python manage.py runserver 0.0.0.0:8000
@@ -65,6 +75,8 @@ services:
       REDIS_URL: redis://redis:6379/0
       STORAGE_BACKEND: ${STORAGE_BACKEND:-local}
       MINIO_ENDPOINT: minio:9000
+      # 容器内 face 服务地址；FACE_MODE=FACE_COMPARE 时生效
+      FACE_API_BASE: http://face:8500
       DJANGO_DEBUG: "True"
     depends_on:
       db:

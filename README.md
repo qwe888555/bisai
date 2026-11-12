@@ -23,12 +23,15 @@ backend/
     accounts/             # 账号、组织、字典、审计日志、登录
     notices/              # 消息中心
     attachments/          # 文件上传下载
-    verification/         # 身份核验
+    verification/         # 身份核验（MANUAL 人工核验 + FACE_COMPARE 调 face 容器）
     policyqa/             # 政策问答
+  tests/test_face_compare.py  # FACE_COMPARE 链路测试（MockTransport，不依赖真实容器）
   deploy/nginx.conf       # 反向代理示例
   Dockerfile / docker-compose.yml
   requirements.txt / .env.example
   manage.py
+face/                     # 独立人脸比对服务（FastAPI + DeepFace ONNX，权重烤进镜像）
+  app/ scripts/ tests/ Dockerfile requirements.txt
 ```
 
 每个应用的固定分层：`models.py`（ORM 模型）→ `schemas.py`（请求模型）→ `services.py`（业务逻辑）→ `api.py`（路由与视图）。
@@ -54,11 +57,14 @@ python -m pytest               # 接口冒烟：登录/权限/400/401/403/404/40
 ## 部署与运维
 
 ```bash
-docker compose up -d                                   # MySQL + Redis + MinIO + web + nginx
+docker compose up -d                                   # MySQL + Redis + MinIO + face + web + nginx
+docker compose up -d face                              # 只起人脸比对容器（首次构建含权重下载，离线可用）
 bash deploy/backup.sh                                  # 备份库/文件/MinIO 到 backups/<时间戳>
 bash deploy/restore.sh backups/<时间戳>                 # 从备份恢复
 python scripts/smoke_concurrency.py --path "/accounts" --total 100 --concurrency 50 --login "admin:Foot@2026"
 ```
+
+- 人脸比对：独立 `face` 容器（FastAPI + DeepFace ONNX，含防翻拍），权重烤进镜像；`.env` 设 `FACE_MODE=FACE_COMPARE` 启用，默认 `MANUAL` 保持人工口径；完整部署、阈值标定、离线镜像与失败安全语义见 `docs/部署与初始化指南.md` 第 11 节；
 
 - 生产 HTTPS：把 compose 里 nginx 的挂载换成 `deploy/nginx-https.conf`，证书放 `deploy/certs/`（不进仓库）；
 - 并发冒烟默认打 `/api/v1` 前缀，报名提交这类写接口加 `--idempotency` 让每次请求带不同幂等键；

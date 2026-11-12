@@ -44,7 +44,7 @@ class IdentityCheckCreate(StrictSchema):
     enrollmentId: str = Field(..., min_length=1, max_length=64)
     athleteId: str = Field(..., min_length=1, max_length=64)
     capturedPhotoFileId: str = Field(..., min_length=1, max_length=64)
-    # 自动人脸比对已下线，只接受 MANUAL；默认值兼容不带该字段的旧客户端。
+    # MANUAL（默认，现场人工核验）；FACE_COMPARE 需平台 FACE_MODE=FACE_COMPARE。
     mode: str = Field("MANUAL", max_length=20)
 
 
@@ -67,6 +67,8 @@ def _identity_out(check: IdentityCheck) -> dict:
         "mode": check.mode,
         "machineStatus": check.machine_status,
         "machineVerified": bool(check.machine_verified),
+        "machineDistance": check.machine_distance,
+        "machineReason": check.machine_reason,
         "manualStatus": check.manual_status,
         "version": int(check.version or 0),
         "createdAt": check.created_at,

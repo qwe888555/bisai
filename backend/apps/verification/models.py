@@ -23,6 +23,10 @@ class IdentityCheck(models.Model):
     mode = models.CharField(max_length=20, choices=[(m, m) for m in MODES])
     machine_status = models.CharField(max_length=20, default="NOT_RUN")
     machine_verified = models.BooleanField(default=False)
+    # 机器比对的 cosine 距离（仅 FACE_COMPARE 且成功出距离时有值），便于复核与阈值标定
+    machine_distance = models.FloatField(null=True, blank=True, default=None)
+    # 机器侧结论说明（如防翻拍拦截、face 服务不可用原因），人工复核不修改此字段
+    machine_reason = models.CharField(max_length=255, blank=True, default="")
     manual_status = models.CharField(max_length=20, default="NOT_REVIEWED")
     manual_reason = models.CharField(max_length=1000, blank=True, default="")
     reviewer_account_id = models.CharField(max_length=64, blank=True, default="")
