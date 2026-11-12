@@ -44,7 +44,7 @@ class IdentityCheckCreate(StrictSchema):
     enrollmentId: str = Field(..., min_length=1, max_length=64)
     athleteId: str = Field(..., min_length=1, max_length=64)
     capturedPhotoFileId: str = Field(..., min_length=1, max_length=64)
-    # 自动人脸比对已下线，只接受 MANUAL；默认值兼容不带该字段的旧客户端。
+    # FACE_COMPARE 走机器比对，MANUAL 只做人工核验；默认值兼容旧客户端。
     mode: str = Field("MANUAL", max_length=20)
 
 
@@ -136,6 +136,7 @@ def identity_list(
     enrollmentId: Optional[str] = None,
     athleteId: Optional[str] = None,
     manualStatus: Optional[str] = None,
+    machineStatus: Optional[str] = None,
 ):
     actor = require("identityList")
     queryset = services.list_checks(
@@ -144,6 +145,7 @@ def identity_list(
             "enrollmentId": enrollmentId,
             "athleteId": athleteId,
             "manualStatus": manualStatus,
+            "machineStatus": machineStatus,
         }
     )
     return paginate(request, queryset, mapper=_identity_out)
@@ -155,10 +157,22 @@ def identity_list(
     response=EnvelopeOut,
     summary="身份核验记录列表",
 )
-def identity_list_root(request):
+def identity_list_root(
+    request,
+    matchId: Optional[str] = None,
+    enrollmentId: Optional[str] = None,
+    athleteId: Optional[str] = None,
+    manualStatus: Optional[str] = None,
+    machineStatus: Optional[str] = None,
+):
     """GET /identity-checks：zuqiu 前端 identityApi.list 实际调用路径
-    （src/api/index.ts L325），与原 /identity-checks/list 等价并存。"""
-    return identity_list(request)
+    （src/api/index.ts L325），与原 /identity-checks/list 等价并存。
+
+    必须显式声明并透传筛选参数，否则 query 参数在根路径上会被丢弃。
+    """
+    return identity_list(
+        request, matchId, enrollmentId, athleteId, manualStatus, machineStatus
+    )
 
 
 @router.get(

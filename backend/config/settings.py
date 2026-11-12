@@ -216,6 +216,17 @@ AI_TIMEOUT_SECONDS = env_int("AI_TIMEOUT_SECONDS", 15)
 AI_MAX_QUESTION_CHARS = env_int("AI_MAX_QUESTION_CHARS", 1000)
 AI_RATE_LIMIT_PER_HOUR = env_int("AI_RATE_LIMIT_PER_HOUR", 20)
 
+# 人脸比对（自建 DeepFace 服务；FACE_API_BASE 留空时机器比对降级为 UNAVAILABLE）
+FACE_API_BASE = env("FACE_API_BASE", "")
+FACE_API_KEY = env("FACE_API_KEY", "")
+# cosine 距离阈值，越小越严格
+FACE_THRESHOLD = float(env("FACE_THRESHOLD", "0.30"))
+FACE_MODEL = env("FACE_MODEL", "Facenet512")
+FACE_DETECTOR = env("FACE_DETECTOR", "retinaface")
+FACE_ANTI_SPOOFING = env_bool("FACE_ANTI_SPOOFING", True)
+# 首次请求要加载模型（retinaface + facenet512），比普通接口慢
+FACE_TIMEOUT_SECONDS = env_int("FACE_TIMEOUT_SECONDS", 30)
+
 LOGGING = {
     "version": 1,
     "disable_existing_loggers": False,

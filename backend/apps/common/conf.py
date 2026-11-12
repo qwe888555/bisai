@@ -45,6 +45,15 @@ AI_TIMEOUT_SECONDS: int = getattr(_s, "AI_TIMEOUT_SECONDS", 15)
 AI_MAX_QUESTION_CHARS: int = getattr(_s, "AI_MAX_QUESTION_CHARS", 1000)
 AI_RATE_LIMIT_PER_HOUR: int = getattr(_s, "AI_RATE_LIMIT_PER_HOUR", 20)
 
+# ------------------------------------------------------------------ 人脸比对
+FACE_API_BASE: str = getattr(_s, "FACE_API_BASE", "")
+FACE_API_KEY: str = getattr(_s, "FACE_API_KEY", "")
+FACE_THRESHOLD: float = getattr(_s, "FACE_THRESHOLD", 0.30)
+FACE_MODEL: str = getattr(_s, "FACE_MODEL", "Facenet512")
+FACE_DETECTOR: str = getattr(_s, "FACE_DETECTOR", "retinaface")
+FACE_ANTI_SPOOFING: bool = getattr(_s, "FACE_ANTI_SPOOFING", True)
+FACE_TIMEOUT_SECONDS: int = getattr(_s, "FACE_TIMEOUT_SECONDS", 30)
+
 # ------------------------------------------------------------------ 分页
 DEFAULT_PAGE_SIZE: int = getattr(_s, "DEFAULT_PAGE_SIZE", 20)
 MAX_PAGE_SIZE = 100
