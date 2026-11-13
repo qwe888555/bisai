@@ -7,10 +7,12 @@ import json
 from apps.enrollments.tests.factories import (
     BASE,
     GROUP_ID,
+    complete_draft,
     create_draft,
     get_detail,
     post_json,
     put_json,
+    submit,
 )
 
 
@@ -230,21 +232,30 @@ def test_form_config_rejects_non_university(client, auth):
         assert response.json()["code"] == "FORBIDDEN"
 
 
-def test_global_admin_sees_all_enrollments(client, auth):
-    """未挂组织的全局管理员覆盖全库（与文档口径一致，2026-11-04 修复）。"""
+def test_admin_sees_submitted_but_not_drafts(client, auth):
+    """管理员覆盖全库的已提交报名，但草稿只留在报送账号自己那里。"""
     school_a = auth("university")
     school_b = auth("university2")
-    first = create_draft(client, school_a, team_id="org_team_01")
-    second = create_draft(client, school_b, team_id="org_team_02")
+    submitted_id = complete_draft(client, school_a, team_id="org_team_01")
+    submitted = submit(client, school_a, submitted_id, "admin-list-submit")
+    assert submitted.status_code == 200, submitted.json()
+    draft = create_draft(client, school_b, team_id="org_team_02")
 
     admin = auth("globaladmin")
     listing = client.get(f"{BASE}/enrollments", **admin)
     assert listing.status_code == 200
     ids = {item["id"] for item in listing.json()["data"]["items"]}
-    assert {first["id"], second["id"]} <= ids
+    assert submitted_id in ids
+    assert draft["id"] not in ids
 
-    detail = client.get(f"{BASE}/enrollments/{second['id']}", **admin)
-    assert detail.status_code == 200
+    assert client.get(f"{BASE}/enrollments/{submitted_id}", **admin).status_code == 200
+    hidden = client.get(f"{BASE}/enrollments/{draft['id']}", **admin)
+    assert hidden.status_code == 403
+    assert hidden.json()["code"] == "DATA_SCOPE_DENIED"
+
+    # 学校端本人仍能看到并继续维护自己的草稿。
+    own = client.get(f"{BASE}/enrollments/{draft['id']}", **school_b)
+    assert own.status_code == 200
 
     stats = client.get(
         f"{BASE}/enrollment-statistics?eventId=event_01&dimension=CITY", **admin
@@ -253,19 +264,19 @@ def test_global_admin_sees_all_enrollments(client, auth):
 
 
 def test_recorder_reads_but_cannot_write_roster(client, auth):
-    """记录台跨队只读；名单/附件写操作需创建者或本队（2026-11-04 修复）。"""
+    """记录台跨队只读已提交报名；名单/附件写操作需创建者或本队（2026-11-04 修复）。"""
     school = auth("university")
-    enrollment = create_draft(client, school)
+    enrollment_id = complete_draft(client, school)
+    submitted = submit(client, school, enrollment_id, "recorder-roster-submit")
+    assert submitted.status_code == 200, submitted.json()
     recorder = auth("recorder")
 
-    listing = client.get(
-        f"{BASE}/enrollments/{enrollment['id']}/players", **recorder
-    )
+    listing = client.get(f"{BASE}/enrollments/{enrollment_id}/players", **recorder)
     assert listing.status_code == 200
 
     created = post_json(
         client,
-        f"{BASE}/enrollments/{enrollment['id']}/players",
+        f"{BASE}/enrollments/{enrollment_id}/players",
         recorder,
         {"athleteId": "per_test_00", "jerseyNumber": 7, "position": "DF"},
     )
@@ -274,7 +285,7 @@ def test_recorder_reads_but_cannot_write_roster(client, auth):
 
     attachment = post_json(
         client,
-        f"{BASE}/enrollments/{enrollment['id']}/attachments",
+        f"{BASE}/enrollments/{enrollment_id}/attachments",
         recorder,
         {"materialType": "STAMPED_FORM", "fileId": "file_not_owned"},
     )

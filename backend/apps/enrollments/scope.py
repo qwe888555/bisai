@@ -25,7 +25,12 @@ from apps.common.permissions import (
 from apps.common.scopes import is_global_admin, org_scope_ids
 
 from .clients import team_client
-from .models import Enrollment
+from .models import STATUS_DRAFT, Enrollment
+
+# 审核/管理/记录端：只看已提交的报名，草稿属于报送账号自己的未完成数据。
+_DRAFT_HIDDEN_ROLES = ORG_SCOPE_ROLES | {MATCH_RECORDER}
+# 报送端：草稿只对创建该草稿的账号可见。
+_SUBMITTER_ROLES = {TEAM, UNIVERSITY}
 
 
 def role_set(account) -> set[str]:
@@ -48,8 +53,23 @@ def team_scope_ids(account) -> list[str]:
     return ids
 
 
+def _apply_draft_visibility(account, queryset):
+    """草稿可见性：只留在创建者自己的账号里，管理/审核/记录端只看已提交报名。"""
+    roles = role_set(account)
+    if roles & _DRAFT_HIDDEN_ROLES:
+        return queryset.exclude(status=STATUS_DRAFT)
+    if roles & _SUBMITTER_ROLES:
+        return queryset.exclude(Q(status=STATUS_DRAFT) & ~Q(created_by=account.pk))
+    return queryset.exclude(status=STATUS_DRAFT)
+
+
 def scoped_queryset(account, queryset):
-    """按数据范围过滤报名单 QuerySet。"""
+    """按数据范围过滤报名单 QuerySet（含草稿可见性）。"""
+    return _apply_draft_visibility(account, _org_scoped_queryset(account, queryset))
+
+
+def _org_scoped_queryset(account, queryset):
+    """按角色/组织树收窄数据范围，不处理草稿。"""
     # 记录员：赛前身份核验需跨队/跨市读取名册，授予全局只读（写权限由 R1/R3 拦截，不在 R5）。
     if MATCH_RECORDER in role_set(account):
         return queryset
@@ -67,7 +87,22 @@ def scoped_queryset(account, queryset):
     return queryset.filter(Q(team_id__in=team_ids))
 
 
+def _ensure_draft_visible(account, enrollment: Enrollment) -> None:
+    """未提交草稿只允许创建者本人读取，避免管理员/审核端/同组织他人看到半成品。"""
+    if enrollment.status != STATUS_DRAFT:
+        return
+    roles = role_set(account)
+    if roles & _SUBMITTER_ROLES and enrollment.created_by == account.pk:
+        return
+    raise ApiError(
+        DATA_SCOPE_DENIED,
+        "草稿仅创建者本人可见",
+        [{"field": "enrollmentId", "reason": "未提交的草稿不对外可见"}],
+    )
+
+
 def ensure_enrollment_access(account, enrollment: Enrollment) -> None:
+    _ensure_draft_visible(account, enrollment)
     if MATCH_RECORDER in role_set(account):
         return
     if is_global_admin(account):
