@@ -363,10 +363,13 @@ def test_city_province_admin_forbidden(client, auth):
 
 
 def test_team_role_within_scope_allowed(client, auth):
-    """TEAM 在自身球队数据范围内可执行资格操作。"""
-    school = auth("university")
+    """TEAM 在自身球队数据范围内可执行资格操作。
+
+    2026-11-13 新规则「草稿仅创建者本人可见」后，草稿必须由执行账号自己创建，
+    否则连读取都会被 403 拦截，故此处用球队账号建单。
+    """
     team = auth("team")
-    enrollment_id = complete_draft(client, school)
+    enrollment_id = complete_draft(client, team)
     item = _item(enrollment_id)
 
     response = _qualify(
