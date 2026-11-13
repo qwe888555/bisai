@@ -33,8 +33,11 @@ def _unavailable(reason: str) -> dict[str, Any]:
     }
 
 
-def resolve_reference_photo_file_id(enrollment_id: str, athlete_id: str) -> str:
-    """参考照优先级：名单条目 RosterItem.photo_file_id → 人员主档 Person.photo_file_id。"""
+def resolve_reference_photo(enrollment_id: str, athlete_id: str) -> dict[str, Any]:
+    """参考照解析（带来源）：名单条目 RosterItem.photo_file_id → 人员主档 Person.photo_file_id。
+
+    核验前探测接口与真正比对共用这一处优先级，避免两处逻辑漂移。
+    """
     from apps.enrollments.models import RosterItem
     from apps.persons.models import Person
 
@@ -44,7 +47,7 @@ def resolve_reference_photo_file_id(enrollment_id: str, athlete_id: str) -> str:
         .first()
     )
     if roster_photo:
-        return roster_photo
+        return {"file_id": roster_photo, "source": "ROSTER"}
     try:
         person_photo = (
             Person.objects.filter(pk=athlete_id)
@@ -54,7 +57,14 @@ def resolve_reference_photo_file_id(enrollment_id: str, athlete_id: str) -> str:
     except (ValueError, TypeError):
         # 非数字 id 无法匹配 BigAutoField，按无参考照处理，不抛 500
         person_photo = None
-    return person_photo or ""
+    if person_photo:
+        return {"file_id": person_photo, "source": "PERSON"}
+    return {"file_id": "", "source": "NONE"}
+
+
+def resolve_reference_photo_file_id(enrollment_id: str, athlete_id: str) -> str:
+    """参考照优先级：名单条目 RosterItem.photo_file_id → 人员主档 Person.photo_file_id。"""
+    return resolve_reference_photo(enrollment_id, athlete_id)["file_id"] or ""
 
 
 def _build_client() -> httpx.Client:

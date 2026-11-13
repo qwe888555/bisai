@@ -134,6 +134,27 @@ def create_check(account, data: dict[str, Any]) -> IdentityCheck:
     )
 
 
+def reference_photo(enrollment_id: str, athlete_id: str) -> dict[str, Any]:
+    """核验前探测参考照：返回 fileId / source / available。
+
+    记录员角色无人员档案读取权限，前端无法自行判断「名单照片 → 档案头像」两级回落，
+    因此由后端按与比对完全一致的优先级给出结论；文件记录已删则按不可用处理。
+    """
+    from apps.attachments.models import FileRecord
+
+    from . import face_client
+
+    resolved = face_client.resolve_reference_photo(enrollment_id, athlete_id)
+    file_id = resolved["file_id"]
+    if file_id and not FileRecord.objects.filter(pk=file_id).exists():
+        return {"fileId": file_id, "source": resolved["source"], "available": False}
+    return {
+        "fileId": file_id,
+        "source": resolved["source"],
+        "available": bool(file_id),
+    }
+
+
 def list_checks(filters: dict):
     queryset = IdentityCheck.objects.all()
     if filters.get("matchId"):

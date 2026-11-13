@@ -285,3 +285,63 @@ class FaceCompareTestCase(TestCase):
         self.assertEqual(data["machineStatus"], "MATCH")
         self.assertIs(data["machineVerified"], True)
         self.assertEqual(data["machineDistance"], 0.12)
+
+    # -------------------------------------------------- 参考照探测接口
+    def test_api_reference_photo_roster(self):
+        from apps.accounts.models import Account
+        from apps.common.authentication import issue_access_token, make_password
+        from apps.common.ids import new_account_id
+
+        recorder = Account.objects.create(
+            id=new_account_id(),
+            username="ref-recorder",
+            roles=["MATCH_RECORDER"],
+            password=make_password("recorder-pass-123"),
+            enabled=True,
+        )
+        token = issue_access_token(recorder)[0]
+        response = self.client.get(
+            f"{BASE}/reference-photo",
+            {"enrollmentId": self.enrollment.id, "athleteId": self.roster.athlete_id},
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+        self.assertEqual(response.status_code, 200, response.content)
+        data = response.json()["data"]
+        self.assertIs(data["available"], True)
+        self.assertEqual(data["source"], "ROSTER")
+        self.assertEqual(data["fileId"], self.reference.id)
+
+    def test_api_reference_photo_person_fallback(self):
+        self.roster.photo_file_id = ""
+        self.roster.save()
+        person = Person.objects.create(
+            person_no="P-FACE-2",
+            full_name="测试球员二",
+            person_category="ATHLETE",
+            photo_file_id=self.reference.id,
+        )
+        out = services.reference_photo(self.enrollment.id, person.pk)
+        self.assertIs(out["available"], True)
+        self.assertEqual(out["source"], "PERSON")
+
+    def test_reference_photo_none(self):
+        self.roster.photo_file_id = ""
+        self.roster.save()
+        out = services.reference_photo(self.enrollment.id, "999999")
+        self.assertIs(out["available"], False)
+        self.assertEqual(out["source"], "NONE")
+        self.assertEqual(out["fileId"], "")
+
+    def test_reference_photo_dangling_file(self):
+        """名单里写了 fileId 但文件记录已删：探测必须判不可用，不能骗前端说可用。"""
+        self.roster.photo_file_id = ""
+        self.roster.save()
+        person = Person.objects.create(
+            person_no="P-FACE-3",
+            full_name="测试球员三",
+            person_category="ATHLETE",
+            photo_file_id="file_gone",
+        )
+        out = services.reference_photo(self.enrollment.id, person.pk)
+        self.assertIs(out["available"], False)
+        self.assertEqual(out["source"], "PERSON")

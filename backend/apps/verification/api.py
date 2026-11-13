@@ -164,6 +164,19 @@ def identity_list_root(request):
 
 
 @router.get(
+    "/identity-checks/reference-photo",
+    operation_id="identityCreate",
+    auth=_auth,
+    response=EnvelopeOut,
+    summary="核验前探测参考照（名单照片 → 人员档案头像）",
+)
+def identity_reference_photo(request, enrollmentId: str, athleteId: str):
+    """记录员无权读取人员档案，故由后端按与比对一致的优先级给出结论。"""
+    actor = require("identityCreate")
+    return ok(services.reference_photo(enrollmentId, athleteId))
+
+
+@router.get(
     "/identity-checks/{identity_check_id}",
     operation_id="identityGet",
     auth=_auth,
