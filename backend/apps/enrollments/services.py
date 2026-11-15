@@ -168,7 +168,7 @@ def _local_team_display(team_id: str) -> dict:
     """成员4 的 Team 主档只补展示字段，不改变 mock 客户端返回的 orgId/城市范围。"""
     from apps.teams.models import Team
 
-    raw = str(team_id or "")
+    raw = team_client.resolve_team_id(team_id)
     if not raw:
         return {}
     queryset = Team.objects.filter(is_deleted=False).select_related("school", "region")
@@ -379,19 +379,22 @@ def get_enrollment(actor, enrollment_id: str) -> dict:
 
 def create_enrollment(actor, payload) -> dict:
     scope.subject_type_allowed(actor, payload.subjectType)
+    # 报名单统一落球队主档 ID：球队端历史参数可能是组织节点 ID，
+    # 直接用会让同一支球队在学校报送/球队报送下被当成两支。
+    team_id = team_client.resolve_team_id(payload.teamId)
     # 关联主档取不到时明确报错，不 or {} 兜底
-    team = team_client.get_team(payload.teamId)
+    team = team_client.get_team(team_id)
     event_config_client.get_event(payload.eventId)
     event_config_client.get_group(payload.eventId, payload.groupId)
     scope.ensure_team_in_scope(actor, team)
     precheck.ensure_window_open(payload.eventId)
-    _ensure_not_duplicate(payload.teamId, payload.groupId)
+    _ensure_not_duplicate(team_id, payload.groupId)
 
     enrollment = Enrollment.objects.create(
         id=new_id("enr"),
         event_id=payload.eventId,
         group_id=payload.groupId,
-        team_id=payload.teamId,
+        team_id=team_id,
         subject_type=payload.subjectType,
         status=STATUS_DRAFT,
         contact_name=payload.contactName,

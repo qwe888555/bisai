@@ -215,6 +215,74 @@ def test_documents_bundle_and_excel_are_masked(client, auth):
     assert "138****0001" in joined
 
 
+def test_statistics_merges_org_team_id_and_team_pk(client, auth, db):
+    """球队组织节点 ID 与 Team.pk 指向同一支队时必须合并，且按球队归属地归市州。
+
+    历史数据里学校报送存 Team.pk、球队报送存 team 组织 ID；两条记录的
+    city_org_id 还可能写错。统计应以球队主档的市州为准，并把同一支队
+    （同组别）只算一次。
+    """
+    from apps.accounts.models import Organization
+    from apps.enrollments.models import STATUS_APPROVED, Enrollment
+    from apps.persons.models import Region, School
+    from apps.teams.models import Team
+
+    province_headers = auth("province")
+    assert Organization.objects.filter(pk="org_team_01", code="TEAM001").exists()
+
+    region = Region.objects.create(name="示例市州", code="CITY01", level=2)
+    school = School.objects.create(
+        name="示例第一中学", code="SCH001", school_type="SENIOR", region=region
+    )
+    # 故意让组织 code（TEAM001）与球队编队号不一致，覆盖演示库的真实情况：
+    # 只能靠同校球队名把 org_team_01 认成这支队。
+    team = Team.objects.create(
+        team_no="T202600000017",
+        name="示例第一中学男子足球队",
+        category_code="U15",
+        region=region,
+        school=school,
+    )
+
+    def add_enrollment(pk: str, team_id: str, group_id: str, submission_no: int):
+        Enrollment.objects.create(
+            id=pk,
+            event_id="event_01",
+            group_id=group_id,
+            team_id=team_id,
+            subject_type="SCHOOL_TEAM",
+            status=STATUS_APPROVED,
+            submission_no=submission_no,
+            contact_name="张老师",
+            # 故意写成另一个市州，验证以球队主档归属地为准
+            city_org_id="org_city_02",
+        )
+
+    # 学校端（Team.pk）与球队端（组织节点）各报一个组别，
+    # 同组别再各报一次，验证合并去重。
+    add_enrollment("enr_pk_u15", str(team.pk), "group_u15", 2)
+    add_enrollment("enr_org_u15", "org_team_01", "group_u15", 1)
+    add_enrollment("enr_org_u12", "org_team_01", "group_u12", 1)
+
+    response = client.get(
+        f"{BASE}/enrollment-statistics?eventId=event_01&dimension=CITY",
+        **province_headers,
+    )
+    assert response.status_code == 200, response.json()
+    rows = response.json()["data"]["items"]
+    assert len(rows) == 1
+    assert rows[0]["key"] == "org_city_01"
+    assert rows[0]["label"] == "示例市州教育局"
+    assert rows[0]["teamCount"] == 1
+    assert rows[0]["enrollmentCount"] == 2
+    assert rows[0]["approvedCount"] == 2
+
+    # 写入侧：组织节点 ID 建单也要落成 Team.pk
+    school_headers = auth("university")
+    created = create_draft(client, school_headers, team_id="org_team_01", group_id="group_u13")
+    assert Enrollment.objects.get(pk=created["id"]).team_id == str(team.pk)
+
+
 def test_statistics_excludes_draft_and_dedups(client, auth):
     school_headers = auth("university")
     other_headers = auth("university2")

@@ -226,6 +226,62 @@ def _city_org_for(team) -> tuple[str, str]:
 
 class TeamClient:
     @staticmethod
+    def resolve_team_id(team_id: str) -> str:
+        """把 TEAM 组织节点 ID 规范为主档 Team.pk；解析不了时原样返回。
+
+        历史/演示数据里报名单的 team_id 可能是组织节点（org_team_01），
+        而球队主档、市州归属、参赛队伍页用的是 Team.pk。统一后再聚合，
+        学校报送与球队报送才会落到同一支球队、同一个市州。
+        """
+        raw = str(team_id or "")
+        if not raw:
+            return raw
+        try:
+            from apps.accounts.models import Organization
+            from apps.teams.models import Team
+
+            # Team.pk 是整型自增：非数字 ID（如 org_team_01）直接跳过主键查询，
+            # 否则 filter(pk="org_team_01") 会抛 ValueError 走进兜底、永不归一。
+            if raw.isdigit() and Team.objects.filter(
+                pk=int(raw), is_deleted=False
+            ).exists():
+                return raw
+            org = Organization.objects.filter(pk=raw, org_type="TEAM").first()
+            if org is not None:
+                team = None
+                if org.code:
+                    team = Team.objects.filter(
+                        team_no=org.code, is_deleted=False
+                    ).first()
+                if team is None:
+                    # 历史 TEAM 组织 code 可能与球队主档不一致（演示库 TEAM001/
+                    # TEAM002），按同校球队名兜底；仅当唯一命中时才采用。
+                    from apps.persons.models import School
+
+                    stem = org.name.strip()
+                    for suffix in ("足球队", "球队", "队"):
+                        if stem.endswith(suffix) and len(stem) > len(suffix):
+                            stem = stem[: -len(suffix)]
+                            break
+                    if stem:
+                        candidates = Team.objects.filter(
+                            name__contains=stem, is_deleted=False
+                        )
+                        parent = org.parent
+                        if parent is not None and parent.org_type == "SCHOOL":
+                            school = School.objects.filter(code=parent.code).first()
+                            if school is not None:
+                                candidates = candidates.filter(school=school)
+                        matched = list(candidates[:2])
+                        if len(matched) == 1:
+                            team = matched[0]
+                if team is not None:
+                    return str(team.pk)
+        except Exception:  # pragma: no cover - 规范化失败不阻断业务
+            logger.debug("球队 ID 规范化失败 team_id=%s", team_id, exc_info=True)
+        return raw
+
+    @staticmethod
     def _real_team(team_id: str) -> Optional[dict[str, Any]]:
         """优先读本库真实球队主档，读不到再走演示数据。"""
         try:
@@ -265,6 +321,8 @@ class TeamClient:
             from apps.common.errors import INVALID_ARGUMENT, ApiError
 
             raise ApiError(INVALID_ARGUMENT, "缺少球队 ID")
+        # 组织节点 ID 先归一到球队主档，保证名称/市州归属与参赛队伍页一致。
+        team_id = self.resolve_team_id(team_id)
         if mock_enabled():
             real = self._real_team(team_id)
             if real is not None:
@@ -371,33 +429,35 @@ class TeamClient:
     def _real_team_ids(org_id: str) -> list[str]:
         """球队 org 节点 parent=org_id 的真实 Team 主档 PK（mock 兜底，异常降级为空）。
 
-        球队账号自身绑定的就是 TEAM 组织节点，其 code 即 Team.team_no，
-        因此也要把本节点映射出的球队算进来，否则本队报名单不可见。
+        球队账号自身绑定的就是 TEAM 组织节点，其 code 通常等于 Team.team_no；
+        历史数据 code 可能对不上，所以统一走 resolve_team_id（含同校名称兜底），
+        否则规范化后的 Team.pk 会被判为「不在账号数据范围内」。
         """
         try:
             from apps.accounts.models import Organization
             from apps.teams.models import Team
 
-            codes = list(
+            team_org_ids = list(
                 Organization.objects.filter(org_type="TEAM", parent_id=org_id).values_list(
-                    "code", flat=True
+                    "pk", flat=True
                 )
             )
-            own_code = (
-                Organization.objects.filter(pk=org_id, org_type="TEAM")
-                .values_list("code", flat=True)
-                .first()
-            )
-            if own_code:
-                codes.append(own_code)
-            if not codes:
+            if Organization.objects.filter(pk=org_id, org_type="TEAM").exists():
+                team_org_ids.append(org_id)
+            if not team_org_ids:
                 return []
-            return [
-                str(pk)
-                for pk in Team.objects.filter(
-                    team_no__in=codes, is_deleted=False
-                ).values_list("pk", flat=True)
-            ]
+            ids: list[str] = []
+            for team_org_id in team_org_ids:
+                resolved = TeamClient.resolve_team_id(team_org_id)
+                if not resolved:
+                    continue
+                if resolved.isdigit() and Team.objects.filter(
+                    pk=int(resolved), is_deleted=False
+                ).exists():
+                    resolved = str(int(resolved))
+                if resolved not in ids:
+                    ids.append(resolved)
+            return ids
         except Exception:
             return []
 
