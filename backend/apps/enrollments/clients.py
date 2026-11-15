@@ -395,23 +395,10 @@ class TeamClient:
             org = Organization.objects.get(pk=org_id)
         except (Organization.DoesNotExist, TypeError, ValueError):
             return []
-        if org.org_type == "TEAM":
-            team = Team.objects.filter(team_no=org.code, is_deleted=False).first()
-            return [str(team.pk)] if team else []
-        if org.org_type in ("SCHOOL", "UNIVERSITY"):
-            codes = list(
-                Organization.objects.filter(parent_id=org.pk, org_type="TEAM").values_list(
-                    "code", flat=True
-                )
-            )
-            if not codes:
-                return []
-            return [
-                str(pk)
-                for pk in Team.objects.filter(
-                    team_no__in=codes, is_deleted=False
-                ).values_list("pk", flat=True)
-            ]
+        if org.org_type in ("TEAM", "SCHOOL", "UNIVERSITY"):
+            # 与写入口径一致：组织节点 code 与 Team.team_no 不一致时，
+            # 仍按同校球队名解析出主档 PK。
+            return self._real_team_ids(org_id)
         # CITY / PROVINCE / ADMIN：省/管理员可见全部；
         # 市州级细化隔离依赖成员4 暴露 org→region 映射，待补
         logger.warning(
