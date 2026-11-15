@@ -82,7 +82,7 @@ GROUP_SPECS_EVENT_01 = [
     ("group_u12", "小学男子组", "PRIMARY", "MALE", 16, 9, 12, 18),
     ("group_u13", "初中男子U13组", "MIDDLE", "MALE", 16, 12, 13, 18),
     ("group_u15", "初中男子组", "MIDDLE", "MALE", 16, 13, 15, 22),
-    ("group_u18", "高中男子组", "MIDDLE", "MALE", 16, 15, 18, 22),
+    ("group_u18", "高中男子组", "HIGH", "MALE", 16, 15, 18, 22),
     ("group_gu12", "小学女子组", "PRIMARY", "FEMALE", 12, 9, 12, 18),
     ("group_gu15", "初中女子组", "MIDDLE", "FEMALE", 12, 13, 15, 22),
 ]

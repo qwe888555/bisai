@@ -43,11 +43,12 @@ EVENT_STATUSES = (
     ("FINISHED", "已结束"),
 )
 
-# 2026-10-28 待决 11 方案二 2a：本项目无"高校组"，组别收敛 PRIMARY/MIDDLE；
-# 历史迁移中的 UNIVERSITY choices 不回改，由 state-only 迁移同步模型状态。
+# 2026-11-15 组别口径最终统一：小学组 / 初中组 / 高中组（PRIMARY/MIDDLE/HIGH）。
+# 本项目无"高校组"；历史 UNIVERSITY choices 不回改，由 state-only 迁移同步模型状态。
 GROUP_CATEGORIES = (
     ("PRIMARY", "小学组"),
     ("MIDDLE", "初中组"),
+    ("HIGH", "高中组"),
 )
 
 GROUP_GENDERS = (

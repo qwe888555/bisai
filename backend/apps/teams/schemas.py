@@ -36,10 +36,9 @@ class TeamCreateBody(StrictSchema):
     """POST /teams 请求体（键名与前端 createTeam payload 一致）。"""
 
     name: str = Field(min_length=1, max_length=100)
-    # 2026-10-28 业务规则：无"高校组"，组别仅 PRIMARY/MIDDLE（原 UNIVERSITY
-    # 高校组在服务端拒绝，不静默转换）；字典 team_category CSV 收敛 BLOCKED
-    # 登记（规则文档待决 11）。
-    groupCategory: Literal["PRIMARY", "MIDDLE"]
+    # 2026-11-15 组别口径最终统一：小学组/初中组/高中组（PRIMARY/MIDDLE/HIGH）；
+    # 本项目无"高校组"，UNIVERSITY 在服务端拒绝，不做静默转换。
+    groupCategory: Literal["PRIMARY", "MIDDLE", "HIGH"]
     schoolOrgId: Optional[str] = Field(None, min_length=1, max_length=64)
     # 2026-11-02 契约对齐（用户管理端全量联调发现）：docs/后端接口文档.md
     # teamCreate 请求表列出 cityOrgId（可选），前端 TeamsView 创建表单也提交
@@ -73,7 +72,7 @@ class TeamUpdateBody(StrictSchema):
     # 契约可选字段（同 teamCreate）：前端编辑未提交，声明以放行；市州随学校
     # 派生，不在此处改绑（改绑需与学校一致性校验，契约未定义该流程）。
     cityOrgId: Optional[str] = Field(None, min_length=1, max_length=64)
-    groupCategory: Optional[Literal["PRIMARY", "MIDDLE"]] = Field(None)  # 回传原值：同 create 无高校组
+    groupCategory: Optional[Literal["PRIMARY", "MIDDLE", "HIGH"]] = Field(None)  # 回传原值：同 create 无高校组
     version: int = Field(ge=0)
 
 

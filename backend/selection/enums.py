@@ -4,12 +4,15 @@ from .common import BusinessError
 
 
 class GroupType:
-    MIDDLE = "MIDDLE"
     PRIMARY = "PRIMARY"
+    MIDDLE = "MIDDLE"
+    HIGH = "HIGH"
 
+    # 2026-11-15 组别口径统一为小学组/初中组/高中组；MIDDLE 不再代表整个中学段。
     CHOICES = (
-        (MIDDLE, "中学组"),
         (PRIMARY, "小学组"),
+        (MIDDLE, "初中组"),
+        (HIGH, "高中组"),
     )
     LABELS = dict(CHOICES)
 
@@ -25,7 +28,7 @@ class GroupType:
             raise BusinessError(
                 400,
                 f"不支持的{field_name}: {value}"
-                "（可选 MIDDLE/PRIMARY）",
+                "（可选 PRIMARY/MIDDLE/HIGH）",
             )
         return code
 
@@ -72,11 +75,14 @@ for _code, _label in GroupType.CHOICES:
 
 GroupType._ALIASES.update(
     {
+        # “中学/中学组”为历史口径，含义不明确；保留兼容时按初中处理，
+        # 新客户端应使用 小学组/初中组/高中组。
         "中学": GroupType.MIDDLE,
+        "中学组": GroupType.MIDDLE,
         "初中组": GroupType.MIDDLE,
         "初中": GroupType.MIDDLE,
-        "高中组": GroupType.MIDDLE,
-        "高中": GroupType.MIDDLE,
+        "高中组": GroupType.HIGH,
+        "高中": GroupType.HIGH,
         "小学": GroupType.PRIMARY,
         "小学组": GroupType.PRIMARY,
     }

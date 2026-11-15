@@ -18,10 +18,9 @@ from . import display
 from .models import event_category_label
 
 EventStatus = Literal["DRAFT", "REGISTRATION_OPEN", "REGISTRATION_CLOSED", "RUNNING", "FINISHED"]
-# 2026-10-28 业务规则：本项目无"高校组"，学段仅小学/初中/高中（PRIMARY/MIDDLE）；
-# 原 UNIVERSITY"高校组"值在服务端（schema 层）明确拒绝，不做静默转换。
-# 模型 GROUP_CATEGORIES choices 的收敛涉迁移，BLOCKED 登记（规则文档待决 11）。
-GroupCategory = Literal["PRIMARY", "MIDDLE"]
+# 2026-11-15 组别口径最终统一：小学组/初中组/高中组（PRIMARY/MIDDLE/HIGH）；
+# 本项目无"高校组"，原 UNIVERSITY 值在服务端（schema 层）明确拒绝，不做静默转换。
+GroupCategory = Literal["PRIMARY", "MIDDLE", "HIGH"]
 GroupGender = Literal["MALE", "FEMALE", "MIXED"]
 
 

@@ -1,13 +1,13 @@
-"""2026-10-28"高校组"清理回归：学段/组别值域服务端收敛。
+"""组别值域回归：小学组/初中组/高中组，无"高校组"。
 
-业务规则（已裁定）：本项目没有"高校组"，学段/组别仅小学/初中/高中
-（PRIMARY/MIDDLE，高中口径=MIDDLE 初中段，详见规则文档待决 11）；
-服务端在 schema 层明确拒绝 UNIVERSITY，不做静默转换。覆盖：
+业务规则（2026-11-15 最终裁定）：本项目没有"高校组"，组别统一为
+小学组/初中组/高中组（PRIMARY/MIDDLE/HIGH）；服务端在 schema 层明确
+拒绝 UNIVERSITY，不做静默转换。覆盖：
 
-1. events 组别 GroupCategory：PRIMARY/MIDDLE 合法、UNIVERSITY 拒绝；
+1. events 组别 GroupCategory：PRIMARY/MIDDLE/HIGH 合法、UNIVERSITY 拒绝；
 2. enrollments 报名 subjectType（创建/更新）：SCHOOL_TEAM/CITY 合法、
    UNIVERSITY 拒绝；读侧过滤保留 UNIVERSITY（历史数据兼容）；
-3. teams groupCategory（创建/更新回传）：PRIMARY/MIDDLE 合法、UNIVERSITY 拒绝；
+3. teams groupCategory（创建/更新回传）：PRIMARY/MIDDLE/HIGH 合法、UNIVERSITY 拒绝；
 4. 服务层 scope.subject_type_allowed：SCHOOL_TEAM 放行、
    UNIVERSITY 报送被拒、非学校端角色被拒。
 
@@ -39,9 +39,10 @@ class EventGroupCategoryRuleTests(TestCase):
     def setUp(self):
         self.adapter = TypeAdapter(evt_schemas.GroupCategory)
 
-    def test_primary_and_middle_are_valid(self):
+    def test_primary_middle_and_high_are_valid(self):
         self.assertEqual(self.adapter.validate_python("PRIMARY"), "PRIMARY")
         self.assertEqual(self.adapter.validate_python("MIDDLE"), "MIDDLE")
+        self.assertEqual(self.adapter.validate_python("HIGH"), "HIGH")
 
     def test_university_group_is_rejected(self):
         for bad in ("UNIVERSITY", "HIGHER", "高校组", "university"):
@@ -91,12 +92,12 @@ class TeamGroupCategoryRuleTests(TestCase):
     def _create_payload(self, category):
         return {"name": "测试队", "groupCategory": category}
 
-    def test_primary_and_middle_are_valid(self):
-        for cat in ("PRIMARY", "MIDDLE"):
+    def test_primary_middle_and_high_are_valid(self):
+        for cat in ("PRIMARY", "MIDDLE", "HIGH"):
             body = team_schemas.TeamCreateBody(**self._create_payload(cat))
             self.assertEqual(body.groupCategory, cat)
-        update = {"groupCategory": "MIDDLE", "version": 0}
-        self.assertEqual(team_schemas.TeamUpdateBody(**update).groupCategory, "MIDDLE")
+        update = {"groupCategory": "HIGH", "version": 0}
+        self.assertEqual(team_schemas.TeamUpdateBody(**update).groupCategory, "HIGH")
 
     def test_university_group_is_rejected(self):
         for bad in ("UNIVERSITY", "高校组", "HIGHER"):
@@ -137,7 +138,8 @@ class ModelChoicesConvergenceTests(TestCase):
         from apps.events import models as evt_models
 
         self.assertEqual(
-            dict(evt_models.GROUP_CATEGORIES), {"PRIMARY": "小学组", "MIDDLE": "初中组"}
+            dict(evt_models.GROUP_CATEGORIES),
+            {"PRIMARY": "小学组", "MIDDLE": "初中组", "HIGH": "高中组"},
         )
         self.assertNotIn("UNIVERSITY", dict(evt_models.GROUP_CATEGORIES))
 

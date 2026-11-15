@@ -102,7 +102,7 @@ class PublicityApiTests(TestCase):
         self.assertEqual(data["action"], "published")
         self.assertEqual(data["name"], "张伟")
         self.assertEqual(data["group_type"], "MIDDLE")
-        self.assertEqual(data["group_type_label"], "中学组")
+        self.assertEqual(data["group_type_label"], "初中组")
         self.assertEqual(data["publicity_type_label"], "运动员")
         self.assertEqual(data["city"], "江城市")
         self.assertEqual(
