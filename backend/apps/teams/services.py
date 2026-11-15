@@ -50,7 +50,7 @@ from apps.common.permissions import TEAM
 from apps.common.scopes import (
     account_org_code,
     ensure_org_in_scope,
-    is_global_admin,
+    is_admin,
     visible_school_codes,
 )
 from apps.teams.models import Team, TeamCoach, TeamMember, TeamTransfer
@@ -85,13 +85,13 @@ def visible_teams(
 ) -> QuerySet[Team]:
     """当前账号可见的球队（未软删）；无任何范围 → 403 DATA_SCOPE_DENIED。
 
-    - 无组织的全局管理员：全量；
+    - 管理员（含挂组织的系统管理员）：全量，避免建赛时队伍下拉为空；
     - roles 含 TEAM：仅 team_no=账号组织节点 code 的本队，org code 为空拒绝；
     - 其余：组织子树内学校类组织的 code 过滤 school（org.code=School.code），
       可见学校集合为空 → 403（保持原范围拒绝语义，不静默返回空列表）。
     """
     qs = queryset if queryset is not None else _team_queryset()
-    if is_global_admin(account):
+    if is_admin(account):
         return qs
     if TEAM in (getattr(account, "roles", ()) or ()):
         code = account_org_code(account)
@@ -484,7 +484,11 @@ def update_team(team_id: str, payload: dict, account) -> Team:
     changed = False
     for src, dst in mapping.items():
         if src in payload:
-            setattr(team, dst, payload[src])
+            value = payload[src]
+            # 图片字段显式传空串 = 移除队徽/队旗/合影，统一落 NULL。
+            if dst.endswith("_file_id") and not value:
+                value = None
+            setattr(team, dst, value)
             changed = True
     if changed:
         team.save()

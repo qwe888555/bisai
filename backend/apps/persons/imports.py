@@ -28,6 +28,7 @@ from apps.common.errors import (
     ApiError,
 )
 from apps.common.ids import new_id
+from apps.common.id_card import valid_id_number
 
 from . import services
 from .models import Person, PersonImportBatch, School
@@ -60,17 +61,6 @@ _GENDER_MAP = {
     "未指定": "UNSPECIFIED",
     "UNSPECIFIED": "UNSPECIFIED",
 }
-_WEIGHTS = (7, 9, 10, 5, 8, 4, 2, 1, 6, 3, 7, 9, 10, 5, 8, 4, 2)
-_CHECK_CODES = "10X98765432"
-
-
-def valid_id_number(value: str) -> bool:
-    """18 位身份证 + ISO 7064 MOD 11-2 校验位。"""
-    text = (value or "").strip().upper()
-    if not re.fullmatch(r"\d{17}[\dX]", text):
-        return False
-    total = sum(int(text[index]) * _WEIGHTS[index] for index in range(17))
-    return _CHECK_CODES[total % 11] == text[17]
 
 
 def render_template() -> bytes:

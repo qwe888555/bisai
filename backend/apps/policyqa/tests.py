@@ -58,6 +58,18 @@ class DisabledAnswerTests(TestCase):
         self.assertEqual(result["status"], "DISABLED")
         self.assertEqual(result["fallbackPolicies"], [])
 
+    def test_platform_material_question_answers_with_platform_rule(self):
+        result = answer("报名需要交什么材料")
+        self.assertEqual(result["status"], "ANSWERED")
+        self.assertEqual(result["answerMode"], "GENERAL")
+        self.assertIn("学籍证明", result["answer"])
+        self.assertEqual(result["citations"], [])
+
+    def test_policy_document_material_question_still_uses_policy(self):
+        _enabled_document()
+        result = answer("政策文件规定报名要交哪些材料")
+        self.assertEqual(result["status"], "DISABLED")
+
     def test_disabled_still_rejects_personal_info(self):
         _enabled_document()
         with self.assertRaises(ApiError) as caught:

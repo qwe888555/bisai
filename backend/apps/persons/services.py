@@ -1145,7 +1145,7 @@ def _ensure_school_in_operator_scope(school_org_id, account, *, required: bool) 
 
 
 def create_person(payload: dict, account):
-    """POST /people：创建人员主档（DRAFT 起步）+ 变更留痕。
+    """POST /people：创建人员主档（管理员直接通过，其余 DRAFT 起步）+ 变更留痕。
 
     - kinds 方案C：person_category 存主类别（首项），按类别建扩展档案行；
     - idNumber 一期必填（服务层）：冻结 id_card_hash 无 NULL 且唯一含软删行；
@@ -1180,6 +1180,10 @@ def create_person(payload: dict, account):
     if not (payload.get("gender") or "").strip():
         gender_value = raw_gender if raw_gender is not None else enums.Gender.UNKNOWN
 
+    from apps.common.scopes import is_admin
+
+    # 系统管理员代表管理端直接建档，档案立即生效；其他角色仍走提交审核流程。
+    initial_status = enums.AuditStatus.APPROVED if is_admin(account) else enums.AuditStatus.DRAFT
     with transaction.atomic():
         person = Person(
             full_name=payload["realName"].strip(),
@@ -1193,7 +1197,7 @@ def create_person(payload: dict, account):
             school=school,
             photo_file_id=avatar,
             education=(payload.get("education") or "").strip() or None,
-            audit_status=enums.AuditStatus.DRAFT,
+            audit_status=initial_status,
             status=enums.EnableStatus.ACTIVE,
         )
         person.save()
@@ -1271,10 +1275,13 @@ def update_person(person_id: str, payload: dict, account):
         if school is not None:
             track("school", person.school_id, school.pk)
             person.school = school
-        avatar = _resolve_avatar_file(payload.get("avatarFileId"))
-        if avatar is not None:
-            track("photoFileId", person.photo_file_id, avatar)
-            person.photo_file_id = avatar
+        # avatarFileId：未传=保留；显式传空串=移除头像（前端“移除头像”按钮）。
+        if "avatarFileId" in payload:
+            raw_avatar = (payload.get("avatarFileId") or "").strip()
+            avatar = _resolve_avatar_file(raw_avatar) if raw_avatar else None
+            if avatar != person.photo_file_id:
+                track("photoFileId", person.photo_file_id, avatar)
+                person.photo_file_id = avatar
         # education：未传（None）→ 保留原值（编辑表单缺省不丢数据）；
         # 传值（含空串）→ 覆盖写入（表单有输入框，可主动清空）
         education_value = payload.get("education")

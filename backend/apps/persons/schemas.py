@@ -12,7 +12,7 @@ from datetime import date
 from typing import Literal, Optional
 
 from django.core.exceptions import ObjectDoesNotExist
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from apps.common import crypto
 from apps.common.schemas import StrictSchema
@@ -257,6 +257,20 @@ class PersonCreate(StrictSchema):
     education: Optional[str] = Field(None, max_length=100)
     coachCategory: Optional[str] = Field(None, max_length=64)
 
+    @model_validator(mode="after")
+    def _check_personal_info(self):
+        if self.birthDate is not None and self.birthDate > date.today():
+            raise ValueError("出生日期不能晚于今天")
+        if self.idNumber:
+            text = self.idNumber.upper()
+            try:
+                born = date(int(text[6:10]), int(text[10:12]), int(text[12:14]))
+            except ValueError:
+                raise ValueError("身份证号中的出生日期不合法") from None
+            if born < date(1900, 1, 1) or born > date.today():
+                raise ValueError("身份证号中的出生日期不合法")
+        return self
+
 
 class PersonUpdate(StrictSchema):
     """PUT /people/{id} 更新（前端编辑表单不含 idNumber/phone 输入，L370 仅新建显示）。
@@ -277,12 +291,18 @@ class PersonUpdate(StrictSchema):
     gender: Optional[str] = Field(None, max_length=20)
     birthDate: Optional[date] = None
     schoolOrgId: Optional[str] = Field(None, min_length=1, max_length=64)
-    avatarFileId: Optional[str] = Field(None, min_length=1, max_length=64)
+    avatarFileId: Optional[str] = Field(None, max_length=64)
     phone: Optional[str] = Field(None, min_length=11, max_length=11, pattern=r"^1[3-9]\d{9}$")
     education: Optional[str] = Field(None, max_length=100)
     coachCategory: Optional[str] = Field(None, max_length=64)
     changeReason: Optional[str] = Field(None, max_length=200)
     version: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def _check_birth_date(self):
+        if self.birthDate is not None and self.birthDate > date.today():
+            raise ValueError("出生日期不能晚于今天")
+        return self
 
 
 class MyProfileUpdate(StrictSchema):

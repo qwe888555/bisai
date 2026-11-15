@@ -10,13 +10,14 @@ from ninja import Router
 
 from apps.common.authentication import JWTAuth
 from apps.common.envelope import action_result, ok
-from apps.common.errors import NOT_FOUND, ApiError
+from apps.common.errors import INVALID_ARGUMENT, NOT_FOUND, ApiError
 from apps.common.pagination import paginate
-from apps.common.permissions import ALL_ROLES, register_operation, require
+from apps.common.permissions import ADMIN, ALL_ROLES, register_operation, require
 from apps.common.schemas import EnvelopeOut
 from apps.common.versioning import bump
 
-from .models import Message
+from .models import Message, push_message
+from .schemas import MessagePublishIn
 
 router = Router(tags=["notices"])
 _auth = JWTAuth()
@@ -24,6 +25,18 @@ _auth = JWTAuth()
 register_operation("messageList", ALL_ROLES)
 register_operation("messageGet", ALL_ROLES)
 register_operation("messageRead", ALL_ROLES)
+register_operation("messagePublish", [ADMIN])
+
+_VALID_ROLES = {
+    "TEAM",
+    "UNIVERSITY",
+    "CITY",
+    "PROVINCE_REVIEWER",
+    "ATHLETE",
+    "COACH",
+    "ADMIN",
+    "MATCH_RECORDER",
+}
 
 
 def _message_out(message: Message) -> dict:
@@ -99,3 +112,31 @@ def message_read(request, message_id: str):
         bump(message)
         message.save()
     return action_result(True, message.pk, message.version)
+
+
+@router.post(
+    "/messages",
+    operation_id="messagePublish",
+    auth=_auth,
+    response=EnvelopeOut,
+    summary="管理员群发系统消息",
+)
+def message_publish(request, payload: MessagePublishIn):
+    require("messagePublish")
+    from apps.accounts.models import Account
+
+    roles = {role.strip().upper() for role in (payload.roles or []) if role.strip()}
+    invalid = roles - _VALID_ROLES
+    if invalid:
+        raise ApiError(INVALID_ARGUMENT, f"未知的接收角色：{', '.join(sorted(invalid))}")
+
+    title = payload.title.strip()
+    body = payload.body.strip()
+    recipients = 0
+    for account_id, account_roles in Account.objects.filter(enabled=True).values_list("pk", "roles"):
+        if roles and not roles.intersection({role.upper() for role in (account_roles or [])}):
+            continue
+        push_message(account_id, title, body, "SYSTEM")
+        recipients += 1
+
+    return ok({"count": recipients})

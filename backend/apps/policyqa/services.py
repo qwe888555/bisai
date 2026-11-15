@@ -179,6 +179,10 @@ def _ask_model(question: str, documents: list[PolicyDocument]) -> Optional[str]:
             "content": (
                 "你是省级中小学足球赛事系统的政策问答助手。"
                 "只能依据提供的政策原文回答，不得编造、不得推测。"
+                "但涉及平台报名办理（怎么报名、要交哪些材料、在哪个入口）时，"
+                "以平台实际规则优先：平台为在线填报，报名附件只有球队报名表与名单（盖章）、学籍证明两类，"
+                "体检表、保险单、照片、户籍等不是平台在线报名必交项；"
+                "不要把政策文件中的材料清单整段当作平台必交材料，政策原文只作补充依据。"
                 "如果原文不足以回答，只回复：NO_EVIDENCE"
             ),
         },
@@ -229,11 +233,35 @@ _GENERAL_SYSTEM = (
     "账号由上级账号签发邀请后注册，人员主档由学校维护；"
     "材料在材料中心上传，审核结果和通知在消息中心查看；"
     "本人可在个人中心修改密码，忘记密码需联系上级账号或管理员重置。"
+    "平台报名是在线填报，不需要提交纸质件；报名附件只有球队报名表与名单（盖章）、学籍证明两类，"
+    "体检表、保险单、照片、户籍等不是平台在线报名必交项，赛事另有要求的以组别配置和平台通知为准。"
     "除此之外不要臆造功能入口、按钮位置或流程细节，不确定就提示联系上级账号或管理员。"
     "涉及赛事政策条款、报名资格、时间节点、名额和审核结论时，只说明“请以平台发布的政策原文为准”，"
     "不得编造具体条款、日期、数字或结论。"
     "语气友好，简体中文，200 字以内，不使用表情符号；不知道就直接说不知道。"
 )
+
+# 用户在问“平台报名要交什么材料”：按平台实际办理规则作答，
+# 不能把政策文件里的材料清单整段搬过来（政策要求 ≠ 平台在线报名必交项）。
+_PLATFORM_MATERIAL_QUESTION = re.compile(
+    r"(报名|参赛|注册).{0,10}(材料|资料|证件|东西|交什么|提交什么)"
+    r"|(材料|资料).{0,10}(报名|参赛|注册)"
+)
+_POLICY_DOC_HINT = re.compile(r"政策|规程|文件|条款|办法|第[一二三四五六七八九十\d]+条")
+
+
+def _platform_enrollment_answer() -> str:
+    from apps.enrollments.models import MATERIAL_TYPES
+
+    attachments = "、".join(label for _, label in MATERIAL_TYPES)
+    return (
+        "平台在线报名不需要提交政策文件里列的全部纸质材料。实际只需两步：\n"
+        "1. 在报名单中填写赛事、组别、参赛球队和领队联系方式；\n"
+        f"2. 上传报名附件：{attachments}。\n"
+        "体检表、保险单、照片、户籍等不是平台在线报名的必交项；"
+        "如该赛事另有要求，以组别配置和平台通知为准。"
+    )
+
 
 
 def _ask_general(question: str) -> Optional[str]:
@@ -296,6 +324,20 @@ def _general_result(question: str, fallback: list[dict[str, Any]]) -> dict[str, 
 
 def answer(question: str, event_id: Optional[str] = None, season: Optional[str] = None) -> dict[str, Any]:
     _reject_personal_info(question)
+
+    # 平台报名材料类问题：优先按平台实际办理规则回答，避免模型把政策条款里的
+    # 体检、保险、照片等材料清单当成平台必交项。明确在问政策条款时仍走政策检索。
+    if _PLATFORM_MATERIAL_QUESTION.search(question) and not _POLICY_DOC_HINT.search(question):
+        return {
+            "status": "ANSWERED",
+            "answer": _platform_enrollment_answer(),
+            "answerMode": "GENERAL",
+            "notice": "该答复为平台办理规则说明，未引用政策条款；政策与报名要求以平台发布为准。",
+            "citations": [],
+            "fallbackPolicies": [],
+            "aiGenerated": False,
+            "requestId": get_request_id(),
+        }
 
     documents = _candidate_documents(event_id, season)
     ranked = _rank(question, documents)

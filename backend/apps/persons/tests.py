@@ -1383,7 +1383,7 @@ class PeopleWriteApiTests(TestCase):
         self.assertEqual(data["kinds"], ["ATHLETE"])
         self.assertEqual(data["maskedIdNumber"], "110101********1234")
         self.assertEqual(data["maskedPhone"], "138****1111")
-        self.assertEqual(data["reviewStatus"], "DRAFT")
+        self.assertEqual(data["reviewStatus"], "APPROVED")
         self.assertEqual(data["schoolOrgId"], str(self.org_school.pk))
         # 身份证解析（DDL birth_date 注释口径）：第7-14位出生、第17位奇→男
         self.assertEqual(data["birthDate"], "2013-05-01")
