@@ -1253,8 +1253,27 @@ def _result_news_title(match) -> str:
     return f"赛果：{home} {hs}:{as_} {away}"
 
 
-def _result_news_body(match, event_name: str, title: str) -> tuple[str, str]:
-    """生成自动赛果快讯正文：比分 + 进球名单 + 红黄牌，返回 (html, 纯文本)。"""
+def _result_news_summary(event_name: str, scorer_names: list[str], card_count: int) -> str:
+    """赛果快讯摘要：赛事名 + 进球球员 + 红黄牌。
+
+    早期实现直接把标题拼进来（f"{title}（{event_name}）"），导致门户卡片上
+    标题与摘要两行内容几乎一致、重复显示。摘要改为补足标题没有的信息。
+    """
+    parts = [event_name]
+    if scorer_names:
+        names = "、".join(scorer_names[:5])
+        if len(scorer_names) > 5:
+            names += f" 等 {len(scorer_names)} 人"
+        parts.append(f"进球球员：{names}")
+    else:
+        parts.append("本场未产生进球")
+    if card_count:
+        parts.append(f"红黄牌 {card_count} 张")
+    return " · ".join(parts)[:300]
+
+
+def _result_news_body(match, event_name: str, title: str) -> tuple[str, str, str]:
+    """生成自动赛果快讯正文：比分 + 进球名单 + 红黄牌，返回 (html, 纯文本, 摘要)。"""
     from .models import MatchEvent
 
     events = list(MatchEvent.objects.filter(match_id=match.pk))
@@ -1312,7 +1331,16 @@ def _result_news_body(match, event_name: str, title: str) -> tuple[str, str]:
     body_text = title
     if scorer_names:
         body_text += f"。进球球员：{'、'.join(scorer_names)}"
-    return "".join(parts), body_text
+    summary = _result_news_summary(event_name, scorer_names, len(card_items))
+    return "".join(parts), body_text, summary
+
+
+def result_news_summary(match) -> str:
+    """按比赛现有记录计算赛果快讯摘要（供修复历史数据复用）。"""
+    event_name = display.event_name(match.event_id, match.event_id)
+    title = _result_news_title(match)
+    _, _, summary = _result_news_body(match, event_name, title)
+    return summary
 
 
 def _sync_result_news(match) -> None:
@@ -1326,8 +1354,7 @@ def _sync_result_news(match) -> None:
 
     event_name = display.event_name(match.event_id, match.event_id)
     title = _result_news_title(match)
-    summary = f"{title}（{event_name}）"
-    body_html, body_text = _result_news_body(match, event_name, title)
+    body_html, body_text, summary = _result_news_body(match, event_name, title)
     content = Content.objects.filter(source_match_id=match.pk).first()
     if content is None:
         Content.objects.create(
