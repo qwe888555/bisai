@@ -51,6 +51,7 @@ from apps.common.scopes import (
     account_org_code,
     ensure_org_in_scope,
     is_admin,
+    is_global_admin,
     visible_school_codes,
 )
 from apps.teams.models import Team, TeamCoach, TeamMember, TeamTransfer

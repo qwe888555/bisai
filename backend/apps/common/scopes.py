@@ -63,23 +63,33 @@ def account_org_id(account) -> str:
 
 
 def _subtree_ids(org_id: str) -> list[str]:
-    """自顶向下收集 org_id 及其所有后代（含软删过滤）。"""
+    """自顶向下收集 org_id 及其所有后代（含软删过滤）。
+
+    一次读出组织树后在内存展开：远端库单次查询约 40ms，逐节点
+    ``exists()`` + ``parent_id`` 查询在组织节点多时会把一次列表请求拖成
+    一两秒（14 个节点 = 28 次查询）。组织表规模很小，整表读入更划算。
+    """
     from apps.accounts.models import Organization
+
+    children: dict[str, list[str]] = {}
+    known: set[str] = set()
+    for pk, parent_id in Organization.objects.values_list("id", "parent_id"):
+        known.add(pk)
+        if parent_id:
+            children.setdefault(parent_id, []).append(pk)
+    if org_id not in known:
+        return []
 
     ids: list[str] = []
     seen: set[str] = set()
     queue = [org_id]
     while queue:
         current = queue.pop()
-        if not current or current in seen:
-            continue
-        if not Organization.objects.filter(pk=current).exists():
+        if current in seen:
             continue
         seen.add(current)
         ids.append(current)
-        queue.extend(
-            Organization.objects.filter(parent_id=current).values_list("id", flat=True)
-        )
+        queue.extend(children.get(current, ()))
     return ids
 
 

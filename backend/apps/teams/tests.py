@@ -165,7 +165,9 @@ class TeamApiTests(TestCase):
             category_code="MIDDLE",
         )
         cls.team_soft = Team.objects.create(
-            team_no="T202600000009",
+            # 不能占用 T+年份+8位自增 ID 可能生成到的编号（曾用 …000009，
+            # 自增主键走到 9 时创建球队会撞 uk_team_no 而使用例随执行顺序失败）
+            team_no="T202600009999",
             name="已删队",
             category_code="PRIMARY",
             school=cls.school,

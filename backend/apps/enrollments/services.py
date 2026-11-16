@@ -7,6 +7,9 @@
 from __future__ import annotations
 
 import json
+import sys
+import threading
+import time
 from typing import Any, Optional
 
 from django.core.serializers.json import DjangoJSONEncoder
@@ -61,6 +64,34 @@ from .models import (
 )
 
 # ---------------------------------------------------------------- 序列化
+
+# 展示名短 TTL 缓存：数据库在远端，单次查询约 40ms，而列表页此前逐行重复
+# 查询球队/赛事/组别/市州名（10 行约 170 次查询，首屏 8 秒以上，并发时极易
+# 触发前端 20s 超时报「网络异常」）。这里只缓存只读展示字段，写路径不经过
+# 缓存；60 秒 TTL 保证球队/赛事改名后最多延迟一分钟生效。
+_DISPLAY_CACHE_TTL = 60.0
+_display_cache: dict[tuple, tuple[float, Any]] = {}
+_display_cache_lock = threading.Lock()
+
+
+def _cached_display(key: tuple, factory):
+    # 测试套件在同一进程内反复建库/改名，缓存会串数据，直接绕过。
+    if any(arg in ("test", "pytest") for arg in sys.argv):
+        return factory()
+    now = time.monotonic()
+    with _display_cache_lock:
+        hit = _display_cache.get(key)
+        if hit is not None and hit[0] > now:
+            return hit[1]
+    value = factory()
+    with _display_cache_lock:
+        _display_cache[key] = (now + _DISPLAY_CACHE_TTL, value)
+    return value
+
+
+def _team_info(team_id: str) -> dict:
+    cached = _cached_display(("team", str(team_id)), lambda: team_client.get_team(team_id))
+    return dict(cached)
 
 
 def _latest_snapshot(enrollment: Enrollment) -> Optional[EnrollmentSnapshot]:
@@ -134,54 +165,67 @@ def to_review(record) -> dict:
 
 def _event_display_names(enrollment: Enrollment) -> tuple[str, str]:
     """赛事/组别名：优先取成员5 events 主档，联调期回退赛事配置客户端。"""
-    from apps.events import display as event_display
+    key = ("event_group", str(enrollment.event_id), str(enrollment.group_id))
 
-    event = event_display.event_name(enrollment.event_id, "")
-    group = event_display.group_name(enrollment.group_id, "")
-    if event and group:
-        return event, group
-    from .clients import mock_enabled
+    def resolve() -> tuple[str, str]:
+        from apps.events import display as event_display
 
-    if mock_enabled():
-        try:
-            event = event or event_config_client.get_event(enrollment.event_id).get("name") or ""
-        except Exception:  # noqa: BLE001 - 展示名缺失不应阻断报名列表
-            event = ""
-        try:
-            group = group or event_config_client.get_group(
-                enrollment.event_id, enrollment.group_id
-            ).get("name") or ""
-        except Exception:  # noqa: BLE001
-            group = ""
-    return event or enrollment.event_id, group or enrollment.group_id
+        event = event_display.event_name(enrollment.event_id, "")
+        group = event_display.group_name(enrollment.group_id, "")
+        if event and group:
+            return event, group
+        from .clients import mock_enabled
+
+        if mock_enabled():
+            try:
+                event = event or event_config_client.get_event(enrollment.event_id).get("name") or ""
+            except Exception:  # noqa: BLE001 - 展示名缺失不应阻断报名列表
+                event = ""
+            try:
+                group = group or event_config_client.get_group(
+                    enrollment.event_id, enrollment.group_id
+                ).get("name") or ""
+            except Exception:  # noqa: BLE001
+                group = ""
+        return event or enrollment.event_id, group or enrollment.group_id
+
+    return _cached_display(key, resolve)
 
 
 def _org_display_name(org_id: str) -> str:
     if not org_id:
         return ""
-    from apps.accounts.models import Organization
 
-    return Organization.objects.filter(pk=org_id).values_list("name", flat=True).first() or ""
+    def resolve() -> str:
+        from apps.accounts.models import Organization
+
+        return Organization.objects.filter(pk=org_id).values_list("name", flat=True).first() or ""
+
+    return _cached_display(("org", str(org_id)), resolve)
 
 
 def _local_team_display(team_id: str) -> dict:
     """成员4 的 Team 主档只补展示字段，不改变 mock 客户端返回的 orgId/城市范围。"""
-    from apps.teams.models import Team
 
-    raw = team_client.resolve_team_id(team_id)
-    if not raw:
-        return {}
-    queryset = Team.objects.filter(is_deleted=False).select_related("school", "region")
-    team = queryset.filter(pk=int(raw)).first() if raw.isdigit() else None
-    if team is None:
-        team = queryset.filter(team_no=raw).first()
-    if team is None:
-        return {}
-    return {
-        "name": team.name,
-        "schoolName": team.school.name if team.school_id else "",
-        "cityName": team.region.name if team.region_id else "",
-    }
+    def resolve() -> dict:
+        from apps.teams.models import Team
+
+        raw = team_client.resolve_team_id(team_id)
+        if not raw:
+            return {}
+        queryset = Team.objects.filter(is_deleted=False).select_related("school", "region")
+        team = queryset.filter(pk=int(raw)).first() if raw.isdigit() else None
+        if team is None:
+            team = queryset.filter(team_no=raw).first()
+        if team is None:
+            return {}
+        return {
+            "name": team.name,
+            "schoolName": team.school.name if team.school_id else "",
+            "cityName": team.region.name if team.region_id else "",
+        }
+
+    return dict(_cached_display(("local_team", str(team_id)), resolve))
 
 
 def _resolve_player_count(enrollment: Enrollment, player_count: Optional[int]) -> int:
@@ -196,7 +240,7 @@ def _resolve_player_count(enrollment: Enrollment, player_count: Optional[int]) -
 def to_summary(
     enrollment: Enrollment, player_count: Optional[int] = None
 ) -> dict:
-    team = team_client.get_team(enrollment.team_id)
+    team = _team_info(enrollment.team_id)
     local_team = _local_team_display(enrollment.team_id)
     event_name, group_name = _event_display_names(enrollment)
     snapshot = _latest_snapshot(enrollment)
