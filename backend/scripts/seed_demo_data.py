@@ -531,16 +531,22 @@ def seed_persons_and_teams() -> list[dict]:
 
 
 def seed_events_and_groups() -> dict[str, EventGroup]:
+    # 报名窗口同样按“距今”生成：写死日期会让演示赛事过一段时间自动变成“报名截止”，
+    # 门户上的报名入口随之消失。
+    league_reg_closes = _kickoff(days=45, hour=23)
     event_01, _ = Event.objects.update_or_create(
         id=EVENT_01,
         defaults={
             "name": "2026年四川省中小学足球联赛",
             "season": "2026",
             "event_category": "SCHOOL_LEAGUE",
-            "registration_opens_at": _aware(2026, 9, 1),
-            "registration_closes_at": _aware(2026, 12, 31, 23, 59),
+            "registration_opens_at": _kickoff(days=-76, hour=0),
+            "registration_closes_at": league_reg_closes,
             "status": "RUNNING",
-            "description": "省级中小学足球联赛（演示数据）：报名通道开放至 2026-12-31，比赛进行中。",
+            "description": (
+                "省级中小学足球联赛（演示数据）：报名通道开放至 "
+                f"{timezone.localtime(league_reg_closes):%Y-%m-%d}，比赛进行中。"
+            ),
         },
     )
     Event.objects.update_or_create(
@@ -549,8 +555,8 @@ def seed_events_and_groups() -> dict[str, EventGroup]:
             "name": "2026年四川省青少年足球锦标赛",
             "season": "2026",
             "event_category": "CHAMPIONSHIP",
-            "registration_opens_at": _aware(2026, 11, 1),
-            "registration_closes_at": _aware(2027, 1, 15, 23, 59),
+            "registration_opens_at": _kickoff(days=-15, hour=0),
+            "registration_closes_at": _kickoff(days=60, hour=23),
             "status": "DRAFT",
             "description": "青少年足球锦标赛（演示数据）：筹备中，报名尚未开始。",
         },
@@ -586,6 +592,25 @@ def _aware(year: int, month: int, day: int, hour: int = 0, minute: int = 0) -> d
     return timezone.make_aware(datetime(year, month, day, hour, minute))
 
 
+def _kickoff(
+    *,
+    days: float = 0,
+    hours: float = 0,
+    minutes: float = 0,
+    hour: int | None = None,
+) -> datetime:
+    """相对当前时间生成开球时间，避免演示赛程写死日期。
+
+    写死年月日的赛程过几天就全部变成“已结束”，门户首页与赛程页也就没有
+    未开赛/进行中的比赛可展示。这里按“距今多少天/小时”推算：
+    days 为负数表示已经踢完，hour 指定当地整点（不指定则保留当前时刻）。
+    """
+    moment = timezone.localtime(timezone.now()) + timedelta(days=days, hours=hours, minutes=minutes)
+    if hour is not None:
+        moment = moment.replace(hour=hour, minute=0)
+    return moment.replace(second=0, microsecond=0)
+
+
 def _referee(name: str, role: str, level: str = "一级") -> dict:
     return {"name": name, "role": role, "level": level}
 
@@ -599,16 +624,18 @@ def seed_matches(contexts: list[dict]) -> dict[str, Match]:
 
     match_specs = [
         # (id, group, home, away, kickoff, stage, status, home_score, away_score, published, result_published, reason)
-        ("mat_demo_u15_r1", "group_u15", home, away, _aware(2026, 10, 10, 15, 0), "小组赛", "FINISHED", 3, 1, True, True, ""),
-        ("mat_demo_u15_r2", "group_u15", away, home, _aware(2026, 10, 24, 15, 0), "半决赛", "FINISHED", 1, 2, True, True, ""),
-        ("mat_demo_u15_r3", "group_u15", home, away, _aware(2026, 11, 7, 15, 0), "决赛", "SCHEDULED", None, None, False, False, ""),
-        ("mat_demo_u18_r1", "group_u18", home, away, _aware(2026, 10, 11, 9, 0), "小组赛", "FINISHED", 2, 2, True, True, ""),
-        ("mat_demo_u18_r2", "group_u18", home, away, _aware(2026, 11, 8, 9, 0), "小组赛", "SCHEDULED", None, None, False, False, ""),
-        ("mat_demo_u18_r3", "group_u18", away, home, _aware(2026, 10, 18, 9, 0), "小组赛", "CANCELLED", None, None, False, False, "因暴雨改期，另行通知"),
-        ("mat_demo_gu12_r1", "group_gu12", girls_home, girls_away, _aware(2026, 10, 12, 10, 0), "小组赛", "FINISHED", 4, 0, True, True, ""),
-        ("mat_demo_gu12_r2", "group_gu12", girls_away, girls_home, _aware(2026, 10, 27, 19, 0), "半决赛", "LIVE", 1, 0, False, False, ""),
-        ("mat_demo_gu15_r1", "group_gu15", girls_home, girls_away, _aware(2026, 10, 13, 14, 0), "小组赛", "FINISHED", 1, 1, True, True, ""),
-        ("mat_demo_gu15_r2", "group_gu15", girls_away, girls_home, _aware(2026, 11, 10, 14, 0), "半决赛", "SCHEDULED", None, None, False, False, ""),
+        # 开球时间按“距今”生成：已结束的排在几天前，进行中的刚开球，未开赛的排在明后天，
+        # 这样门户始终同时有“已结束 / 进行中 / 未开赛”三种状态可看。
+        ("mat_demo_u15_r1", "group_u15", home, away, _kickoff(days=-20, hour=15), "小组赛", "FINISHED", 3, 1, True, True, ""),
+        ("mat_demo_u15_r2", "group_u15", away, home, _kickoff(days=-6, hour=15), "半决赛", "FINISHED", 1, 2, True, True, ""),
+        ("mat_demo_u15_r3", "group_u15", home, away, _kickoff(days=1, hour=15), "决赛", "SCHEDULED", None, None, True, False, ""),
+        ("mat_demo_u18_r1", "group_u18", home, away, _kickoff(days=-19, hour=9), "小组赛", "FINISHED", 2, 2, True, True, ""),
+        ("mat_demo_u18_r2", "group_u18", home, away, _kickoff(days=2, hour=9), "小组赛", "SCHEDULED", None, None, True, False, ""),
+        ("mat_demo_u18_r3", "group_u18", away, home, _kickoff(days=-12, hour=9), "小组赛", "CANCELLED", None, None, True, False, "因暴雨改期，另行通知"),
+        ("mat_demo_gu12_r1", "group_gu12", girls_home, girls_away, _kickoff(days=-18, hour=10), "小组赛", "FINISHED", 4, 0, True, True, ""),
+        ("mat_demo_gu12_r2", "group_gu12", girls_away, girls_home, _kickoff(minutes=-45), "半决赛", "LIVE", 1, 0, True, False, ""),
+        ("mat_demo_gu15_r1", "group_gu15", girls_home, girls_away, _kickoff(days=-17, hour=14), "小组赛", "FINISHED", 1, 1, True, True, ""),
+        ("mat_demo_gu15_r2", "group_gu15", girls_away, girls_home, _kickoff(days=3, hour=14), "半决赛", "SCHEDULED", None, None, True, False, ""),
     ]
     matches: dict[str, Match] = {}
     for (
@@ -651,7 +678,10 @@ def seed_matches(contexts: list[dict]) -> dict[str, Match]:
         )
         matches[mid] = match
     _STATS["matches"] = len(matches)
-    log(f"✅ 比赛：{len(matches)} 场（含 Finished/Live/Scheduled/Cancelled 各状态）")
+    log(
+        f"✅ 比赛：{len(matches)} 场（含 Finished/Live/Scheduled/Cancelled 各状态，"
+        "开球时间按距今天数生成，重跑即刷新赛程）"
+    )
     return matches
 
 
