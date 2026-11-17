@@ -1306,13 +1306,14 @@ def _result_news_body(match, event_name: str, title: str) -> tuple[str, str, str
         )
         if not event.own_goal:
             scorer_names.append(who)
+    # 红黄牌只输出结构化信息（时间/牌型/球员/球队）。event.reason 是记录台的
+    # 自由文本备注（如验收标记、内部说明），不能透出到公开快讯。
     card_items = [
         (
             f"<li>{escape(minute_text(event))} "
             f"{'红牌' if event.penalty_type == 'RED_CARD' else '黄牌'} "
             f"{escape(display.athlete_name(event.athlete_id, event.athlete_id or '未知球员'))}"
-            f"（{escape(display.team_name(event.team_id, event.team_id))}）"
-            f"{f'：{escape(event.reason)}' if event.reason else ''}</li>"
+            f"（{escape(display.team_name(event.team_id, event.team_id))}）</li>"
         )
         for event in cards
     ]
@@ -1341,6 +1342,13 @@ def result_news_summary(match) -> str:
     title = _result_news_title(match)
     _, _, summary = _result_news_body(match, event_name, title)
     return summary
+
+
+def result_news_body(match) -> tuple[str, str, str]:
+    """按比赛现有记录重算赛果快讯 (body_html, body_text, summary)（供修复历史数据复用）。"""
+    event_name = display.event_name(match.event_id, match.event_id)
+    title = _result_news_title(match)
+    return _result_news_body(match, event_name, title)
 
 
 def _sync_result_news(match) -> None:

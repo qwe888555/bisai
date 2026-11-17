@@ -710,9 +710,17 @@ def public_match_out(match) -> dict:
 
 
 def public_match_detail_out(match, events) -> dict:
-    """门户比赛详情：在对阵投影上补裁判组与已记录事件（含姓名投影）。"""
+    """门户比赛详情：在对阵投影上补裁判组与已记录事件（含姓名投影）。
+
+    事件里的 note 是记录台内部备注（种子/联调标记等），不向门户暴露；
+    reason 为展示用犯规说明，保留。
+    """
     data = public_match_out(match)
-    data["events"] = [match_event_out(event) for event in events]
+    data["events"] = []
+    for event in events:
+        item = match_event_out(event)
+        item.pop("note", None)
+        data["events"].append(item)
     return data
 
 

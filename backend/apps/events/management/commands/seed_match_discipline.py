@@ -90,7 +90,7 @@ class Command(BaseCommand):
                     team_id=team_id,
                     athlete_id=athlete_id,
                     penalty_type=penalty_type,
-                    reason="种子数据：验收红黄牌统计链路",
+                    reason="战术犯规",
                     note="由 seed_match_discipline 生成",
                     match_version=int(match.version or 0),
                 )

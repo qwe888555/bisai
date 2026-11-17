@@ -408,8 +408,9 @@ class ResultNewsTests(TestCase):
         # 自动快讯必须包含进球球员名单与红黄牌，而不只是比分。
         self.assertIn("ath_1", news.body_html)
         self.assertIn("黄牌", news.body_html)
-        self.assertIn("拉人", news.body_html)
         self.assertIn("ath_1", news.body_text)
+        # reason 是记录台自由文本备注（内部说明），不允许透出到公开快讯。
+        self.assertNotIn("拉人", news.body_html)
 
         self.match.refresh_from_db()
         services.publish_match_result(self.match.pk, self.match.version)
