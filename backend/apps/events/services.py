@@ -1318,9 +1318,25 @@ def _result_news_body(match, event_name: str, title: str) -> tuple[str, str, str
         for event in cards
     ]
 
+    # 导语作为新闻要素段：赛事、组别、开球时间、场地（缺失项自动省略）。
+    lead_bits = [event_name]
+    if match.group_id:
+        # 组别记录被删时 group_name 返回兜底空串，此时直接省略，避免透出内部 ID。
+        group_label = display.group_name(match.group_id, "")
+        if group_label:
+            lead_bits.append(group_label)
+    if match.kickoff_at:
+        lead_bits.append(
+            f"开球时间 {timezone.localtime(match.kickoff_at).strftime('%Y-%m-%d %H:%M')}"
+        )
+    venue = (match.venue or "").strip()
+    if venue:
+        lead_bits.append(f"场地 {venue}")
+
+    # 标题不再重复写进正文（此前第二段是 <p><strong>{title}</strong></p>，
+    # 详情页出现三遍同句，前端去重只是展示层兜底，源头直接不再生成）。
     parts = [
-        f"<p>{escape(event_name)}</p>",
-        f"<p><strong>{escape(title)}</strong></p>",
+        f"<p>{' · '.join(escape(bit) for bit in lead_bits)}</p>",
         "<h3>进球时间线</h3>",
         f"<ul>{''.join(goal_items)}</ul>" if goal_items else "<p>本场暂无进球记录。</p>",
     ]
