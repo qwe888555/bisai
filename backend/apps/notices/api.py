@@ -132,11 +132,12 @@ def message_publish(request, payload: MessagePublishIn):
 
     title = payload.title.strip()
     body = payload.body.strip()
+    business_type = payload.businessType or "SYSTEM"
     recipients = 0
     for account_id, account_roles in Account.objects.filter(enabled=True).values_list("pk", "roles"):
         if roles and not roles.intersection({role.upper() for role in (account_roles or [])}):
             continue
-        push_message(account_id, title, body, "SYSTEM")
+        push_message(account_id, title, body, business_type)
         recipients += 1
 
     return ok({"count": recipients})
