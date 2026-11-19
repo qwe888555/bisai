@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from typing import Optional
 
@@ -61,6 +62,25 @@ SCHOOL_TYPE_CODES: tuple[str, ...] = (
 
 
 # ---------------------------------------------------------------- 通用
+
+# 姓名规则：2-20 位中文，允许少数民族姓名的间隔号「·」。
+# 只拦截"新填写/被修改"的姓名；历史档案里已存在的数字/英文姓名保持可保存
+# （不修改姓名的编辑不再被格式校验挡住，见 update_person）。
+_PERSON_NAME_PATTERN = re.compile(r"^[一-龥·]{2,20}$")
+_PERSON_NAME_MESSAGE = "姓名应为 2-20 位中文，不能含数字或特殊符号"
+
+
+def _validate_person_name(name: str) -> str:
+    """校验并返回去空白后的姓名；不合法抛 400（字段级明细供前端定位）。"""
+    text = (name or "").strip()
+    if not _PERSON_NAME_PATTERN.fullmatch(text):
+        raise ApiError(
+            INVALID_ARGUMENT,
+            _PERSON_NAME_MESSAGE,
+            field_errors([("realName", "应为 2-20 位中文，不能含数字或特殊符号")]),
+        )
+    return text
+
 
 def parse_path_id(raw: str, field: str = "id") -> int:
     """路径参数 → 正整数；不合法直接 400，避免拿脏值查库。"""
@@ -1182,11 +1202,13 @@ def create_person(payload: dict, account):
 
     from apps.common.scopes import is_admin
 
+    # 新档案的姓名必须符合规则（历史脏数据只影响其自身编辑，不阻断新建）。
+    real_name = _validate_person_name(payload.get("realName"))
     # 系统管理员代表管理端直接建档，档案立即生效；其他角色仍走提交审核流程。
     initial_status = enums.AuditStatus.APPROVED if is_admin(account) else enums.AuditStatus.DRAFT
     with transaction.atomic():
         person = Person(
-            full_name=payload["realName"].strip(),
+            full_name=real_name,
             gender=gender_value,
             birth_date=birth_date,
             person_category=kind_list[0],
@@ -1252,6 +1274,10 @@ def update_person(person_id: str, payload: dict, account):
     # 类别移除保护（有档案数据 409）必须在落库前校验；_apply_kinds 在事务内执行
     with transaction.atomic():
         new_name = payload["realName"].strip()
+        # 仅在姓名实际变更时校验：历史档案里的数字/英文姓名不修改也能保存，
+        # 避免"什么都没改却存不回去"。
+        if new_name != person.full_name:
+            new_name = _validate_person_name(new_name)
         track("realName", person.full_name, new_name)
         person.full_name = new_name
 
@@ -1346,6 +1372,8 @@ def update_own_person(person_id: str, payload: dict):
     changes: list[dict] = []
     with transaction.atomic():
         new_name = payload["realName"].strip()
+        if new_name != person.full_name:
+            new_name = _validate_person_name(new_name)
         entry = _change_entry("realName", person.full_name, new_name)
         if entry:
             changes.append(entry)

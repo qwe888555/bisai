@@ -31,6 +31,7 @@ org.code=School.code）。账号无可见学校范围时抛 403 DATA_SCOPE_DENIE
 
 from __future__ import annotations
 
+from datetime import date
 from typing import Optional
 
 from django.db import transaction
@@ -688,6 +689,8 @@ def member_update(team_id: str, member_id: str, payload: dict, account) -> TeamM
     - 可变：jerseyNumber/position（exclude_unset 语义，仅前端提交键应用）；
     - 不应用：athleteId（回传字段，重绑人员=移出+重加或转队）、
       effectiveFrom/effectiveTo（前端回传/无冻结承载，防重写加入日期）；
+      但两者同时提交时必须满足 effectiveTo >= effectiveFrom，否则 400
+      （前端编辑弹窗的结束日期不得早于生效日期）；
     - EXITED 历史行禁改（模型注释"单向流转，历史禁改"，安全失败 409）；
     - 球衣号 R3 校验仅对现役成员排除自身。
     """
@@ -701,6 +704,26 @@ def member_update(team_id: str, member_id: str, payload: dict, account) -> TeamM
     ensure_version(member, payload["version"])
     if member.status != enums.RelationStatus.CURRENT:
         raise ApiError(STATE_CONFLICT, "已离队成员属历史关系，禁止修改")
+    # 日期区间校验：结束日期不得早于生效日期（与教练关系同款语义）。
+    raw_from = (payload.get("effectiveFrom") or "").strip()
+    raw_to = (payload.get("effectiveTo") or "").strip()
+    if raw_from and raw_to:
+        try:
+            start, end = date.fromisoformat(raw_from), date.fromisoformat(raw_to)
+        except ValueError:
+            raise ApiError(
+                INVALID_ARGUMENT,
+                "日期须为 YYYY-MM-DD 格式",
+                field_errors([("effectiveTo", "须为 YYYY-MM-DD 日期")]),
+            ) from None
+        if end < start:
+            raise ApiError(
+                INVALID_ARGUMENT,
+                "结束日期不能早于生效日期",
+                field_errors(
+                    [("effectiveTo", f"结束日期 {raw_to} 早于生效日期 {raw_from}")]
+                ),
+            )
     changed = False
     if "jerseyNumber" in payload:
         jersey = payload["jerseyNumber"]

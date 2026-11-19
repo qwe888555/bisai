@@ -1257,6 +1257,24 @@ class TeamMemberApiTests(TestCase):
         self.member_a.refresh_from_db()
         self.assertEqual(self.member_a.joined_at, date(2026, 3, 1))  # 未被重写
 
+    def test_member_update_end_before_start_rejected(self):
+        """结束日期早于生效日期 → 400，且不写入任何字段（编辑弹窗拦截）。"""
+        resp = self._put(
+            f"{self._mpath(self.team_main.pk)}/{self.member_a.pk}",
+            {
+                "jerseyNumber": 9,
+                "effectiveFrom": "2026-11-18",
+                "effectiveTo": "2025-11-12",
+                "version": self._mver(self.member_a),
+            },
+            token=self.admin_token,
+        )
+        self.assertEqual(resp.status_code, 400, resp.content)
+        self.assertEqual(resp.json()["code"], "INVALID_ARGUMENT")
+        self.member_a.refresh_from_db()
+        self.assertNotEqual(self.member_a.jersey_number, 9)
+        self.assertEqual(self.member_a.joined_at, date(2026, 3, 1))
+
     def test_member_update_athlete_id_tamper_ignored(self):
         resp = self._put(
             f"{self._mpath(self.team_main.pk)}/{self.member_a.pk}",

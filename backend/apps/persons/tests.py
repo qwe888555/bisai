@@ -1648,6 +1648,43 @@ class PeopleWriteApiTests(TestCase):
             log.field_changes,
         )
 
+    def test_update_legacy_name_unchanged_still_saves(self):
+        """历史档案姓名含数字/英文时，不修改姓名的保存不应被格式校验拦截。"""
+        _, person = self._create()
+        from apps.persons.schemas import person_version
+
+        person.full_name = "人脸识别测试02"
+        person.save()
+        resp = self._put(
+            person.pk,
+            {
+                "kinds": ["ATHLETE"],
+                "realName": "人脸识别测试02",
+                "version": person_version(person),
+            },
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        person.refresh_from_db()
+        self.assertEqual(person.full_name, "人脸识别测试02")
+
+    def test_update_name_with_digits_rejected(self):
+        """姓名被修改时必须符合 2-20 位中文规则。"""
+        _, person = self._create()
+        from apps.persons.schemas import person_version
+
+        resp = self._put(
+            person.pk,
+            {
+                "kinds": ["ATHLETE"],
+                "realName": "王改名02",
+                "version": person_version(person),
+            },
+        )
+        self.assertEqual(resp.status_code, 400, resp.content)
+        self.assertEqual(resp.json()["code"], "INVALID_ARGUMENT")
+        person.refresh_from_db()
+        self.assertEqual(person.full_name, "王测试")
+
     def test_update_optional_fields_kept_when_absent(self):
         _, person = self._create()  # phone=13800001111、school 已建
         from apps.persons.schemas import person_version
@@ -3852,7 +3889,7 @@ class MyProfileApiTests(TestCase):
         self.athlete.education = "本科"
         self.athlete.save()
         resp = self._put(
-            {"realName": "张小改2", "version": person_version(self.athlete)}
+            {"realName": "张小改二", "version": person_version(self.athlete)}
         )
         self.assertEqual(resp.status_code, 200, resp.content)
         self.athlete.refresh_from_db()
