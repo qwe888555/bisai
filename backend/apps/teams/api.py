@@ -39,6 +39,7 @@ from apps.common.permissions import (
     ATHLETE,
     CITY,
     COACH,
+    MATCH_RECORDER,
     PROVINCE_REVIEWER,
     TEAM,
     UNIVERSITY,
@@ -58,7 +59,8 @@ _auth = JWTAuth()
 # 收窄为 ADMIN / UNIVERSITY / TEAM（见 _TEAM_WRITE_ROLES）。
 _TEAM_ROLES = (ADMIN, UNIVERSITY, TEAM, CITY, PROVINCE_REVIEWER)
 # 球队只读（2026-11-01 用户裁定）：运动员/教练个人页可直接查球队档案与赛程。
-_TEAM_READ_ROLES = _TEAM_ROLES + (ATHLETE, COACH)
+# 2026-11-20 补充 MATCH_RECORDER：记录台新建对阵需按数据范围选择主客队。
+_TEAM_READ_ROLES = _TEAM_ROLES + (ATHLETE, COACH, MATCH_RECORDER)
 # 写操作收敛（2026-11-09）：前端只有管理员、学校端与球队端提供球队/成员/教练
 # 维护入口（TeamsView、TeamProfileView、TeamMembersView、TeamCoachesView）。
 # CITY/PROVINCE_REVIEWER 保留读权限用于审核查看，不再授予写权限。
