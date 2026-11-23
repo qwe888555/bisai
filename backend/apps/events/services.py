@@ -461,12 +461,28 @@ def get_match_event(match_id: str, event_id: str):
     return event
 
 
+def _ensure_match_recordable(match) -> None:
+    """未开赛或已取消的比赛不能录入赛况事件，避免赛前误记进球与判罚。
+
+    到达开球时间即视为开赛：记录台不必先手动把状态改成 LIVE 才能录入，
+    否则改期/准点开赛时会出现「时间到了仍然不能记录」的问题。
+    """
+    if match.status in ("LIVE", "FINISHED"):
+        return
+    if match.status == "CANCELLED":
+        raise ApiError(STATE_CONFLICT, "比赛已取消，不能录入赛况事件")
+    if match.kickoff_at and timezone.now() >= match.kickoff_at:
+        return
+    raise ApiError(STATE_CONFLICT, "比赛尚未开赛，不能录入赛况事件")
+
+
 def create_match_event(match_id: str, data: dict):
     from django.db import transaction
 
     from .models import MatchEvent
 
     match = get_match(match_id)
+    _ensure_match_recordable(match)
     check_version(match, data.get("matchVersion"))
     _validate_event_team(match, data["teamId"])
     _validate_event_payload(data)
