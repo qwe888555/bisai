@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from datetime import timedelta
 from typing import Callable, Iterable, Optional
 
@@ -166,14 +167,56 @@ def _make_thumbnail(data: bytes, max_side: int = 320) -> Optional[bytes]:
         return None
 
 
-def _store(account, owner_type: str, owner_id: str, category: str, uploaded: UploadedFile) -> FileRecord:
+def _find_duplicate(
+    owner_type: str, owner_id: str, category: str, data: bytes, storage
+) -> Optional[FileRecord]:
+    """同一归属与类别下重复上传同一份内容时复用原记录，避免照片重复入库。
+
+    只比对同 owner/category 且大小相同的少量候选，避免逐条读取全部对象存储；
+    不同归属之间不复用，防止把他人的私有文件返回给当前账号。
+    """
+    digest = hashlib.sha256(data).hexdigest()
+    candidates = FileRecord.objects.filter(
+        owner_type=owner_type,
+        owner_id=owner_id,
+        category=category,
+        size_bytes=len(data),
+    ).order_by("-created_at")[:20]
+    for record in candidates:
+        try:
+            handle = storage.open(record.storage_key)
+            try:
+                same_content = hashlib.sha256(handle.read()).hexdigest() == digest
+            finally:
+                handle.close()
+        except Exception:  # noqa: BLE001 - 历史文件缺失时继续比对下一条
+            continue
+        if same_content:
+            return record
+    return None
+
+
+def _store(
+    account,
+    owner_type: str,
+    owner_id: str,
+    category: str,
+    uploaded: UploadedFile,
+    track: Optional[list] = None,
+) -> FileRecord:
     from .storage import get_storage
 
     allowed_ext = _validate_category(category)
     ext, data = _prepare(uploaded, allowed_ext)
+    storage = get_storage()
+
+    # 重复上传同一张照片/同一份文件时直接复用已有记录，不重复入库。
+    duplicate = _find_duplicate(owner_type, owner_id, category, data, storage)
+    if duplicate is not None:
+        return duplicate
+
     file_id = new_file_id()
     storage_key = f"{file_id}.{ext}"
-    storage = get_storage()
 
     import io
 
@@ -186,7 +229,7 @@ def _store(account, owner_type: str, owner_id: str, category: str, uploaded: Upl
             thumbnail_key = f"{file_id}.thumb.jpg"
             storage.save(thumbnail_key, io.BytesIO(thumb))
 
-    return FileRecord.objects.create(
+    record = FileRecord.objects.create(
         id=file_id,
         owner_type=owner_type,
         owner_id=owner_id,
@@ -200,6 +243,10 @@ def _store(account, owner_type: str, owner_id: str, category: str, uploaded: Upl
         thumbnail_key=thumbnail_key,
         uploaded_by=account.pk,
     )
+    # track 只收集本次真正新建的记录；批量失败回滚时不能误删命中去重的历史文件。
+    if track is not None:
+        track.append(record)
+    return record
 
 
 def upload(account, owner_type: str, owner_id: str, category: str, uploaded: UploadedFile) -> FileRecord:
@@ -236,12 +283,13 @@ def upload_batch(
 
     storage = get_storage()
     created: list[FileRecord] = []
+    fresh: list[FileRecord] = []
     try:
         for uploaded in files:
-            created.append(_store(account, owner_type, owner_id, category, uploaded))
+            created.append(_store(account, owner_type, owner_id, category, uploaded, track=fresh))
     except Exception:
-        # 整批失败：回滚元数据并清理已落地对象，避免残留
-        for record in created:
+        # 整批失败：只回滚本次新建的记录与对象，命中去重的历史文件保持不动
+        for record in fresh:
             storage.delete(record.storage_key)
             FileRecord.all_objects.filter(pk=record.pk).delete()
         raise

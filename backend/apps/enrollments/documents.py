@@ -412,6 +412,7 @@ def build_documents_zip(enrollments: Iterable[Enrollment]) -> bytes:
     """批量报名表 ZIP；文件名 {学校编码}_{球队名称}_报名表.pdf。"""
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        used: set[str] = set()
         for enrollment in enrollments:
             snapshot = services.latest_snapshot(enrollment)
             pdf = render_registration_pdf(enrollment, snapshot)
@@ -422,6 +423,12 @@ def build_documents_zip(enrollments: Iterable[Enrollment]) -> bytes:
                 char for char in f"{school_code}_{team_name}_报名表.pdf"
                 if char not in '\\/:*?"<>|'
             )
+            # 同一球队可能有多份报名（不同组别/不同赛事），同名会在 ZIP 中互相覆盖导致丢件；
+            # 冲突时追加报名单号保证每份报名都能解压出来。
+            if safe_name in used:
+                stem, _, ext = safe_name.rpartition(".")
+                safe_name = f"{stem}_{enrollment.id}.{ext}"
+            used.add(safe_name)
             archive.writestr(safe_name, pdf)
     return buffer.getvalue()
 
