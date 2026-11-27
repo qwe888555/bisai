@@ -203,6 +203,7 @@ class AuthFlowTests(AccountScopeTestBase):
         self.assertEqual(data["username"], "scope-admin")
         self.assertEqual(data["orgId"], self.P.pk)
         self.assertEqual(data["orgName"], "测试省")
+        self.assertFalse(data["mustChangePassword"])
         self.assertIn("api:accountList", data["permissions"])
         self.assertIn("api:organizationList", data["permissions"])
         menu_keys = {m["key"] for m in data["menus"]}
@@ -300,6 +301,10 @@ class AuthFlowTests(AccountScopeTestBase):
         )
         self.assertEqual(resp.status_code, 200)
         self.assertTrue(resp.json()["data"].get("mustChangePassword"))
+        token = resp.json()["data"]["accessToken"]
+        me = self._get(f"{BASE}/me", token=token)
+        self.assertEqual(me.status_code, 200)
+        self.assertTrue(me.json()["data"].get("mustChangePassword"))
 
 
 # ================================================================ 权限点与角色

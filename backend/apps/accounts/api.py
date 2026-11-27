@@ -130,6 +130,8 @@ def current_user(request):
         "teamIds": list(actor.team_ids or []),
         "permissions": permissions_for(actor.roles),
         "menus": menus_for(actor.roles),
+        # 首次登录/管理员重置后为 true；前端据此强制改密。
+        "mustChangePassword": bool(actor.must_change_password),
     }
     if actor.person_id:
         data["personId"] = actor.person_id

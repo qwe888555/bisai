@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sys
 import threading
 import time
@@ -62,6 +63,8 @@ from .models import (
     RosterItem,
     RosterQualificationLog,
 )
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------- 序列化
 
@@ -946,6 +949,67 @@ def _review_stage(actor, enrollment: Enrollment) -> tuple[str, str]:
     )
 
 
+def _review_message_title(stage: str, action: str) -> str:
+    stage_label = {"CITY": "市州初审", "PROVINCE": "省级终审"}.get(stage, "审核")
+    action_label = {
+        "APPROVE": "审核通过",
+        "REJECT": "审核驳回",
+        "RETURN_FOR_CORRECTION": "退回补正",
+    }.get(action, "审核结果")
+    return f"报名{stage_label}结果：{action_label}"
+
+
+def _review_recipient(enrollment: Enrollment, detail: dict) -> str:
+    """优先发给报送账号；历史数据 created_by 为空时按学校组织兜底。"""
+    from apps.accounts.models import Account
+
+    created_by = str(enrollment.created_by or "")
+    if created_by and Account.objects.filter(pk=created_by, enabled=True).exists():
+        return created_by
+
+    org_id = str(detail.get("schoolOrgId") or "")
+    if not org_id:
+        try:
+            org_id = str(team_client.get_team(enrollment.team_id).get("orgId") or "")
+        except Exception:  # noqa: BLE001
+            org_id = ""
+    if org_id:
+        for account in Account.objects.filter(organization_id=org_id, enabled=True).order_by("pk"):
+            roles = set(account.roles or [])
+            if roles & {"UNIVERSITY", "TEAM"}:
+                return account.pk
+    return ""
+
+
+def _notify_review_result(
+    enrollment: Enrollment, detail: dict, stage: str, action: str, reason: str
+) -> None:
+    """审核结果站内信；通知失败只记日志，不阻断审核事务。"""
+    try:
+        from apps.notices.models import push_message
+
+        recipient = _review_recipient(enrollment, detail)
+        if not recipient:
+            logger.warning("报名审核消息无接收人 enrollment=%s", enrollment.pk)
+            return
+        body = (
+            f"赛事：{detail.get('eventName') or '-'}；"
+            f"组别：{detail.get('groupName') or '-'}；"
+            f"球队：{detail.get('teamName') or '-'}。"
+        )
+        if reason:
+            body += f"原因：{reason}"
+        push_message(
+            recipient,
+            _review_message_title(stage, action),
+            body,
+            business_type="REVIEW",
+            business_id=enrollment.pk,
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("报名审核消息写入失败 enrollment=%s", enrollment.pk)
+
+
 @transaction.atomic
 def review_enrollment(actor, enrollment_id: str, payload) -> dict:
     enrollment = _locked_enrollment(actor, enrollment_id)
@@ -1009,7 +1073,9 @@ def review_enrollment(actor, enrollment_id: str, payload) -> dict:
         snapshot_id=snapshot.pk if snapshot else "",
     )
     message_client.notify_enrollment(enrollment, f"enrollment.review.{action}")
-    return to_detail(enrollment)
+    detail = to_detail(enrollment)
+    _notify_review_result(enrollment, detail, stage, action, payload.reason or "")
+    return detail
 
 
 def list_reviews(actor, enrollment_id: str):
@@ -1041,8 +1107,9 @@ def list_attachments(actor, enrollment_id: str):
     return enrollment.attachments.all().order_by("created_at", "id")
 
 
+@transaction.atomic
 def create_attachment(actor, enrollment_id: str, payload) -> dict:
-    enrollment = scope.get_enrollment(actor, enrollment_id)
+    enrollment = _locked_enrollment(actor, enrollment_id)
     scope.ensure_enrollment_creator(actor, enrollment)
     _ensure_editable(enrollment)
     precheck.ensure_window_open(enrollment.event_id)
@@ -1071,6 +1138,17 @@ def create_attachment(actor, enrollment_id: str, payload) -> dict:
         enrollment_id=enrollment.pk, file_id=payload.fileId
     ).exists():
         raise ApiError(DUPLICATE_RESOURCE, "该文件已关联到本报名")
+    # 两类报名材料各保留一份（全队材料按 athlete_id 为空去重；个人学籍材料按运动员区分）。
+    if EnrollmentAttachment.objects.filter(
+        enrollment_id=enrollment.pk,
+        material_type=payload.materialType,
+        athlete_id=payload.athleteId or "",
+    ).exists():
+        raise ApiError(
+            DUPLICATE_RESOURCE,
+            "该报名已存在同类型材料，请先移除原材料",
+            [{"field": "materialType", "reason": "已存在"}],
+        )
 
     attachment = EnrollmentAttachment.objects.create(
         id=new_id("att"),
